@@ -1,0 +1,64 @@
+#include "correlation_kernel.hpp"
+#include <cmath>
+#include <cstring>
+
+inline bool within_bounds(int h, int w, int H, int W)
+{
+    return (h >= 0 && h < H && w >= 0 && w < W);
+}
+
+void patchify_cpu(
+    const float* fmap,    // [C][H][W]
+    const float* coords,  // [M][2]
+    int M,
+    int C,
+    int H,
+    int W,
+    int radius,
+    float* gmap           // [M][C][D][D]
+)
+{
+    const int D = 2 * radius + 2;
+
+    // zero output (matches CUDA behavior)
+    std::memset(gmap, 0, sizeof(float) * M * C * D * D);
+
+    for (int m = 0; m < M; m++) {
+
+        const float x = coords[m*2 + 0];
+        const float y = coords[m*2 + 1];
+
+        const int cx = static_cast<int>(std::floor(x));
+        const int cy = static_cast<int>(std::floor(y));
+
+        for (int ii = 0; ii < D; ii++) {
+            for (int jj = 0; jj < D; jj++) {
+
+                const int i = cy + (ii - radius);
+                const int j = cx + (jj - radius);
+
+                if (!within_bounds(i, j, H, W))
+                    continue;
+
+                for (int c = 0; c < C; c++) {
+
+                    // fmap[c][i][j]
+                    const int fmap_idx = 
+                            (c * (H * W)) + (i * W) + j;
+                    // (c * H + i) * W + j;
+
+                    // gmap[m][c][ii][jj]
+                    const int gmap_idx =
+                            m * C * D * D +
+                            c * D * D +
+                            ii * D +
+                            jj;
+
+                            // ((m * C + c) * D + ii) * D + jj;
+
+                    gmap[gmap_idx] = fmap[fmap_idx];
+                }
+            }
+        }
+    }
+}
