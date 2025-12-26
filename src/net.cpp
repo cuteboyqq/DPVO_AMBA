@@ -36,7 +36,7 @@ void Patchifier::forward(
     // ------------------------------------------------
     // 3. Patchify grid → patches (RGB)
     // ------------------------------------------------
-    patchify_cpu(
+    patchify_cpu_safe(
         grid.data(), coords.data(),
         M, 3, H, W,
         m_patch_size / 2,
@@ -46,7 +46,7 @@ void Patchifier::forward(
     // ------------------------------------------------
     // 4. Patchify fmap → gmap
     // ------------------------------------------------
-    patchify_cpu(
+    patchify_cpu_safe(
         fmap, coords.data(),
         M, 128, H, W,
         m_patch_size / 2,
@@ -56,7 +56,7 @@ void Patchifier::forward(
     // ------------------------------------------------
     // 5. imap sampling (radius = 0)
     // ------------------------------------------------
-    patchify_cpu(
+    patchify_cpu_safe(
         imap, coords.data(),
         M, m_DIM, H, W,
         0,

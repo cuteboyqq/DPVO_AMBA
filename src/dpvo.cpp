@@ -269,18 +269,24 @@ void DPVO::keyframe() {
 			m_pg.m_poses[f]   = m_pg.m_poses[f + 1];
 
 			// ---- arrays → memcpy ----
+			// void* std::memcpy(
+			//     void*       dest,
+			//     const void* src,
+			//     std::size_t count
+			// );
+			// Copy all patch data of frame f+1 into frame f
 			std::memcpy(
 				m_pg.m_patches[f],
 				m_pg.m_patches[f + 1],
 				sizeof(m_pg.m_patches[0])
 			);
-
+			// Copy all patch colors from frame f+1 → frame f
 			std::memcpy(
 				m_pg.m_colors[f],
 				m_pg.m_colors[f + 1],
 				sizeof(m_pg.m_colors[0])
 			);
-
+			// Copy camera intrinsics of frame f+1 → frame f
 			std::memcpy(
 				m_pg.m_intrinsics[f],
 				m_pg.m_intrinsics[f + 1],
