@@ -3,7 +3,8 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
-
+#include "projective_ops.hpp"
+#include "correlation_kernel.hpp"
 static_assert(sizeof(((PatchGraph*)0)->m_index[0]) ==
               sizeof(int) * PatchGraph::M,
               "PatchGraph layout mismatch");
@@ -12,6 +13,11 @@ static_assert(sizeof(((PatchGraph*)0)->m_index[0]) ==
 // Constructor
 // -------------------------------------------------------------
 DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd)
+    : DPVO(cfg, ht, wd, nullptr)
+{
+}
+
+DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     : m_cfg(cfg),
       m_ht(ht), m_wd(wd),
       m_counter(0),
@@ -45,9 +51,22 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd)
     // PatchGraph constructor will initialize internal arrays
 	// Patchifier default patch size 3
     m_patchifier = Patchifier(3);
+    
+    // Initialize update model if config provided (no threading needed for sequential execution)
+    if (config != nullptr) {
+        m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+    }
+}
+
+void DPVO::setUpdateModel(Config_S* config)
+{
+    if (config != nullptr && m_updateModel == nullptr) {
+        m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+    }
 }
 
 DPVO::~DPVO() {
+    // Update model will be automatically destroyed by unique_ptr
     delete[] m_imap;
     delete[] m_gmap;
     delete[] m_fmap1;
@@ -74,19 +93,23 @@ void DPVO::run(int64_t timestamp,
     // -------------------------------------------------
     // 1. Patchify (WRITE DIRECTLY INTO BUFFERS)
     // -------------------------------------------------
-    float* imap_dst = &m_imap[imap_idx(pm, 0, 0)];
-    float* gmap_dst = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
-    float* fmap1_dst = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
-    float* fmap2_dst = &m_fmap2[fmap2_idx(0, mm, 0, 0, 0)];
+    // float* imap_dst = &m_imap[imap_idx(pm, 0, 0)];
+    // float* gmap_dst = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
+    // float* fmap1_dst = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
+    // float* fmap2_dst = &m_fmap2[fmap2_idx(0, mm, 0, 0, 0)];
+	m_cur_imap  = &m_imap[imap_idx(pm, 0, 0)];
+	m_cur_gmap  = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
+	m_cur_fmap1 = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
+
 
     float patches[M * 3 * P * P];
     uint8_t clr[M * 3];
 
     m_patchifier.forward(
         image, H, W,
-        fmap1_dst,     // full-res fmap
-        imap_dst,
-        gmap_dst,
+        m_cur_fmap1,     // full-res fmap
+        m_cur_imap,
+        m_cur_gmap,
         patches,
         clr,
         M
@@ -142,10 +165,10 @@ void DPVO::run(int64_t timestamp,
                 float sum = 0.0f;
                 for (int dy = 0; dy < 4; dy++)
                     for (int dx = 0; dx < 4; dx++)
-                        sum += fmap1_dst[c * H * W +
+                        sum += m_cur_fmap1[c * H * W +
                             (y * 4 + dy) * W +
                             (x * 4 + dx)];
-                fmap2_dst[c * m_fmap2_H * m_fmap2_W +
+                m_cur_fmap1[c * m_fmap2_H * m_fmap2_W +
                           y * m_fmap2_W + x] = sum / 16.0f;
             }
         }
@@ -184,12 +207,230 @@ void DPVO::run(int64_t timestamp,
 // -------------------------------------------------------------
 // Update (NN + BA stub)
 // -------------------------------------------------------------
-void DPVO::update() {
-    if (m_pg.m_num_edges == 0) return;
+// void DPVO::update() {
+//     if (m_pg.m_num_edges == 0) return;
 
-    // NN update + reprojection will go here
-    // BA_CV28(...) will go here
+//     // NN update + reprojection will go here
+//     // BA_CV28(...) will go here
+// }
+
+
+void DPVO::update()
+{
+    const int num_active = m_pg.m_num_edges;
+    if (num_active == 0)
+        return;
+
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    const int P = m_P;
+
+    // -------------------------------------------------
+    // 1. Reprojection
+    // -------------------------------------------------
+    std::vector<float> coords(num_active * 2 * P * P); // [num_active, 2, P, P]
+    reproject(
+        m_pg.m_ii, m_pg.m_jj, m_pg.m_kk,
+        num_active,
+        coords.data()
+    );
+
+    // -------------------------------------------------
+    // 2. Correlation
+    // -------------------------------------------------
+    std::vector<float> corr(num_active * 2 * P * P); // flatten stacked corr1+corr2
+    computeCorrelation(
+		m_gmap,
+		m_cur_fmap1,      // pyramid0
+		m_fmap2,          // pyramid1
+		coords.data(),
+		m_pg.m_kk,        // ii
+		m_pg.m_jj,        // jj
+		num_active,
+		M,
+		P,
+		m_fmap1_H, m_fmap1_W,
+		128,
+		corr.data()
+	);
+
+
+    // -------------------------------------------------
+    // 3. Context slice from imap
+    // -------------------------------------------------
+    std::vector<float> ctx(num_active * m_DIM);
+    for (int e = 0; e < num_active; e++) {
+        int kk_idx = m_pg.m_kk[e] % (M * m_pmem);
+        std::memcpy(
+            &ctx[e * m_DIM],
+            &m_imap[kk_idx * m_DIM],
+            sizeof(float) * m_DIM
+        );
+    }
+
+    // -------------------------------------------------
+    // 4. Network update (DPVO Update Model Inference)
+    // -------------------------------------------------
+    std::vector<float> delta(num_active * 2);
+    std::vector<float> weight(num_active);
+    
+    if (m_updateModel != nullptr) {
+        // Model expects fixed shapes: [1, 384, 768, 1] for net/inp, [1, 882, 768, 1] for corr, [1, 768, 1] for indices
+        const int MODEL_EDGE_COUNT = 768;
+        const int CORR_DIM = 882; // Correlation feature dimension
+        
+        // Prepare input data - pad or truncate to MODEL_EDGE_COUNT
+        const int num_edges_to_process = std::min(num_active, MODEL_EDGE_COUNT);
+        
+        // Allocate model input buffers
+        std::vector<float> net_input(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
+        std::vector<float> inp_input(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
+        std::vector<float> corr_input(1 * CORR_DIM * MODEL_EDGE_COUNT * 1, 0.0f);
+        std::vector<int32_t> ii_input(1 * MODEL_EDGE_COUNT * 1, 0);
+        std::vector<int32_t> jj_input(1 * MODEL_EDGE_COUNT * 1, 0);
+        std::vector<int32_t> kk_input(1 * MODEL_EDGE_COUNT * 1, 0);
+        
+        // Reshape and copy net data: [num_active, 384] -> [1, 384, 768, 1]
+        // Layout: [batch, channels, spatial, 1] = [1, 384, 768, 1]
+        for (int e = 0; e < num_edges_to_process; e++) {
+            for (int d = 0; d < 384; d++) {
+                // net: [1, 384, 768, 1] - channel major, then spatial
+                net_input[0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = m_pg.m_net[e][d];
+                // inp: [1, 384, 768, 1] - same layout
+                inp_input[0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = ctx[e * 384 + d];
+            }
+        }
+        
+        // Reshape correlation: [num_active * 18] -> [1, 882, 768, 1]
+        // Note: corr is [num_active, 2, P, P] = [num_active, 18] where P=3
+        // Model expects [1, 882, 768, 1] - we'll pad the correlation dimension
+        const int corr_per_edge = 2 * P * P; // 18
+        for (int e = 0; e < num_edges_to_process; e++) {
+            // Copy original correlation (18 values per edge)
+            for (int c = 0; c < corr_per_edge && c < CORR_DIM; c++) {
+                corr_input[0 * CORR_DIM * MODEL_EDGE_COUNT * 1 + c * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = 
+                    corr[e * corr_per_edge + c];
+            }
+            // Rest of CORR_DIM is zero-padded
+        }
+        
+        // Copy indices: [num_active] -> [1, 768, 1]
+        for (int e = 0; e < num_edges_to_process; e++) {
+            ii_input[0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = static_cast<int32_t>(m_pg.m_ii[e]);
+            jj_input[0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = static_cast<int32_t>(m_pg.m_jj[e]);
+            kk_input[0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = static_cast<int32_t>(m_pg.m_kk[e]);
+        }
+        
+        // Call update model inference synchronously
+        DPVOUpdate_Prediction pred;
+        if (m_updateModel->runInference(
+                net_input.data(),
+                inp_input.data(),
+                corr_input.data(),
+                ii_input.data(),
+                jj_input.data(),
+                kk_input.data(),
+                m_updateFrameCounter++,
+                pred))
+        {
+            // Extract outputs: net_out [1, 384, 768, 1], d_out [1, 2, 768, 1], w_out [1, 2, 768, 1]
+            // d_out contains delta: [1, 2, 768, 1] -> [num_edges, 2]
+            // w_out contains weight: [1, 2, 768, 1] -> we'll use first channel
+            
+            if (pred.dOutBuff != nullptr && pred.wOutBuff != nullptr) {
+                // Extract delta from d_out: [1, 2, 768, 1]
+                for (int e = 0; e < num_edges_to_process; e++) {
+                    // d_out layout: [batch, channels, spatial, 1] = [1, 2, 768, 1]
+                    delta[e * 2 + 0] = pred.dOutBuff[0 * 2 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                    delta[e * 2 + 1] = pred.dOutBuff[0 * 2 * MODEL_EDGE_COUNT * 1 + 1 * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                    
+                    // w_out layout: [1, 2, 768, 1] - use first channel for weight
+                    weight[e] = pred.wOutBuff[0 * 2 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                }
+                
+                // Update m_pg.m_net with net_out if available
+                if (pred.netOutBuff != nullptr) {
+                    // net_out: [1, 384, 768, 1] -> [num_edges, 384]
+                    for (int e = 0; e < num_edges_to_process; e++) {
+                        for (int d = 0; d < 384; d++) {
+                            m_pg.m_net[e][d] = pred.netOutBuff[0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                        }
+                    }
+                }
+            }
+            
+            // Free prediction buffers
+            if (pred.netOutBuff) delete[] pred.netOutBuff;
+            if (pred.dOutBuff) delete[] pred.dOutBuff;
+            if (pred.wOutBuff) delete[] pred.wOutBuff;
+        }
+        
+        // If we have more edges than processed, use zero delta/weight for remaining
+        for (int e = num_edges_to_process; e < num_active; e++) {
+            delta[e * 2 + 0] = 0.0f;
+            delta[e * 2 + 1] = 0.0f;
+            weight[e] = 0.0f;
+        }
+    } else {
+        // Fallback: zero delta and weight if no update model
+        std::fill(delta.begin(), delta.end(), 0.0f);
+        std::fill(weight.begin(), weight.end(), 0.0f);
+    }
+
+    // -------------------------------------------------
+    // 5. Compute target positions
+    // -------------------------------------------------
+    for (int e = 0; e < num_active; e++) {
+        int center = (P / 2) * P + (P / 2);
+        float cx = coords[e * 2 * P * P + center * 2 + 0];
+        float cy = coords[e * 2 * P * P + center * 2 + 1];
+
+        m_pg.m_target[e * 2 + 0] = cx + delta[e * 2 + 0];
+        m_pg.m_target[e * 2 + 1] = cy + delta[e * 2 + 1];
+        m_pg.m_weight[e] = weight[e];
+    }
+
+    // -------------------------------------------------
+    // 6. Bundle Adjustment
+    // -------------------------------------------------
+    // try {
+    //     bool run_global_ba = false;
+    //     for (int e = 0; e < num_active; e++) {
+    //         if (m_pg.m_ii[e] < m_pg.m_n - m_cfg.REMOVAL_WINDOW - 1) {
+    //             run_global_ba = true;
+    //             break;
+    //         }
+    //     }
+
+    //     if (run_global_ba) {
+    //         runGlobalBA();  // implement your global BA
+    //     } else {
+    //         int t0 = m_is_initialized ?
+    //                  std::max(m_pg.m_n - m_cfg.OPTIMIZATION_WINDOW, 1) : 1;
+
+    //         fastBA(
+    //             m_pg.m_poses,
+    //             m_pg.m_patches,
+    //             m_pg.m_intrinsics,
+    //             m_pg.m_target,
+    //             m_pg.m_weight,
+    //             m_pg.m_ii,
+    //             m_pg.m_jj,
+    //             m_pg.m_kk,
+    //             t0,
+    //             m_pg.m_n
+    //         );
+    //     }
+    // } catch (...) {
+    //     std::cerr << "Warning: BA failed...\n";
+    // }
+
+    // -------------------------------------------------
+    // 7. Update point cloud
+    // -------------------------------------------------
+//     updatePointCloud(); // implement pops::point_cloud equivalent
 }
+
+
 
 // -------------------------------------------------------------
 // Keyframe logic (minimal, safe version)
@@ -460,5 +701,38 @@ void DPVO::removeFactors(const bool* mask, bool store) {
 float DPVO::motionMagnitude(int, int) {
     return 1.0f;
 }
+
+
+void DPVO::reproject(
+    const int* ii,
+    const int* jj,
+    const int* kk,
+    int num_edges,
+    float* coords_out)
+{
+    if (num_edges <= 0)
+        return;
+
+    // Flattened pointers to patches and intrinsics
+    float* patches_flat = &m_pg.m_patches[0][0][0][0][0];
+    float* intrinsics_flat = &m_pg.m_intrinsics[0][0];
+
+    // Call flattened transform
+    pops::transform(
+        m_pg.m_poses,         // SE3 poses [N]
+        patches_flat,         // flattened patches
+        intrinsics_flat,      // flattened intrinsics
+        ii, jj, kk,           // indices
+        num_edges,            // number of edges
+        m_cfg.PATCHES_PER_FRAME,
+        m_P,
+        coords_out            // output [num_edges][2][P][P] flattened
+    );
+
+    // Output layout already matches Python coords.permute(0,1,4,2,3)
+    // Each edge: [2][P][P] → 2 channels: u,v
+}
+
+
 
 void DPVO::terminate() {}

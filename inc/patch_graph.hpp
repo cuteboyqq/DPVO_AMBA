@@ -50,14 +50,14 @@ public:
     int m_jj[MAX_EDGES];
     int m_kk[MAX_EDGES];
     float m_weight[MAX_EDGES];
-    Vec2  m_target[MAX_EDGES];
+    float  m_target[MAX_EDGES];
 
     // ---- inactive edges ----
     int m_ii_inac[MAX_EDGES];
     int m_jj_inac[MAX_EDGES];
     int m_kk_inac[MAX_EDGES];
     float m_weight_inac[MAX_EDGES];
-    Vec2  m_target_inac[MAX_EDGES];
+    float  m_target_inac[MAX_EDGES];
 
 public:
     PatchGraph();

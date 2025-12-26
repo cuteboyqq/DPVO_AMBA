@@ -1,8 +1,10 @@
 #pragma once
 #include "patch_graph.hpp"
 #include "net.hpp"
+#include "dla_config.hpp"
 #include <cstdint>
 #include <vector>
+#include <memory>
 
 struct DPVOConfig {
     int PATCHES_PER_FRAME;
@@ -15,15 +17,32 @@ struct DPVOConfig {
     int KEYFRAME_THRESH;
     int PATCH_LIFETIME;
     int REMOVAL_WINDOW;
+
+    DPVOConfig()
+        : PATCHES_PER_FRAME(16),
+          BUFFER_SIZE(4096),
+          PATCH_SIZE(3),
+          MIXED_PRECISION(0),
+          LOOP_CLOSURE(0),
+          MAX_EDGE_AGE(1500),
+          KEYFRAME_INDEX(2),
+          KEYFRAME_THRESH(10),
+          PATCH_LIFETIME(6),
+          REMOVAL_WINDOW(8)
+    {}
 };
 
 class DPVO {
 public:
     DPVO(const DPVOConfig& cfg, int ht, int wd);
+    DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config); // Constructor with config for update model
     ~DPVO();
 
     void run(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W);
     void terminate();
+    
+    // Set update model (if not initialized in constructor)
+    void setUpdateModel(Config_S* config);
 
 private:
     void update();
@@ -33,7 +52,7 @@ private:
     void edgesBackward(std::vector<int>& kk, std::vector<int>& jj);
     void appendFactors(const std::vector<int>& kk, const std::vector<int>& jj);
     void removeFactors(const bool* mask, bool store);
-
+    void reproject(const int* ii, const int* jj, const int* kk, int num_edges, float* coords_out); // Alister add 2025-12-26
     float motionMagnitude(int i, int j);
 
     // Helpers for indexing
@@ -79,8 +98,17 @@ private:
     float* m_fmap1;
     float* m_fmap2;
 
+    float* m_cur_imap;   // pointer to latest frame in imap
+    float* m_cur_gmap;   // pointer to latest frame in gmap
+    float* m_cur_fmap1;  // pointer to latest frame in fmap1
+
+
     std::vector<int64_t> m_tlist;
 
     // ---- Patchifier for extracting patches ----
     Patchifier m_patchifier;
+    
+    // ---- DPVO Update Model (optional) ----
+    std::unique_ptr<DPVOUpdate> m_updateModel;
+    int m_updateFrameCounter = 0;
 };
