@@ -25,13 +25,21 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
       m_DIM(384),    // same as NET_DIM
       m_P(PatchGraph::P),
       m_pmem(cfg.BUFFER_SIZE),
-      m_mem(cfg.BUFFER_SIZE)
+      m_mem(cfg.BUFFER_SIZE),
+      m_patchifier(3)  // Initialize in member initializer list (not copyable due to unique_ptr)
 {
-    // fmap sizes
-    m_fmap1_H = ht;
-    m_fmap1_W = wd;
-    m_fmap2_H = ht / 4;
-    m_fmap2_W = wd / 4;
+    // fmap sizes - Python uses RES=4, so work at 1/4 resolution
+    // Python: ht = ht // RES, wd = wd // RES (where RES=4)
+    // fmap1_: [ht // 1, wd // 1] = [ht/4, wd/4] in original coordinates
+    // fmap2_: [ht // 4, wd // 4] = [ht/16, wd/16] in original coordinates
+    const int RES = 4;
+    const int res_ht = ht / RES;  // e.g., 480 / 4 = 120
+    const int res_wd = wd / RES;  // e.g., 640 / 4 = 160
+    
+    m_fmap1_H = res_ht;      // 120 (1/4 resolution)
+    m_fmap1_W = res_wd;      // 160 (1/4 resolution)
+    m_fmap2_H = res_ht / 4;  // 30 (1/16 resolution)
+    m_fmap2_W = res_wd / 4;  // 40 (1/16 resolution)
 
 	const int M = cfg.PATCHES_PER_FRAME;
     // allocate float arrays
@@ -48,10 +56,6 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     std::memset(m_fmap1, 0, sizeof(float) * m_mem * 128 * m_fmap1_H * m_fmap1_W);
     std::memset(m_fmap2, 0, sizeof(float) * m_mem * 128 * m_fmap2_H * m_fmap2_W);
 
-    // PatchGraph constructor will initialize internal arrays
-	// Patchifier default patch size 3
-    m_patchifier = Patchifier(3);
-    
     // Initialize update model if config provided (no threading needed for sequential execution)
     if (config != nullptr) {
         m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
@@ -63,6 +67,11 @@ void DPVO::setUpdateModel(Config_S* config)
     if (config != nullptr && m_updateModel == nullptr) {
         m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
     }
+}
+
+void DPVO::setPatchifierModels(Config_S* fnetConfig, Config_S* inetConfig)
+{
+    m_patchifier.setModels(fnetConfig, inetConfig);
 }
 
 DPVO::~DPVO() {
@@ -157,7 +166,8 @@ void DPVO::run(int64_t timestamp,
     }
 
     // -------------------------------------------------
-    // 6. Downsample fmap → fmap2 (Python avg_pool2d)
+    // 6. Downsample fmap1 → fmap2 (Python avg_pool2d)
+    // fmap1 is at 1/4 resolution (e.g., 120x160), fmap2 is at 1/16 resolution (e.g., 30x40)
     // -------------------------------------------------
     for (int c = 0; c < 128; c++) {
         for (int y = 0; y < m_fmap2_H; y++) {
@@ -165,11 +175,12 @@ void DPVO::run(int64_t timestamp,
                 float sum = 0.0f;
                 for (int dy = 0; dy < 4; dy++)
                     for (int dx = 0; dx < 4; dx++)
-                        sum += m_cur_fmap1[c * H * W +
-                            (y * 4 + dy) * W +
+                        // fmap1 is at m_fmap1_H x m_fmap1_W (1/4 resolution)
+                        sum += m_cur_fmap1[c * m_fmap1_H * m_fmap1_W +
+                            (y * 4 + dy) * m_fmap1_W +
                             (x * 4 + dx)];
-                m_cur_fmap1[c * m_fmap2_H * m_fmap2_W +
-                          y * m_fmap2_W + x] = sum / 16.0f;
+                // Store in fmap2 (at 1/16 resolution)
+                m_fmap2[fmap2_idx(0, mm, c, y, x)] = sum / 16.0f;
             }
         }
     }

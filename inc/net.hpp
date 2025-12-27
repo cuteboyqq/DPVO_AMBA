@@ -59,9 +59,72 @@ struct DPVOUpdate_Prediction
     }
 };
 
+// Simple inference classes for fnet and inet
+class FNetInference {
+public:
+    FNetInference(Config_S* config);
+    ~FNetInference();
+    bool runInference(const uint8_t* image, int H, int W, float* fmap_out);
+    
+private:
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    void _initModelIO();
+    bool _releaseModel();
+    bool _loadInput(const uint8_t* image, int H, int W);
+    
+    std::string m_modelPathStr;    // Store model path as string
+    char* m_ptrModelPath = nullptr;
+    ea_net_t* m_model = nullptr;
+    ea_tensor_t* m_inputTensor = nullptr;
+    ea_tensor_t* m_outputTensor = nullptr;
+    std::string m_inputTensorName = "images";
+    std::string m_outputTensorName = "fmap";
+    int m_inputHeight = 0;
+    int m_inputWidth = 0;
+    int m_inputChannel = 3;
+    int m_outputHeight = 0;
+    int m_outputWidth = 0;
+    int m_outputChannel = 128;
+    float* m_outputBuffer = nullptr;
+#endif
+};
+
+class INetInference {
+public:
+    INetInference(Config_S* config);
+    ~INetInference();
+    bool runInference(const uint8_t* image, int H, int W, float* imap_out);
+    
+private:
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    void _initModelIO();
+    bool _releaseModel();
+    bool _loadInput(const uint8_t* image, int H, int W);
+    
+    std::string m_modelPathStr;    // Store model path as string
+    char* m_ptrModelPath = nullptr;
+    ea_net_t* m_model = nullptr;
+    ea_tensor_t* m_inputTensor = nullptr;
+    ea_tensor_t* m_outputTensor = nullptr;
+    std::string m_inputTensorName = "images";
+    std::string m_outputTensorName = "imap";
+    int m_inputHeight = 0;
+    int m_inputWidth = 0;
+    int m_inputChannel = 3;
+    int m_outputHeight = 0;
+    int m_outputWidth = 0;
+    int m_outputChannel = 384;
+    float* m_outputBuffer = nullptr;
+#endif
+};
+
 class Patchifier {
 public:
     Patchifier(int patch_size = 3, int DIM = 64);
+    Patchifier(int patch_size, int DIM, Config_S* config); // Constructor with models
+    ~Patchifier();
+    
+    void setModels(Config_S* fnetConfig, Config_S* inetConfig);
 
     // forward function
     void forward(const uint8_t* image, int H, int W,
@@ -72,10 +135,14 @@ public:
 private:
     int m_patch_size;
     int m_DIM;
-
-    // void extractPatches(const uint8_t* image, int H, int W,
-    //                     float* patches, uint8_t* clr,
-    //                     int patches_per_image);
+    
+    // Model inference objects
+    std::unique_ptr<FNetInference> m_fnet;
+    std::unique_ptr<INetInference> m_inet;
+    
+    // Temporary buffers for model outputs
+    std::vector<float> m_fmap_buffer;
+    std::vector<float> m_imap_buffer;
 };
 
 // DPVO Update Model Inference Class
@@ -162,6 +229,7 @@ private:
     size_t m_wOutBufferSize   = 0;  // 1 * 2 * 768 * 1
 
 #if defined(CV28) || defined(CV28_SIMULATOR)
+    std::string m_modelPathStr;    // Store model path as string
     char*       	m_ptrModelPath  = NULL;
     ea_net_t*   	m_model         = NULL;
     

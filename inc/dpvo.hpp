@@ -43,6 +43,9 @@ public:
     
     // Set update model (if not initialized in constructor)
     void setUpdateModel(Config_S* config);
+    
+    // Set fnet and inet models for Patchifier
+    void setPatchifierModels(Config_S* fnetConfig, Config_S* inetConfig);
 
 private:
     void update();

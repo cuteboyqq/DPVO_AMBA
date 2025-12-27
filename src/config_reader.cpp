@@ -67,6 +67,9 @@ void AppConfigReader::read(std::string configPath)
 
         // Model Information
         string modelPath        = "";
+        string fnetModelPath    = "";  // DPVO FNet model path
+        string inetModelPath    = "";  // DPVO INet model path
+        string updateModelPath  = "";  // DPVO Update model path
         int    modelWidth           = 320;
         int    modelHeight          = 320;
 
@@ -148,6 +151,9 @@ void AppConfigReader::read(std::string configPath)
 
         // Model Information
         configReader->getValue("ModelPath", modelPath);
+        configReader->getValue("FnetModelPath", fnetModelPath);
+        configReader->getValue("InetModelPath", inetModelPath);
+        configReader->getValue("UpdateModelPath", updateModelPath);
         configReader->getValue("ModelWidth", modelWidth);
         configReader->getValue("ModelHeight", modelHeight);
 
@@ -222,6 +228,9 @@ void AppConfigReader::read(std::string configPath)
             logger->info("[Model Information]");
             logger->info("-------------------------------------------------");
             logger->info("ModelPath \t\t= {}",      modelPath);
+            logger->info("FnetModelPath \t\t= {}",  fnetModelPath);
+            logger->info("InetModelPath \t\t= {}",  inetModelPath);
+            logger->info("UpdateModelPath \t= {}",  updateModelPath);
             logger->info("ModelWidth \t\t= {}",     modelWidth);
             logger->info("ModelHeight \t\t= {}",    modelHeight);
             
@@ -314,6 +323,9 @@ void AppConfigReader::read(std::string configPath)
 
         // Model Information
         m_config->modelPath      = modelPath;
+        m_config->fnetModelPath   = fnetModelPath;
+        m_config->inetModelPath  = inetModelPath;
+        m_config->updateModelPath = updateModelPath;
         m_config->modelWidth     = modelWidth;
         m_config->modelHeight    = modelHeight;
 

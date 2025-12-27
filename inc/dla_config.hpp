@@ -102,6 +102,11 @@ typedef struct
 typedef struct
 {
     std::string modelPath;
+    
+    // DPVO Model Paths
+    std::string fnetModelPath;      // Path to FNet model
+    std::string inetModelPath;      // Path to INet model
+    std::string updateModelPath;    // Path to DPVO Update model
 
     // Model Input Size
     int modelWidth;

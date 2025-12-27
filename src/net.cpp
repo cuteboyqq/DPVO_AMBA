@@ -2,77 +2,568 @@
 #include "correlation_kernel.hpp"
 #include <sys/stat.h>
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
 
+// =================================================================================================
+// FNet Inference Implementation
+// =================================================================================================
+FNetInference::FNetInference(Config_S *config)
+{
+#ifdef SPDLOG_USE_SYSLOG
+    auto logger = spdlog::syslog_logger_mt("fnet", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+    auto logger = spdlog::stdout_color_mt("fnet");
+    logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+
+    logger->set_level(config->stDebugConfig.AIModel ? spdlog::level::debug : spdlog::level::info);
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    // Use fnetModelPath if available, otherwise fallback to modelPath
+    m_modelPathStr = !config->fnetModelPath.empty() ? config->fnetModelPath : config->modelPath;
+    m_ptrModelPath = const_cast<char *>(m_modelPathStr.c_str());
+
+    // Initialize network parameters
+    ea_net_params_t net_params;
+    memset(&net_params, 0, sizeof(net_params));
+    net_params.acinf_gpu_id = -1;
+
+    // Create network instance
+    m_model = ea_net_new(&net_params);
+    if (m_model == NULL)
+    {
+        logger->error("Creating FNet model failed");
+    }
+
+    m_inputTensor = nullptr;
+    m_outputTensor = nullptr;
+
+    _initModelIO();
+#endif
+}
+
+FNetInference::~FNetInference()
+{
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    _releaseModel();
+    if (m_outputBuffer)
+    {
+        delete[] m_outputBuffer;
+    }
+#endif
+}
+
+bool FNetInference::runInference(const uint8_t *image, int H, int W, float *fmap_out)
+{
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    auto logger = spdlog::get("fnet");
+
+    if (!_loadInput(image, H, W))
+    {
+        logger->error("FNet: Load Input Data Failed");
+        return false;
+    }
+
+    // Run inference
+    if (EA_SUCCESS != ea_net_forward(m_model, 1))
+    {
+        logger->error("FNet: Inference failed");
+        return false;
+    }
+
+    // Sync output tensor
+#if defined(CV28)
+    int rval = ea_tensor_sync_cache(m_outputTensor, EA_VP, EA_CPU);
+    if (rval != EA_SUCCESS)
+    {
+        logger->error("FNet: Failed to sync output tensor");
+    }
+#endif
+
+    m_outputTensor = ea_net_output_by_index(m_model, 0);
+
+    // Copy output to fmap_out
+    // Model output: [1, 128, H/4, W/4] (channel-first in tensor)
+    // Python works at 1/4 resolution (RES=4), so use model output directly without upsampling
+    // Output format: [128, H/4, W/4] where H/4, W/4 match the model output resolution
+    const int outH = m_outputHeight;  // e.g., 120 (H/4)
+    const int outW = m_outputWidth;   // e.g., 160 (W/4)
+    const int outC = m_outputChannel; // 128
+
+    // Copy from tensor directly to fmap_out (no upsampling needed)
+    // Tensor layout: [N, C, H, W] = [1, 128, 120, 160]
+    // Output layout: [C, H, W] = [128, 120, 160]
+    float *tensor_data = (float *)ea_tensor_data(m_outputTensor);
+    for (int c = 0; c < outC; c++)
+    {
+        for (int y = 0; y < outH; y++)
+        {
+            for (int x = 0; x < outW; x++)
+            {
+                // Tensor layout: [N=0, C, H, W]
+                int tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
+                // Output layout: [C, H, W] - same resolution as model output
+                int dst_idx = c * outH * outW + y * outW + x;
+                fmap_out[dst_idx] = tensor_data[tensor_idx] / 4.0f; // Divide by 4.0 as in Python
+            }
+        }
+    }
+
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+void FNetInference::_initModelIO()
+{
+    auto logger = spdlog::get("fnet");
+
+    int rval = EA_SUCCESS;
+    logger->info("-------------------------------------------");
+    logger->info("Configure FNet Model Input/Output");
+
+    // Configure input tensor
+    logger->info("Input Name: {}", m_inputTensorName);
+    rval = ea_net_config_input(m_model, m_inputTensorName.c_str());
+
+    // Configure output tensor
+    logger->info("Output Name: {}", m_outputTensorName);
+    rval = ea_net_config_output(m_model, m_outputTensorName.c_str());
+
+    // Load model
+    logger->info("Model Path: {}", m_ptrModelPath);
+    FILE *file = fopen(m_ptrModelPath, "r");
+    if (file == nullptr)
+    {
+        logger->error("FNet model file does not exist at path: {}", m_ptrModelPath);
+        return;
+    }
+    fclose(file);
+
+    rval = ea_net_load(m_model, EA_NET_LOAD_FILE, (void *)m_ptrModelPath, 1);
+
+    // Get input tensor
+    m_inputTensor = ea_net_input(m_model, m_inputTensorName.c_str());
+    m_inputHeight = ea_tensor_shape(m_inputTensor)[EA_H];
+    m_inputWidth = ea_tensor_shape(m_inputTensor)[EA_W];
+    m_inputChannel = ea_tensor_shape(m_inputTensor)[EA_C];
+    logger->info("FNet Input H: {}, W: {}, C: {}", m_inputHeight, m_inputWidth, m_inputChannel);
+
+    // Get output tensor
+    m_outputTensor = ea_net_output_by_index(m_model, 0);
+    m_outputHeight = ea_tensor_shape(m_outputTensor)[EA_H];
+    m_outputWidth = ea_tensor_shape(m_outputTensor)[EA_W];
+    m_outputChannel = ea_tensor_shape(m_outputTensor)[EA_C];
+    logger->info("FNet Output H: {}, W: {}, C: {}", m_outputHeight, m_outputWidth, m_outputChannel);
+}
+
+bool FNetInference::_releaseModel()
+{
+    if (m_model)
+    {
+        ea_net_free(m_model);
+        m_model = nullptr;
+    }
+    return true;
+}
+
+bool FNetInference::_loadInput(const uint8_t *image, int H, int W)
+{
+    // Convert uint8 image [C, H, W] (channel-first) to model input format [1, 3, H, W]
+    // Model expects: uint8, normalized by std=256 (divide by 256) - handled by model
+
+    // Allocate input buffer
+    const int inputSize = m_inputChannel * m_inputHeight * m_inputWidth;
+    std::vector<uint8_t> inputBuffer(inputSize);
+
+    // Resize image from [C, H, W] to [C, inputH, inputW]
+    // Simple nearest neighbor resize if needed
+    for (int c = 0; c < m_inputChannel; c++)
+    {
+        for (int y = 0; y < m_inputHeight; y++)
+        {
+            for (int x = 0; x < m_inputWidth; x++)
+            {
+                int src_y = (y * H) / m_inputHeight;
+                int src_x = (x * W) / m_inputWidth;
+                // Source image is channel-first: [C, H, W]
+                int src_idx = c * H * W + src_y * W + src_x;
+                // Tensor layout: [N=0, C, H, W]
+                int dst_idx = 0 * m_inputChannel * m_inputHeight * m_inputWidth +
+                              c * m_inputHeight * m_inputWidth +
+                              y * m_inputWidth + x;
+                inputBuffer[dst_idx] = image[src_idx];
+            }
+        }
+    }
+
+    // Copy to input tensor (model will normalize by std=256 internally)
+    std::memcpy(ea_tensor_data(m_inputTensor), inputBuffer.data(), inputSize * sizeof(uint8_t));
+
+    return true;
+}
+#endif
+
+// =================================================================================================
+// INet Inference Implementation
+// =================================================================================================
+INetInference::INetInference(Config_S *config)
+{
+#ifdef SPDLOG_USE_SYSLOG
+    auto logger = spdlog::syslog_logger_mt("inet", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+    auto logger = spdlog::stdout_color_mt("inet");
+    logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+
+    logger->set_level(config->stDebugConfig.AIModel ? spdlog::level::debug : spdlog::level::info);
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    // Use inetModelPath if available, otherwise fallback to modelPath
+    m_modelPathStr = !config->inetModelPath.empty() ? config->inetModelPath : config->modelPath;
+    m_ptrModelPath = const_cast<char *>(m_modelPathStr.c_str());
+
+    // Initialize network parameters
+    ea_net_params_t net_params;
+    memset(&net_params, 0, sizeof(net_params));
+    net_params.acinf_gpu_id = -1;
+
+    // Create network instance
+    m_model = ea_net_new(&net_params);
+    if (m_model == NULL)
+    {
+        logger->error("Creating INet model failed");
+    }
+
+    m_inputTensor = nullptr;
+    m_outputTensor = nullptr;
+
+    _initModelIO();
+#endif
+}
+
+INetInference::~INetInference()
+{
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    _releaseModel();
+    if (m_outputBuffer)
+    {
+        delete[] m_outputBuffer;
+    }
+#endif
+}
+
+bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap_out)
+{
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    auto logger = spdlog::get("inet");
+
+    if (!_loadInput(image, H, W))
+    {
+        logger->error("INet: Load Input Data Failed");
+        return false;
+    }
+
+    // Run inference
+    if (EA_SUCCESS != ea_net_forward(m_model, 1))
+    {
+        logger->error("INet: Inference failed");
+        return false;
+    }
+
+    // Sync output tensor
+#if defined(CV28)
+    int rval = ea_tensor_sync_cache(m_outputTensor, EA_VP, EA_CPU);
+    if (rval != EA_SUCCESS)
+    {
+        logger->error("INet: Failed to sync output tensor");
+    }
+#endif
+
+    m_outputTensor = ea_net_output_by_index(m_model, 0);
+
+    // Copy output to imap_out
+    // Model output: [1, 384, H/4, W/4] (channel-first in tensor)
+    // Python works at 1/4 resolution (RES=4), so use model output directly without upsampling
+    // Output format: [384, H/4, W/4] where H/4, W/4 match the model output resolution
+    const int outH = m_outputHeight;  // e.g., 120 (H/4)
+    const int outW = m_outputWidth;   // e.g., 160 (W/4)
+    const int outC = m_outputChannel; // 384
+
+    // Copy from tensor directly to imap_out (no upsampling needed)
+    // Tensor layout: [N, C, H, W] = [1, 384, 120, 160]
+    // Output layout: [C, H, W] = [384, 120, 160]
+    float *tensor_data = (float *)ea_tensor_data(m_outputTensor);
+    for (int c = 0; c < outC; c++)
+    {
+        for (int y = 0; y < outH; y++)
+        {
+            for (int x = 0; x < outW; x++)
+            {
+                // Tensor layout: [N=0, C, H, W]
+                int tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
+                // Output layout: [C, H, W] - same resolution as model output
+                int dst_idx = c * outH * outW + y * outW + x;
+                imap_out[dst_idx] = tensor_data[tensor_idx] / 4.0f; // Divide by 4.0 as in Python
+            }
+        }
+    }
+
+    return true;
+#else
+    return false;
+#endif
+}
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+void INetInference::_initModelIO()
+{
+    auto logger = spdlog::get("inet");
+
+    int rval = EA_SUCCESS;
+    logger->info("-------------------------------------------");
+    logger->info("Configure INet Model Input/Output");
+
+    // Configure input tensor
+    logger->info("Input Name: {}", m_inputTensorName);
+    rval = ea_net_config_input(m_model, m_inputTensorName.c_str());
+
+    // Configure output tensor
+    logger->info("Output Name: {}", m_outputTensorName);
+    rval = ea_net_config_output(m_model, m_outputTensorName.c_str());
+
+    // Load model
+    logger->info("Model Path: {}", m_ptrModelPath);
+    FILE *file = fopen(m_ptrModelPath, "r");
+    if (file == nullptr)
+    {
+        logger->error("INet model file does not exist at path: {}", m_ptrModelPath);
+        return;
+    }
+    fclose(file);
+
+    rval = ea_net_load(m_model, EA_NET_LOAD_FILE, (void *)m_ptrModelPath, 1);
+
+    // Get input tensor
+    m_inputTensor = ea_net_input(m_model, m_inputTensorName.c_str());
+    m_inputHeight = ea_tensor_shape(m_inputTensor)[EA_H];
+    m_inputWidth = ea_tensor_shape(m_inputTensor)[EA_W];
+    m_inputChannel = ea_tensor_shape(m_inputTensor)[EA_C];
+    logger->info("INet Input H: {}, W: {}, C: {}", m_inputHeight, m_inputWidth, m_inputChannel);
+
+    // Get output tensor
+    m_outputTensor = ea_net_output_by_index(m_model, 0);
+    m_outputHeight = ea_tensor_shape(m_outputTensor)[EA_H];
+    m_outputWidth = ea_tensor_shape(m_outputTensor)[EA_W];
+    m_outputChannel = ea_tensor_shape(m_outputTensor)[EA_C];
+    logger->info("INet Output H: {}, W: {}, C: {}", m_outputHeight, m_outputWidth, m_outputChannel);
+}
+
+bool INetInference::_releaseModel()
+{
+    if (m_model)
+    {
+        ea_net_free(m_model);
+        m_model = nullptr;
+    }
+    return true;
+}
+
+bool INetInference::_loadInput(const uint8_t *image, int H, int W)
+{
+    // Convert uint8 image [C, H, W] (channel-first) to model input format [1, 3, H, W]
+    // Model expects: uint8, normalized by std=256 (divide by 256) - handled by model
+
+    // Allocate input buffer
+    const int inputSize = m_inputChannel * m_inputHeight * m_inputWidth;
+    std::vector<uint8_t> inputBuffer(inputSize);
+
+    // Resize image from [C, H, W] to [C, inputH, inputW]
+    // Simple nearest neighbor resize if needed
+    for (int c = 0; c < m_inputChannel; c++)
+    {
+        for (int y = 0; y < m_inputHeight; y++)
+        {
+            for (int x = 0; x < m_inputWidth; x++)
+            {
+                int src_y = (y * H) / m_inputHeight;
+                int src_x = (x * W) / m_inputWidth;
+                // Source image is channel-first: [C, H, W]
+                int src_idx = c * H * W + src_y * W + src_x;
+                // Tensor layout: [N=0, C, H, W]
+                int dst_idx = 0 * m_inputChannel * m_inputHeight * m_inputWidth +
+                              c * m_inputHeight * m_inputWidth +
+                              y * m_inputWidth + x;
+                inputBuffer[dst_idx] = image[src_idx];
+            }
+        }
+    }
+
+    // Copy to input tensor (model will normalize by std=256 internally)
+    std::memcpy(ea_tensor_data(m_inputTensor), inputBuffer.data(), inputSize * sizeof(uint8_t));
+
+    return true;
+}
+#endif
+
+// =================================================================================================
+// Patchifier Implementation
+// =================================================================================================
 Patchifier::Patchifier(int patch_size, int DIM)
+    : m_patch_size(patch_size), m_DIM(DIM), m_fnet(nullptr), m_inet(nullptr)
+{
+}
+
+Patchifier::Patchifier(int patch_size, int DIM, Config_S *config)
     : m_patch_size(patch_size), m_DIM(DIM)
-{}
+{
+    // Models will be set via setModels() if config provided
+    if (config != nullptr)
+    {
+        // Note: You'll need separate configs for fnet and inet
+        // For now, assuming same config path structure
+    }
+}
+
+Patchifier::~Patchifier()
+{
+    // Models will be automatically destroyed by unique_ptr
+}
+
+void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
+{
+    if (fnetConfig != nullptr)
+    {
+        m_fnet = std::make_unique<FNetInference>(fnetConfig);
+    }
+    if (inetConfig != nullptr)
+    {
+        m_inet = std::make_unique<INetInference>(inetConfig);
+    }
+}
 
 // Forward pass: fill fmap, imap, gmap, patches, clr
+// Note: fmap and imap are at 1/4 resolution (RES=4), but image and coords are at full resolution
 void Patchifier::forward(
-    const uint8_t* image,
-    int H, int W,
-    float* fmap,     // [128, H, W]
-    float* imap,     // [DIM, H, W]
-    float* gmap,     // [M, 128, P, P]
-    float* patches,  // [M, 3, P, P]
-    uint8_t* clr,    // [M, 3]
-    int M
-) {
-    // ------------------------------------------------
-    // 1. Image → float grid (for patches)
-    // ------------------------------------------------
-    std::vector<float> grid(3 * H * W);
-    for (int c = 0; c < 3; c++)
-        for (int i = 0; i < H*W; i++)
-            grid[c*H*W + i] = image[c*H*W + i] / 255.0f;
+    const uint8_t *image,
+    int H, int W,   // Full resolution image dimensions (e.g., 480x640)
+    float *fmap,    // [128, H/4, W/4] - at 1/4 resolution
+    float *imap,    // [DIM, H/4, W/4] - at 1/4 resolution
+    float *gmap,    // [M, 128, P, P]
+    float *patches, // [M, 3, P, P]
+    uint8_t *clr,   // [M, 3]
+    int M)
+{
+    const int RES = 4;          // Resolution factor (Python RES=4)
+    const int fmap_H = H / RES; // fmap height at 1/4 resolution (e.g., 120)
+    const int fmap_W = W / RES; // fmap width at 1/4 resolution (e.g., 160)
 
     // ------------------------------------------------
-    // 2. Generate RANDOM coords (Python RANDOM mode)
+    // 1. Run fnet and inet inference to get fmap and imap
     // ------------------------------------------------
-    std::vector<float> coords(M * 2);
-    for (int m = 0; m < M; m++) {
-        coords[m*2 + 0] = 1 + rand() % (W - 2);
-        coords[m*2 + 1] = 1 + rand() % (H - 2);
+    if (m_fnet != nullptr && m_inet != nullptr)
+    {
+        // Allocate temporary buffers for 1/4 resolution outputs
+        if (m_fmap_buffer.size() != 128 * fmap_H * fmap_W)
+        {
+            m_fmap_buffer.resize(128 * fmap_H * fmap_W);
+        }
+        if (m_imap_buffer.size() != m_DIM * fmap_H * fmap_W)
+        {
+            m_imap_buffer.resize(m_DIM * fmap_H * fmap_W);
+        }
+
+        // Run fnet inference (outputs at 1/4 resolution, no upsampling)
+        if (!m_fnet->runInference(image, H, W, m_fmap_buffer.data()))
+        {
+            // Fallback: zero fill if inference fails
+            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+        }
+
+        // Run inet inference (outputs at 1/4 resolution, no upsampling)
+        if (!m_inet->runInference(image, H, W, m_imap_buffer.data()))
+        {
+            // Fallback: zero fill if inference fails
+            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+        }
+
+        // Copy to output buffers (already at 1/4 resolution)
+        std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
+        std::memcpy(imap, m_imap_buffer.data(), m_DIM * fmap_H * fmap_W * sizeof(float));
+    }
+    else
+    {
+        // Fallback: zero fill if models not available
+        std::fill(fmap, fmap + 128 * fmap_H * fmap_W, 0.0f);
+        std::fill(imap, imap + m_DIM * fmap_H * fmap_W, 0.0f);
     }
 
     // ------------------------------------------------
-    // 3. Patchify grid → patches (RGB)
+    // 2. Image → float grid (for patches) - full resolution
+    // ------------------------------------------------
+    std::vector<float> grid(3 * H * W);
+    for (int c = 0; c < 3; c++)
+        for (int i = 0; i < H * W; i++)
+            grid[c * H * W + i] = image[c * H * W + i] / 255.0f;
+
+    // ------------------------------------------------
+    // 3. Generate RANDOM coords (Python RANDOM mode) - full resolution
+    // ------------------------------------------------
+    std::vector<float> coords(M * 2);
+    for (int m = 0; m < M; m++)
+    {
+        coords[m * 2 + 0] = 1 + rand() % (W - 2); // Full resolution coordinates
+        coords[m * 2 + 1] = 1 + rand() % (H - 2); // Full resolution coordinates
+    }
+
+    // ------------------------------------------------
+    // 4. Patchify grid → patches (RGB) - full resolution
     // ------------------------------------------------
     patchify_cpu_safe(
         grid.data(), coords.data(),
         M, 3, H, W,
         m_patch_size / 2,
-        patches
-    );
+        patches);
 
     // ------------------------------------------------
-    // 4. Patchify fmap → gmap
+    // 5. Patchify fmap → gmap - scale coords to 1/4 resolution
     // ------------------------------------------------
+    // fmap is at 1/4 resolution, so scale coordinates
+    std::vector<float> fmap_coords(M * 2);
+    for (int m = 0; m < M; m++)
+    {
+        fmap_coords[m * 2 + 0] = coords[m * 2 + 0] / RES; // Scale to 1/4 resolution
+        fmap_coords[m * 2 + 1] = coords[m * 2 + 1] / RES; // Scale to 1/4 resolution
+    }
+
     patchify_cpu_safe(
-        fmap, coords.data(),
-        M, 128, H, W,
+        fmap, fmap_coords.data(),
+        M, 128, fmap_H, fmap_W, // Use 1/4 resolution dimensions
         m_patch_size / 2,
-        gmap
-    );
+        gmap);
 
     // ------------------------------------------------
-    // 5. imap sampling (radius = 0)
+    // 6. imap sampling (radius = 0) - scale coords to 1/4 resolution
     // ------------------------------------------------
     patchify_cpu_safe(
-        imap, coords.data(),
-        M, m_DIM, H, W,
+        imap, fmap_coords.data(),
+        M, m_DIM, fmap_H, fmap_W, // Use 1/4 resolution dimensions
         0,
-        imap   // reuse buffer shape [M, DIM, 1, 1]
+        imap // reuse buffer shape [M, DIM, 1, 1]
     );
 
     // ------------------------------------------------
-    // 6. Color for visualization
+    // 7. Color for visualization - full resolution
     // ------------------------------------------------
-    for (int m = 0; m < M; m++) {
-        int x = static_cast<int>(coords[m*2 + 0]);
-        int y = static_cast<int>(coords[m*2 + 1]);
+    for (int m = 0; m < M; m++)
+    {
+        int x = static_cast<int>(coords[m * 2 + 0]);
+        int y = static_cast<int>(coords[m * 2 + 1]);
         for (int c = 0; c < 3; c++)
-            clr[m*3 + c] = image[c*H*W + y*W + x];
+            clr[m * 3 + c] = image[c * H * W + y * W + x];
     }
 }
 
@@ -149,7 +640,9 @@ DPVOUpdate::DPVOUpdate(Config_S *config, WakeCallback wakeFunc)
     // ==================================
 #if defined(CV28) || defined(CV28_SIMULATOR)
 
-    m_ptrModelPath = const_cast<char *>(config->modelPath.c_str());
+    // Use updateModelPath if available, otherwise fallback to modelPath
+    m_modelPathStr = !config->updateModelPath.empty() ? config->updateModelPath : config->modelPath;
+    m_ptrModelPath = const_cast<char *>(m_modelPathStr.c_str());
 
     // Initialize network parameters
     ea_net_params_t net_params;
@@ -165,27 +658,27 @@ DPVOUpdate::DPVOUpdate(Config_S *config, WakeCallback wakeFunc)
         logger->error("Creating DPVO Update model failed");
     }
 
-    m_inputNetTensor  = NULL;
-    m_inputInpTensor  = NULL;
+    m_inputNetTensor = NULL;
+    m_inputInpTensor = NULL;
     m_inputCorrTensor = NULL;
-    m_inputIiTensor   = NULL;
-    m_inputJjTensor   = NULL;
-    m_inputKkTensor   = NULL;
+    m_inputIiTensor = NULL;
+    m_inputJjTensor = NULL;
+    m_inputKkTensor = NULL;
 
-    m_outputTensors = std::vector<ea_tensor_t*>(m_outputTensorList.size());
+    m_outputTensors = std::vector<ea_tensor_t *>(m_outputTensorList.size());
 
     // Allocate working buffers for input data
-    m_netBuff  = new float[m_netBufferSize];
-    m_inpBuff  = new float[m_inpBufferSize];
+    m_netBuff = new float[m_netBufferSize];
+    m_inpBuff = new float[m_inpBufferSize];
     m_corrBuff = new float[m_corrBufferSize];
-    m_iiBuff   = new int32_t[m_iiBufferSize];
-    m_jjBuff   = new int32_t[m_jjBufferSize];
-    m_kkBuff   = new int32_t[m_kkBufferSize];
+    m_iiBuff = new int32_t[m_iiBufferSize];
+    m_jjBuff = new int32_t[m_jjBufferSize];
+    m_kkBuff = new int32_t[m_kkBufferSize];
 
     // Allocate working buffers for output data
     m_netOutBuff = new float[m_netOutBufferSize];
-    m_dOutBuff   = new float[m_dOutBufferSize];
-    m_wOutBuff   = new float[m_wOutBufferSize];
+    m_dOutBuff = new float[m_dOutBufferSize];
+    m_wOutBuff = new float[m_wOutBufferSize];
 #endif
     // ==================================
 
@@ -202,7 +695,7 @@ bool DPVOUpdate::_releaseModel()
         ea_net_free(m_model);
         m_model = NULL;
     }
-    
+
     return true;
 }
 
@@ -268,19 +761,19 @@ void DPVOUpdate::_initModelIO()
     logger->info("Configure Input Tensors");
     logger->info("Input Net Name: {}", m_inputNetTensorName);
     rval = ea_net_config_input(m_model, m_inputNetTensorName.c_str());
-    
+
     logger->info("Input Inp Name: {}", m_inputInpTensorName);
     rval = ea_net_config_input(m_model, m_inputInpTensorName.c_str());
-    
+
     logger->info("Input Corr Name: {}", m_inputCorrTensorName);
     rval = ea_net_config_input(m_model, m_inputCorrTensorName.c_str());
-    
+
     logger->info("Input Ii Name: {}", m_inputIiTensorName);
     rval = ea_net_config_input(m_model, m_inputIiTensorName.c_str());
-    
+
     logger->info("Input Jj Name: {}", m_inputJjTensorName);
     rval = ea_net_config_input(m_model, m_inputJjTensorName.c_str());
-    
+
     logger->info("Input Kk Name: {}", m_inputKkTensorName);
     rval = ea_net_config_input(m_model, m_inputKkTensorName.c_str());
 
@@ -288,7 +781,8 @@ void DPVOUpdate::_initModelIO()
     logger->info("-------------------------------------------");
     logger->info("Configure Output Tensors");
 
-    for (size_t i = 0; i < m_outputTensorList.size(); ++i) {
+    for (size_t i = 0; i < m_outputTensorList.size(); ++i)
+    {
         logger->info("Output Name: {}", m_outputTensorList[i]);
         rval = ea_net_config_output(m_model, m_outputTensorList[i].c_str());
     }
@@ -299,51 +793,53 @@ void DPVOUpdate::_initModelIO()
     logger->info("Model Path: {}", m_ptrModelPath);
 
     // Check if model path exists before loading
-    if (m_ptrModelPath == nullptr || strlen(m_ptrModelPath) == 0) {
+    if (m_ptrModelPath == nullptr || strlen(m_ptrModelPath) == 0)
+    {
         logger->error("Model path is null or empty");
         return;
     }
-    
+
     // Check if file exists
-    FILE* file = fopen(m_ptrModelPath, "r");
-    if (file == nullptr) {
+    FILE *file = fopen(m_ptrModelPath, "r");
+    if (file == nullptr)
+    {
         logger->error("Model file does not exist at path: {}", m_ptrModelPath);
         return;
     }
     fclose(file);
-    
+
     logger->info("Model file exists, proceeding with loading");
 
-    rval = ea_net_load(m_model, EA_NET_LOAD_FILE, (void *)m_ptrModelPath, 1/*max_batch*/);
+    rval = ea_net_load(m_model, EA_NET_LOAD_FILE, (void *)m_ptrModelPath, 1 /*max_batch*/);
 
     // Get input tensors
     logger->info("-------------------------------------------");
     logger->info("Create Model Input Tensors");
-    
-    m_inputNetTensor  = ea_net_input(m_model, m_inputNetTensorName.c_str());
-    m_inputInpTensor  = ea_net_input(m_model, m_inputInpTensorName.c_str());
+
+    m_inputNetTensor = ea_net_input(m_model, m_inputNetTensorName.c_str());
+    m_inputInpTensor = ea_net_input(m_model, m_inputInpTensorName.c_str());
     m_inputCorrTensor = ea_net_input(m_model, m_inputCorrTensorName.c_str());
-    m_inputIiTensor   = ea_net_input(m_model, m_inputIiTensorName.c_str());
-    m_inputJjTensor   = ea_net_input(m_model, m_inputJjTensorName.c_str());
-    m_inputKkTensor   = ea_net_input(m_model, m_inputKkTensorName.c_str());
-    
+    m_inputIiTensor = ea_net_input(m_model, m_inputIiTensorName.c_str());
+    m_inputJjTensor = ea_net_input(m_model, m_inputJjTensorName.c_str());
+    m_inputKkTensor = ea_net_input(m_model, m_inputKkTensorName.c_str());
+
     logger->info("Input Net Shape: {}x{}x{}x{}",
-        ea_tensor_shape(m_inputNetTensor)[EA_N],
-        ea_tensor_shape(m_inputNetTensor)[EA_H],
-        ea_tensor_shape(m_inputNetTensor)[EA_W],
-        ea_tensor_shape(m_inputNetTensor)[EA_C]);
-    
+                 ea_tensor_shape(m_inputNetTensor)[EA_N],
+                 ea_tensor_shape(m_inputNetTensor)[EA_H],
+                 ea_tensor_shape(m_inputNetTensor)[EA_W],
+                 ea_tensor_shape(m_inputNetTensor)[EA_C]);
+
     logger->info("Input Inp Shape: {}x{}x{}x{}",
-        ea_tensor_shape(m_inputInpTensor)[EA_N],
-        ea_tensor_shape(m_inputInpTensor)[EA_H],
-        ea_tensor_shape(m_inputInpTensor)[EA_W],
-        ea_tensor_shape(m_inputInpTensor)[EA_C]);
-    
+                 ea_tensor_shape(m_inputInpTensor)[EA_N],
+                 ea_tensor_shape(m_inputInpTensor)[EA_H],
+                 ea_tensor_shape(m_inputInpTensor)[EA_W],
+                 ea_tensor_shape(m_inputInpTensor)[EA_C]);
+
     logger->info("Input Corr Shape: {}x{}x{}x{}",
-        ea_tensor_shape(m_inputCorrTensor)[EA_N],
-        ea_tensor_shape(m_inputCorrTensor)[EA_H],
-        ea_tensor_shape(m_inputCorrTensor)[EA_W],
-        ea_tensor_shape(m_inputCorrTensor)[EA_C]);
+                 ea_tensor_shape(m_inputCorrTensor)[EA_N],
+                 ea_tensor_shape(m_inputCorrTensor)[EA_H],
+                 ea_tensor_shape(m_inputCorrTensor)[EA_W],
+                 ea_tensor_shape(m_inputCorrTensor)[EA_C]);
 
     // Get output tensors
     logger->info("-------------------------------------------");
@@ -352,17 +848,17 @@ void DPVOUpdate::_initModelIO()
     m_outputTensors[1] = ea_net_output_by_index(m_model, 1);
     m_outputTensors[2] = ea_net_output_by_index(m_model, 2);
 
-    for (size_t i=0; i<ea_net_output_num(m_model); i++)
+    for (size_t i = 0; i < ea_net_output_num(m_model); i++)
     {
-        const char* tensorName = static_cast<const char*>(ea_net_output_name(m_model, i));
-        const size_t* tensorShape = static_cast<const size_t*>(ea_tensor_shape(ea_net_output_by_index(m_model, i)));
+        const char *tensorName = static_cast<const char *>(ea_net_output_name(m_model, i));
+        const size_t *tensorShape = static_cast<const size_t *>(ea_tensor_shape(ea_net_output_by_index(m_model, i)));
         size_t tensorSize = static_cast<size_t>(ea_tensor_size(ea_net_output_by_index(m_model, i)));
-        
-        std::string shapeStr = std::to_string(tensorShape[0]) + "x" + 
-                               std::to_string(tensorShape[1]) + "x" + 
-                               std::to_string(tensorShape[2]) + "x" + 
+
+        std::string shapeStr = std::to_string(tensorShape[0]) + "x" +
+                               std::to_string(tensorShape[1]) + "x" +
+                               std::to_string(tensorShape[2]) + "x" +
                                std::to_string(tensorShape[3]);
-        
+
         logger->info("Output Tensor Name: {}", tensorName);
         logger->info("Output Tensor Shape: ({})", shapeStr);
         logger->info("Output Tensor Size: {}", tensorSize);
@@ -384,18 +880,22 @@ bool DPVOUpdate::_checkSavedTensor(int frameIdx)
     auto time_0 = std::chrono::high_resolution_clock::now();
 
     // Define file paths for each tensor
-    std::string netOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx-1) + "_tensor0.bin";
-    std::string dOutFilePath    = m_tensorPath + "/frame_" + std::to_string(frameIdx-1) + "_tensor1.bin";
-    std::string wOutFilePath    = m_tensorPath + "/frame_" + std::to_string(frameIdx-1) + "_tensor2.bin";
+    std::string netOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor0.bin";
+    std::string dOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor1.bin";
+    std::string wOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor2.bin";
 
     // Function to load tensor data from a binary file
-    auto loadTensorFromBinaryFile = [](const std::string& filePath, float* buffer, size_t size) {
+    auto loadTensorFromBinaryFile = [](const std::string &filePath, float *buffer, size_t size)
+    {
         std::ifstream inFile(filePath, std::ios::binary);
-        if (inFile.is_open()) {
-            inFile.read(reinterpret_cast<char*>(buffer), size * sizeof(float));
+        if (inFile.is_open())
+        {
+            inFile.read(reinterpret_cast<char *>(buffer), size * sizeof(float));
             inFile.close();
             return true;
-        } else {
+        }
+        else
+        {
             std::cerr << "Failed to open file: " << filePath << std::endl;
             return false;
         }
@@ -405,7 +905,7 @@ bool DPVOUpdate::_checkSavedTensor(int frameIdx)
     std::ifstream netOutFile(netOutFilePath, std::ios::binary);
     std::ifstream dOutFile(dOutFilePath, std::ios::binary);
     std::ifstream wOutFile(wOutFilePath, std::ios::binary);
-    
+
     if (netOutFile && loadTensorFromBinaryFile(netOutFilePath, m_netOutBuff, m_netOutBufferSize) &&
         dOutFile && loadTensorFromBinaryFile(dOutFilePath, m_dOutBuff, m_dOutBufferSize) &&
         wOutFile && loadTensorFromBinaryFile(wOutFilePath, m_wOutBuff, m_wOutBufferSize))
@@ -414,7 +914,7 @@ bool DPVOUpdate::_checkSavedTensor(int frameIdx)
         {
             auto time_1 = std::chrono::high_resolution_clock::now();
             logger->info("[_checkSavedTensor]: {} ms",
-                std::chrono::duration_cast<std::chrono::nanoseconds>(time_1 - time_0).count() / (1000.0 * 1000));
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(time_1 - time_0).count() / (1000.0 * 1000));
         }
 
         return true; // true means the tensors are already saved in the specific path
@@ -428,30 +928,33 @@ bool DPVOUpdate::_saveOutputTensor(int frameIdx)
 {
     auto logger = spdlog::get("dpvo_update");
 
-    std::string netOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx-1) + "_tensor0.bin";
-    std::string dOutFilePath    = m_tensorPath + "/frame_" + std::to_string(frameIdx-1) + "_tensor1.bin";
-    std::string wOutFilePath    = m_tensorPath + "/frame_" + std::to_string(frameIdx-1) + "_tensor2.bin";
+    std::string netOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor0.bin";
+    std::string dOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor1.bin";
+    std::string wOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor2.bin";
 
     logger->debug("========================================");
     logger->debug("Model Frame Index: {}", frameIdx);
-    logger->debug("Out Buffer Size: {}", m_predictionBuffer.size());
     logger->debug("========================================");
 
     // Save tensors to binary files
-    auto saveTensorToBinaryFile = [](const std::string& filePath, float* buffer, size_t size) {
+    auto saveTensorToBinaryFile = [](const std::string &filePath, float *buffer, size_t size)
+    {
         std::ofstream outFile(filePath, std::ios::binary);
-        if (outFile.is_open()) {
-            outFile.write(reinterpret_cast<char*>(buffer), size * sizeof(float));
+        if (outFile.is_open())
+        {
+            outFile.write(reinterpret_cast<char *>(buffer), size * sizeof(float));
             outFile.close();
-        } else {
+        }
+        else
+        {
             std::cerr << "Failed to open file: " << filePath << std::endl;
         }
     };
-    
+
     // Save each tensor to its corresponding binary file
     saveTensorToBinaryFile(netOutFilePath, m_pred.netOutBuff, m_netOutBufferSize);
-    saveTensorToBinaryFile(dOutFilePath,   m_pred.dOutBuff,   m_dOutBufferSize);
-    saveTensorToBinaryFile(wOutFilePath,   m_pred.wOutBuff,   m_wOutBufferSize);
+    saveTensorToBinaryFile(dOutFilePath, m_pred.dOutBuff, m_dOutBufferSize);
+    saveTensorToBinaryFile(wOutFilePath, m_pred.wOutBuff, m_wOutBufferSize);
 
     return true;
 }
@@ -459,18 +962,36 @@ bool DPVOUpdate::_saveOutputTensor(int frameIdx)
 
 bool DPVOUpdate::_releaseInputTensors()
 {
-    if (m_inputNetTensor)  { m_inputNetTensor  = nullptr; }
-    if (m_inputInpTensor)  { m_inputInpTensor  = nullptr; }
-    if (m_inputCorrTensor) { m_inputCorrTensor = nullptr; }
-    if (m_inputIiTensor)   { m_inputIiTensor   = nullptr; }
-    if (m_inputJjTensor)   { m_inputJjTensor   = nullptr; }
-    if (m_inputKkTensor)   { m_inputKkTensor  = nullptr; }
+    if (m_inputNetTensor)
+    {
+        m_inputNetTensor = nullptr;
+    }
+    if (m_inputInpTensor)
+    {
+        m_inputInpTensor = nullptr;
+    }
+    if (m_inputCorrTensor)
+    {
+        m_inputCorrTensor = nullptr;
+    }
+    if (m_inputIiTensor)
+    {
+        m_inputIiTensor = nullptr;
+    }
+    if (m_inputJjTensor)
+    {
+        m_inputJjTensor = nullptr;
+    }
+    if (m_inputKkTensor)
+    {
+        m_inputKkTensor = nullptr;
+    }
     return true;
 }
 
 bool DPVOUpdate::_releaseOutputTensors()
 {
-    for (size_t i=0; i<m_outputTensorList.size(); i++)
+    for (size_t i = 0; i < m_outputTensorList.size(); i++)
     {
         if (m_outputTensors[i])
         {
@@ -495,16 +1016,16 @@ bool DPVOUpdate::_releaseTensorBuffers()
     delete[] m_dOutBuff;
     delete[] m_wOutBuff;
 
-    m_netBuff  = nullptr;
-    m_inpBuff  = nullptr;
+    m_netBuff = nullptr;
+    m_inpBuff = nullptr;
     m_corrBuff = nullptr;
-    m_iiBuff   = nullptr;
-    m_jjBuff   = nullptr;
-    m_kkBuff   = nullptr;
+    m_iiBuff = nullptr;
+    m_jjBuff = nullptr;
+    m_kkBuff = nullptr;
 
     m_netOutBuff = nullptr;
-    m_dOutBuff   = nullptr;
-    m_wOutBuff   = nullptr;
+    m_dOutBuff = nullptr;
+    m_wOutBuff = nullptr;
 
     return true;
 }
@@ -514,38 +1035,38 @@ bool DPVOUpdate::_releaseTensorBuffers()
 // =================================================================================================
 // Synchronous Inference (Public API)
 // =================================================================================================
-bool DPVOUpdate::runInference(float* netData, float* inpData, float* corrData, 
-                              int32_t* iiData, int32_t* jjData, int32_t* kkData, 
-                              int frameIdx, DPVOUpdate_Prediction& pred)
+bool DPVOUpdate::runInference(float *netData, float *inpData, float *corrData,
+                              int32_t *iiData, int32_t *jjData, int32_t *kkData,
+                              int frameIdx, DPVOUpdate_Prediction &pred)
 {
     // Reset prediction structure
     pred = DPVOUpdate_Prediction();
-    
+
     // Call internal _run method
     if (!_run(netData, inpData, corrData, iiData, jjData, kkData, frameIdx))
     {
         return false;
     }
-    
+
     // Copy results directly from m_pred to output
     pred.isProcessed = m_pred.isProcessed;
     pred.netOutBuff = m_pred.netOutBuff;
-    pred.dOutBuff   = m_pred.dOutBuff;
-    pred.wOutBuff   = m_pred.wOutBuff;
-    
+    pred.dOutBuff = m_pred.dOutBuff;
+    pred.wOutBuff = m_pred.wOutBuff;
+
     // Clear m_pred buffers so they don't get double-freed
     m_pred.netOutBuff = nullptr;
-    m_pred.dOutBuff   = nullptr;
-    m_pred.wOutBuff   = nullptr;
-    
+    m_pred.dOutBuff = nullptr;
+    m_pred.wOutBuff = nullptr;
+
     return true;
 }
 
 // =================================================================================================
 // Inference Entrypoint (Internal)
 // =================================================================================================
-bool DPVOUpdate::_run(float* netData, float* inpData, float* corrData, 
-                      int32_t* iiData, int32_t* jjData, int32_t* kkData, int frameIdx)
+bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
+                      int32_t *iiData, int32_t *jjData, int32_t *kkData, int frameIdx)
 {
 #ifdef SPDLOG_USE_SYSLOG
     auto logger = spdlog::get("dpvo_update");
@@ -558,7 +1079,6 @@ bool DPVOUpdate::_run(float* netData, float* inpData, float* corrData,
     auto time_2 = std::chrono::high_resolution_clock::now();
 
     logger->debug(" =========== Model Frame Index: {} ===========", frameIdx);
-    logger->debug(" =========== Buffer Size: {} ===========", m_inputFrameBuffer.size());
 
     if (m_estimateTime)
     {
@@ -588,13 +1108,13 @@ bool DPVOUpdate::_run(float* netData, float* inpData, float* corrData,
     {
         // Allocate memory for all output tensors
         m_pred.netOutBuff = new float[m_netOutBufferSize];
-        m_pred.dOutBuff   = new float[m_dOutBufferSize];
-        m_pred.wOutBuff   = new float[m_wOutBufferSize];
+        m_pred.dOutBuff = new float[m_dOutBufferSize];
+        m_pred.wOutBuff = new float[m_wOutBufferSize];
 
         // Copy output tensors to prediction buffers
         std::memcpy(m_pred.netOutBuff, (float *)m_netOutBuff, m_netOutBufferSize * sizeof(float));
-        std::memcpy(m_pred.dOutBuff,   (float *)m_dOutBuff,   m_dOutBufferSize * sizeof(float));
-        std::memcpy(m_pred.wOutBuff,   (float *)m_wOutBuff,   m_wOutBufferSize * sizeof(float));
+        std::memcpy(m_pred.dOutBuff, (float *)m_dOutBuff, m_dOutBufferSize * sizeof(float));
+        std::memcpy(m_pred.wOutBuff, (float *)m_wOutBuff, m_wOutBufferSize * sizeof(float));
     }
     else
     {
@@ -636,13 +1156,13 @@ bool DPVOUpdate::_run(float* netData, float* inpData, float* corrData,
 
             // Allocate memory for all output tensors
             m_pred.netOutBuff = new float[m_netOutBufferSize];
-            m_pred.dOutBuff   = new float[m_dOutBufferSize];
-            m_pred.wOutBuff   = new float[m_wOutBufferSize];
+            m_pred.dOutBuff = new float[m_dOutBufferSize];
+            m_pred.wOutBuff = new float[m_wOutBufferSize];
 
             // Copy output tensors to prediction buffers
             std::memcpy(m_pred.netOutBuff, (float *)ea_tensor_data(m_outputTensors[0]), m_netOutBufferSize * sizeof(float));
-            std::memcpy(m_pred.dOutBuff,   (float *)ea_tensor_data(m_outputTensors[1]), m_dOutBufferSize * sizeof(float));
-            std::memcpy(m_pred.wOutBuff,   (float *)ea_tensor_data(m_outputTensors[2]), m_wOutBufferSize * sizeof(float));
+            std::memcpy(m_pred.dOutBuff, (float *)ea_tensor_data(m_outputTensors[1]), m_dOutBufferSize * sizeof(float));
+            std::memcpy(m_pred.wOutBuff, (float *)ea_tensor_data(m_outputTensors[2]), m_wOutBufferSize * sizeof(float));
 
 #if defined(SAVE_OUTPUT_TENSOR)
             _saveOutputTensor(frameIdx);
@@ -653,20 +1173,19 @@ bool DPVOUpdate::_run(float* netData, float* inpData, float* corrData,
     m_bProcessed = true;
 
     logger->debug(" ============= Model Frame Index: {} =============", frameIdx);
-    logger->debug(" ============= Out Buffer Size: {} =============", m_predictionBuffer.size());
 
     if (m_estimateTime)
     {
         time_2 = std::chrono::high_resolution_clock::now();
         logger->info("[Inference]: {} ms",
-            std::chrono::duration_cast<std::chrono::nanoseconds>(time_2 - time_1).count() / (1000.0 * 1000));
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(time_2 - time_1).count() / (1000.0 * 1000));
     }
 #endif
     // ==================================
 
-    time_2           = std::chrono::high_resolution_clock::now();
+    time_2 = std::chrono::high_resolution_clock::now();
     auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(time_2 - time_0);
-    m_inferenceTime  = static_cast<float>(nanoseconds.count()) / 1e9f;
+    m_inferenceTime = static_cast<float>(nanoseconds.count()) / 1e9f;
 
     if (m_estimateTime)
     {
@@ -676,92 +1195,15 @@ bool DPVOUpdate::_run(float* netData, float* inpData, float* corrData,
 
     logger->debug("End AI Model Part");
     logger->debug("========================================");
-    m_bDone = true;
 
     return true;
-}
-
-void DPVOUpdate::runThread()
-{
-    m_threadInference = std::thread(&DPVOUpdate::_runInferenceFunc, this);
-    return;
-}
-
-void DPVOUpdate::stopThread()
-{
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_threadTerminated = true;
-    }
-
-    m_condition.notify_all(); // Wake up the thread if it's waiting
-    if (m_threadInference.joinable())
-    {
-        m_threadInference.join();
-    }
-}
-
-bool DPVOUpdate::_runInferenceFunc()
-{
-#ifdef SPDLOG_USE_SYSLOG
-    auto logger = spdlog::get("dpvo_update");
-#else
-    auto logger = spdlog::get("dpvo_update");
-#endif
-
-    while (!m_threadTerminated)
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_condition.wait(lock,
-            [this]() { return m_threadTerminated || (!m_inputFrameBuffer.empty() && m_threadStarted); });
-
-        if (m_threadTerminated)
-            break;
-
-        // Read input data from buffer
-        auto    pair     = m_inputFrameBuffer.front();
-        int     frameIdx = pair.first;
-        InputData inputData = pair.second;
-        m_inputFrameBuffer.pop_front();
-        lock.unlock();
-
-        // Perform AI Inference
-        if (!_run(inputData.netData, inputData.inpData, inputData.corrData, 
-                  inputData.iiData, inputData.jjData, inputData.kkData, frameIdx))
-        {
-            logger->error("Failed in AI Inference");
-            // Free allocated memory before returning
-            delete[] inputData.netData;
-            delete[] inputData.inpData;
-            delete[] inputData.corrData;
-            delete[] inputData.iiData;
-            delete[] inputData.jjData;
-            delete[] inputData.kkData;
-            return true;
-        }
-        
-        // Free allocated memory after inference
-        delete[] inputData.netData;
-        delete[] inputData.inpData;
-        delete[] inputData.corrData;
-        delete[] inputData.iiData;
-        delete[] inputData.jjData;
-        delete[] inputData.kkData;
-    }
-    return true;
-}
-
-void DPVOUpdate::notifyProcessingComplete()
-{
-    if (m_wakeFunc)
-        m_wakeFunc();
 }
 
 // =================================================================================================
 // Load Inputs
 // =================================================================================================
-bool DPVOUpdate::_loadInput(float* netData, float* inpData, float* corrData, 
-                            int32_t* iiData, int32_t* jjData, int32_t* kkData)
+bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
+                            int32_t *iiData, int32_t *jjData, int32_t *kkData)
 {
 #ifdef SPDLOG_USE_SYSLOG
     auto logger = spdlog::get("dpvo_update");
@@ -770,132 +1212,41 @@ bool DPVOUpdate::_loadInput(float* netData, float* inpData, float* corrData,
 #endif
 
     auto time_0 = m_estimateTime ? std::chrono::high_resolution_clock::now()
-                                  : std::chrono::time_point<std::chrono::high_resolution_clock>{};
+                                 : std::chrono::time_point<std::chrono::high_resolution_clock>{};
     auto time_1 = std::chrono::time_point<std::chrono::high_resolution_clock>{};
 
     // Copy input data to working buffers
-    std::memcpy(m_netBuff,  netData,  m_netBufferSize * sizeof(float));
-    std::memcpy(m_inpBuff,  inpData,  m_inpBufferSize * sizeof(float));
+    std::memcpy(m_netBuff, netData, m_netBufferSize * sizeof(float));
+    std::memcpy(m_inpBuff, inpData, m_inpBufferSize * sizeof(float));
     std::memcpy(m_corrBuff, corrData, m_corrBufferSize * sizeof(float));
-    std::memcpy(m_iiBuff,   iiData,   m_iiBufferSize * sizeof(int32_t));
-    std::memcpy(m_jjBuff,   jjData,   m_jjBufferSize * sizeof(int32_t));
-    std::memcpy(m_kkBuff,   kkData,   m_kkBufferSize * sizeof(int32_t));
+    std::memcpy(m_iiBuff, iiData, m_iiBufferSize * sizeof(int32_t));
+    std::memcpy(m_jjBuff, jjData, m_jjBufferSize * sizeof(int32_t));
+    std::memcpy(m_kkBuff, kkData, m_kkBufferSize * sizeof(int32_t));
 
     // Copy data to input tensors
 #if defined(CV28) || defined(CV28_SIMULATOR)
     // Copy float tensors
-    std::memcpy(ea_tensor_data(m_inputNetTensor),  m_netBuff,  m_netBufferSize * sizeof(float));
-    std::memcpy(ea_tensor_data(m_inputInpTensor),  m_inpBuff,  m_inpBufferSize * sizeof(float));
+    std::memcpy(ea_tensor_data(m_inputNetTensor), m_netBuff, m_netBufferSize * sizeof(float));
+    std::memcpy(ea_tensor_data(m_inputInpTensor), m_inpBuff, m_inpBufferSize * sizeof(float));
     std::memcpy(ea_tensor_data(m_inputCorrTensor), m_corrBuff, m_corrBufferSize * sizeof(float));
-    
+
     // Copy int32 tensors
-    std::memcpy(ea_tensor_data(m_inputIiTensor),   m_iiBuff,   m_iiBufferSize * sizeof(int32_t));
-    std::memcpy(ea_tensor_data(m_inputJjTensor),   m_jjBuff,   m_jjBufferSize * sizeof(int32_t));
-    std::memcpy(ea_tensor_data(m_inputKkTensor),   m_kkBuff,   m_kkBufferSize * sizeof(int32_t));
+    std::memcpy(ea_tensor_data(m_inputIiTensor), m_iiBuff, m_iiBufferSize * sizeof(int32_t));
+    std::memcpy(ea_tensor_data(m_inputJjTensor), m_jjBuff, m_jjBufferSize * sizeof(int32_t));
+    std::memcpy(ea_tensor_data(m_inputKkTensor), m_kkBuff, m_kkBufferSize * sizeof(int32_t));
 #endif
 
     if (m_estimateTime)
     {
         time_1 = std::chrono::high_resolution_clock::now();
         logger->info("[Load Input]: {} ms",
-            std::chrono::duration_cast<std::chrono::nanoseconds>(time_1 - time_0).count() / (1000.0 * 1000));
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(time_1 - time_0).count() / (1000.0 * 1000));
     }
 
     return true;
 }
 
-void DPVOUpdate::updateInputData(float* netData, float* inpData, float* corrData, 
-                                 int32_t* iiData, int32_t* jjData, int32_t* kkData, int frameIdx)
-{
-#ifdef SPDLOG_USE_SYSLOG
-    auto logger = spdlog::get("dpvo_update");
-#else
-    auto logger = spdlog::get("dpvo_update");
-#endif
-
-    std::unique_lock<std::mutex> lock(m_mutex);
-
-    // Allocate and copy input data
-    InputData inputData;
-    inputData.netData  = new float[m_netBufferSize];
-    inputData.inpData  = new float[m_inpBufferSize];
-    inputData.corrData = new float[m_corrBufferSize];
-    inputData.iiData   = new int32_t[m_iiBufferSize];
-    inputData.jjData   = new int32_t[m_jjBufferSize];
-    inputData.kkData   = new int32_t[m_kkBufferSize];
-
-    std::memcpy(inputData.netData,  netData,  m_netBufferSize * sizeof(float));
-    std::memcpy(inputData.inpData,  inpData,  m_inpBufferSize * sizeof(float));
-    std::memcpy(inputData.corrData, corrData, m_corrBufferSize * sizeof(float));
-    std::memcpy(inputData.iiData,   iiData,   m_iiBufferSize * sizeof(int32_t));
-    std::memcpy(inputData.jjData,   jjData,   m_jjBufferSize * sizeof(int32_t));
-    std::memcpy(inputData.kkData,   kkData,   m_kkBufferSize * sizeof(int32_t));
-
-    m_inputFrameBuffer.emplace_back(frameIdx, inputData);
-    m_threadStarted = true;
-    m_bDone         = false;
-    lock.unlock();
-
-    m_condition.notify_one();
-}
-
-// =================================================================================================
-// Post Processing
-// =================================================================================================
-bool DPVOUpdate::getLastestPrediction(DPVOUpdate_Prediction& pred, int& frameIdx)
-{
-#ifdef SPDLOG_USE_SYSLOG
-    auto logger = spdlog::get("dpvo_update");
-#else
-    auto logger = spdlog::get("dpvo_update");
-#endif
-
-    std::unique_lock<std::mutex> lock(m_mutex);
-    const auto                   bufferSize = m_predictionBuffer.size();
-
-    if (bufferSize == 0)
-        return false;
-
-    if (bufferSize > 0)
-    {
-        auto pair = m_predictionBuffer.front();
-        frameIdx  = pair.first;
-        pred      = pair.second;
-        m_predictionBuffer.pop_front();
-        return true;
-    }
-
-    lock.unlock();
-
-    logger->warn("buffSize is negative = {}", m_predictionBuffer.size());
-    return false;
-}
-
-// =================================================================================================
-// Utility Functions
-// =================================================================================================
-void DPVOUpdate::getDebugProfiles(float& inferenceTime, int& inputBufferSize, int& outputBufferSize)
-{
-    std::unique_lock<std::mutex> lock(m_mutex);
-    inputBufferSize  = m_inputFrameBuffer.size();
-    outputBufferSize = m_predictionBuffer.size();
-    inferenceTime    = m_inferenceTime;
-    lock.unlock();
-}
-
-bool DPVOUpdate::isInputBufferEmpty() const
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_inputFrameBuffer.empty();
-}
-
-bool DPVOUpdate::isPredictionBufferEmpty() const
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_predictionBuffer.empty();
-}
-
-void DPVOUpdate::updateTensorPath(const std::string& path)
+void DPVOUpdate::updateTensorPath(const std::string &path)
 {
 #ifdef SPDLOG_USE_SYSLOG
     auto logger = spdlog::get("dpvo_update");
