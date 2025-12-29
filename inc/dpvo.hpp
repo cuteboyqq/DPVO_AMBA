@@ -2,6 +2,9 @@
 #include "patch_graph.hpp"
 #include "net.hpp"
 #include "dla_config.hpp"
+#if defined(CV28) || defined(CV28_SIMULATOR)
+#include <eazyai.h>
+#endif
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -50,8 +53,19 @@ public:
     void startProcessingThread();
     void stopProcessingThread();
     void wakeProcessingThread();
-    void updateInput(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W);
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    void updateInput(ea_tensor_t* imgTensor);
+    void addFrame(ea_tensor_t* imgTensor);  // Convenience wrapper like wnc_app
+#else
+    // Fallback for non-CV28 platforms
+    void updateInput(const uint8_t* image, int H, int W);
+    void addFrame(const uint8_t* image, int H, int W);
+#endif
     bool isProcessingComplete();
+    
+    // Set intrinsics (can be called to update from config)
+    void setIntrinsics(const float intrinsics[4]);
+    void setIntrinsicsFromConfig(Config_S* config);  // Initialize from config file
     
     void terminate();
     
@@ -149,11 +163,17 @@ private:
     
     // ---- Threading infrastructure (similar to wnc_app) ----
     struct InputFrame {
-        int64_t timestamp;
-        std::vector<uint8_t> image;  // Store image data
-        float intrinsics[4];
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        ea_tensor_t* imgTensor;  // Store tensor pointer (tensor is managed externally)
+#else
+        std::vector<uint8_t> image;  // Store image data for non-CV28 platforms
+#endif
         int H, W;
     };
+    
+    // ---- Intrinsics and timestamp (stored as member variables) ----
+    float m_intrinsics[4];      // Camera intrinsics [fx, fy, cx, cy]
+    int64_t m_currentTimestamp; // Current frame timestamp
     
     std::thread m_processingThread;
     std::atomic<bool> m_processingThreadRunning{false};

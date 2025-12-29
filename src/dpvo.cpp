@@ -27,7 +27,8 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
       m_P(PatchGraph::P),
       m_pmem(cfg.BUFFER_SIZE),
       m_mem(cfg.BUFFER_SIZE),
-      m_patchifier(3)  // Initialize in member initializer list (not copyable due to unique_ptr)
+      m_patchifier(3),  // Initialize in member initializer list (not copyable due to unique_ptr)
+      m_currentTimestamp(0)
 {
     // fmap sizes - Python uses RES=4, so work at 1/4 resolution
     // Python: ht = ht // RES, wd = wd // RES (where RES=4)
@@ -57,9 +58,16 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     std::memset(m_fmap1, 0, sizeof(float) * m_mem * 128 * m_fmap1_H * m_fmap1_W);
     std::memset(m_fmap2, 0, sizeof(float) * m_mem * 128 * m_fmap2_H * m_fmap2_W);
 
-    // Initialize update model if config provided (no threading needed for sequential execution)
+    // Initialize intrinsics from config or use defaults
     if (config != nullptr) {
+        setIntrinsicsFromConfig(config);
         m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+    } else {
+        // Default intrinsics (will be updated when frame dimensions are known)
+        m_intrinsics[0] = static_cast<float>(wd) * 0.5f;  // fx
+        m_intrinsics[1] = static_cast<float>(ht) * 0.5f;  // fy
+        m_intrinsics[2] = static_cast<float>(wd) * 0.5f;  // cx
+        m_intrinsics[3] = static_cast<float>(ht) * 0.5f;  // cy
     }
 }
 
@@ -73,6 +81,36 @@ void DPVO::setUpdateModel(Config_S* config)
 void DPVO::setPatchifierModels(Config_S* fnetConfig, Config_S* inetConfig)
 {
     m_patchifier.setModels(fnetConfig, inetConfig);
+}
+
+void DPVO::setIntrinsics(const float intrinsics[4])
+{
+    std::memcpy(m_intrinsics, intrinsics, sizeof(float) * 4);
+}
+
+void DPVO::setIntrinsicsFromConfig(Config_S* config)
+{
+    if (config == nullptr) return;
+    
+    // Get focal length from config (in pixels)
+    float focalLength = config->stCameraConfig.focalLength;
+    int frameWidth = config->frameWidth;
+    int frameHeight = config->frameHeight;
+    
+    // Calculate intrinsics: [fx, fy, cx, cy]
+    // If focalLength is valid (> 0), use it; otherwise use frame dimensions as defaults
+    if (focalLength > 0.0f) {
+        m_intrinsics[0] = focalLength;  // fx
+        m_intrinsics[1] = focalLength;  // fy (assuming square pixels)
+    } else {
+        // Default: use frame dimensions
+        m_intrinsics[0] = static_cast<float>(frameWidth) * 0.5f;   // fx
+        m_intrinsics[1] = static_cast<float>(frameHeight) * 0.5f;  // fy
+    }
+    
+    // Principal point at image center
+    m_intrinsics[2] = static_cast<float>(frameWidth) * 0.5f;   // cx
+    m_intrinsics[3] = static_cast<float>(frameHeight) * 0.5f;  // cy
 }
 
 DPVO::~DPVO() {
@@ -786,8 +824,48 @@ void DPVO::startProcessingThread()
                 
                 m_bDone = false;
                 
-                // Call the main processing function
-                run(frame.timestamp, frame.image.data(), frame.intrinsics, frame.H, frame.W);
+#if defined(CV28) || defined(CV28_SIMULATOR)
+                // Extract image data from tensor
+                uint8_t* image_data = static_cast<uint8_t*>(ea_tensor_data_for_read(frame.imgTensor, EA_CPU));
+                size_t pitch = ea_tensor_pitch(frame.imgTensor);
+                const size_t* shape = ea_tensor_shape(frame.imgTensor);
+                int H = static_cast<int>(shape[EA_H]);
+                int W = static_cast<int>(shape[EA_W]);
+                int C = static_cast<int>(shape[EA_C]);
+                
+                // Handle pitch: if pitch != W * C, we need to copy row by row
+                std::vector<uint8_t> image_contiguous;
+                uint8_t* image_ptr = image_data;
+                
+                if (pitch == W * C) {
+                    // Contiguous memory, use directly
+                    image_ptr = image_data;
+                } else {
+                    // Non-contiguous (padded), copy to contiguous buffer
+                    image_contiguous.resize(H * W * C);
+                    uint8_t* src = image_data;
+                    uint8_t* dst = image_contiguous.data();
+                    for (int y = 0; y < H; y++) {
+                        std::memcpy(dst, src, W * C);
+                        src += pitch;
+                        dst += W * C;
+                    }
+                    image_ptr = image_contiguous.data();
+                }
+                
+                // Update timestamp (increment for each frame)
+                m_currentTimestamp++;
+                
+                // Call the main processing function (use member variables for intrinsics and timestamp)
+                run(m_currentTimestamp, image_ptr, m_intrinsics, H, W);
+#else
+                // Use stored image data for non-CV28 platforms
+                // Update timestamp (increment for each frame)
+                m_currentTimestamp++;
+                
+                // Call the main processing function (use member variables for intrinsics and timestamp)
+                run(m_currentTimestamp, frame.image.data(), m_intrinsics, frame.H, frame.W);
+#endif
                 
                 m_bDone = true;
                 lock.lock();
@@ -812,14 +890,49 @@ void DPVO::wakeProcessingThread()
     m_queueCV.notify_one();
 }
 
-void DPVO::updateInput(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W)
+#if defined(CV28) || defined(CV28_SIMULATOR)
+void DPVO::updateInput(ea_tensor_t* imgTensor)
 {
+    if (imgTensor == nullptr)
+        return;
+        
     std::lock_guard<std::mutex> lock(m_queueMutex);
     
     InputFrame frame;
-    frame.timestamp = timestamp;
+    frame.imgTensor = imgTensor;  // Store tensor pointer (tensor is managed externally)
+    
+    // Extract H, W from tensor shape
+    const size_t* shape = ea_tensor_shape(imgTensor);
+    frame.H = static_cast<int>(shape[EA_H]);
+    frame.W = static_cast<int>(shape[EA_W]);
+    
+    m_inputFrameQueue.push(std::move(frame));
+    
+    // Limit queue size to prevent memory issues
+    const size_t MAX_QUEUE_SIZE = 10;
+    while (m_inputFrameQueue.size() > MAX_QUEUE_SIZE)
+    {
+        m_inputFrameQueue.pop();
+    }
+    
+    wakeProcessingThread();
+}
+
+void DPVO::addFrame(ea_tensor_t* imgTensor)
+{
+    updateInput(imgTensor);
+}
+#else
+// Fallback implementation for non-CV28 platforms
+void DPVO::updateInput(const uint8_t* image, int H, int W)
+{
+    if (image == nullptr)
+        return;
+        
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    
+    InputFrame frame;
     frame.image.assign(image, image + H * W * 3);  // Copy image data (assuming RGB)
-    std::memcpy(frame.intrinsics, intrinsics, sizeof(float) * 4);
     frame.H = H;
     frame.W = W;
     
@@ -834,6 +947,12 @@ void DPVO::updateInput(int64_t timestamp, const uint8_t* image, const float intr
     
     wakeProcessingThread();
 }
+
+void DPVO::addFrame(const uint8_t* image, int H, int W)
+{
+    updateInput(image, H, W);
+}
+#endif
 
 bool DPVO::_hasWorkToDo()
 {
