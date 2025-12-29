@@ -5,6 +5,11 @@
 #include <cstdint>
 #include <vector>
 #include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <queue>
 
 struct DPVOConfig {
     int PATCHES_PER_FRAME;
@@ -38,7 +43,16 @@ public:
     DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config); // Constructor with config for update model
     ~DPVO();
 
+    // Main processing function (called from thread)
     void run(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W);
+    
+    // Threading interface (similar to wnc_app)
+    void startProcessingThread();
+    void stopProcessingThread();
+    void wakeProcessingThread();
+    void updateInput(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W);
+    bool isProcessingComplete();
+    
     void terminate();
     
     // Set update model (if not initialized in constructor)
@@ -55,8 +69,26 @@ private:
     void edgesBackward(std::vector<int>& kk, std::vector<int>& jj);
     void appendFactors(const std::vector<int>& kk, const std::vector<int>& jj);
     void removeFactors(const bool* mask, bool store);
-    void reproject(const int* ii, const int* jj, const int* kk, int num_edges, float* coords_out); // Alister add 2025-12-26
+    void reproject(
+        const int* ii, 
+        const int* jj, 
+        const int* kk, 
+        int num_edges, 
+        float* coords_out,
+        float* Ji_out = nullptr,      // [num_edges, 2, P, P, 6] flattened (optional)
+        float* Jj_out = nullptr,      // [num_edges, 2, P, P, 6] flattened (optional)
+        float* Jz_out = nullptr,      // [num_edges, 2, P, P, 1] flattened (optional)
+        float* valid_out = nullptr     // [num_edges, P, P] flattened (optional)
+    ); // Alister add 2025-12-26
     float motionMagnitude(int i, int j);
+    
+    // Bundle Adjustment
+    void bundleAdjustment(
+        float lmbda = 1e-4f,
+        float ep = 100.0f,
+        bool structure_only = false,
+        int fixedp = 1
+    );
 
     // Helpers for indexing
     inline int imap_idx(int i, int j, int k) const { return i * m_cfg.PATCHES_PER_FRAME * m_DIM + j * m_DIM + k; }
@@ -114,4 +146,22 @@ private:
     // ---- DPVO Update Model (optional) ----
     std::unique_ptr<DPVOUpdate> m_updateModel;
     int m_updateFrameCounter = 0;
+    
+    // ---- Threading infrastructure (similar to wnc_app) ----
+    struct InputFrame {
+        int64_t timestamp;
+        std::vector<uint8_t> image;  // Store image data
+        float intrinsics[4];
+        int H, W;
+    };
+    
+    std::thread m_processingThread;
+    std::atomic<bool> m_processingThreadRunning{false};
+    std::mutex m_queueMutex;
+    std::condition_variable m_queueCV;
+    std::queue<InputFrame> m_inputFrameQueue;
+    std::atomic<bool> m_bDone{true};
+    
+    // Helper function to check if there's work to do
+    bool _hasWorkToDo();
 };

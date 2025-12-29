@@ -25,4 +25,12 @@ struct SE3 {
 
     // Skew-symmetric matrix
     static Eigen::Matrix3f skew(const Eigen::Vector3f& v);
+    
+    // Adjoint action: Ad_g(v) where g is this SE3 and v is a 6-vector
+    // Returns: Ad_g * v (6x6 matrix applied to 6-vector)
+    Eigen::Matrix<float, 6, 1> adjoint(const Eigen::Matrix<float, 6, 1>& v) const;
+    
+    // Adjoint transpose: Ad_g^T(J) where g is this SE3 and J is a [2,6] matrix
+    // Returns: J * Ad_g^T (2x6 matrix)
+    Eigen::Matrix<float, 2, 6> adjointT(const Eigen::Matrix<float, 2, 6>& J) const;
 };

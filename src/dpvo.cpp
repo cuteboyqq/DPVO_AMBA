@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <chrono>
 #include "projective_ops.hpp"
 #include "correlation_kernel.hpp"
 static_assert(sizeof(((PatchGraph*)0)->m_index[0]) ==
@@ -403,37 +404,11 @@ void DPVO::update()
     // -------------------------------------------------
     // 6. Bundle Adjustment
     // -------------------------------------------------
-    // try {
-    //     bool run_global_ba = false;
-    //     for (int e = 0; e < num_active; e++) {
-    //         if (m_pg.m_ii[e] < m_pg.m_n - m_cfg.REMOVAL_WINDOW - 1) {
-    //             run_global_ba = true;
-    //             break;
-    //         }
-    //     }
-
-    //     if (run_global_ba) {
-    //         runGlobalBA();  // implement your global BA
-    //     } else {
-    //         int t0 = m_is_initialized ?
-    //                  std::max(m_pg.m_n - m_cfg.OPTIMIZATION_WINDOW, 1) : 1;
-
-    //         fastBA(
-    //             m_pg.m_poses,
-    //             m_pg.m_patches,
-    //             m_pg.m_intrinsics,
-    //             m_pg.m_target,
-    //             m_pg.m_weight,
-    //             m_pg.m_ii,
-    //             m_pg.m_jj,
-    //             m_pg.m_kk,
-    //             t0,
-    //             m_pg.m_n
-    //         );
-    //     }
-    // } catch (...) {
-    //     std::cerr << "Warning: BA failed...\n";
-    // }
+    try {
+        bundleAdjustment(1e-4f, 100.0f, false, 1);
+    } catch (...) {
+        // Silently handle BA failures
+    }
 
     // -------------------------------------------------
     // 7. Update point cloud
@@ -719,7 +694,11 @@ void DPVO::reproject(
     const int* jj,
     const int* kk,
     int num_edges,
-    float* coords_out)
+    float* coords_out,
+    float* Ji_out,
+    float* Jj_out,
+    float* Jz_out,
+    float* valid_out)
 {
     if (num_edges <= 0)
         return;
@@ -728,8 +707,34 @@ void DPVO::reproject(
     float* patches_flat = &m_pg.m_patches[0][0][0][0][0];
     float* intrinsics_flat = &m_pg.m_intrinsics[0][0];
 
-    // Call flattened transform
-    pops::transform(
+    const int P = m_P;
+    
+    // Allocate temporary buffers if Jacobians are not provided
+    std::vector<float> Ji_temp, Jj_temp, Jz_temp, valid_temp;
+    float* Ji_ptr = Ji_out;
+    float* Jj_ptr = Jj_out;
+    float* Jz_ptr = Jz_out;
+    float* valid_ptr = valid_out;
+    
+    if (Ji_ptr == nullptr) {
+        Ji_temp.resize(num_edges * 2 * P * P * 6);
+        Ji_ptr = Ji_temp.data();
+    }
+    if (Jj_ptr == nullptr) {
+        Jj_temp.resize(num_edges * 2 * P * P * 6);
+        Jj_ptr = Jj_temp.data();
+    }
+    if (Jz_ptr == nullptr) {
+        Jz_temp.resize(num_edges * 2 * P * P * 1);
+        Jz_ptr = Jz_temp.data();
+    }
+    if (valid_ptr == nullptr) {
+        valid_temp.resize(num_edges * P * P);
+        valid_ptr = valid_temp.data();
+    }
+
+    // Call transformWithJacobians
+    pops::transformWithJacobians(
         m_pg.m_poses,         // SE3 poses [N]
         patches_flat,         // flattened patches
         intrinsics_flat,      // flattened intrinsics
@@ -737,13 +742,106 @@ void DPVO::reproject(
         num_edges,            // number of edges
         m_cfg.PATCHES_PER_FRAME,
         m_P,
-        coords_out            // output [num_edges][2][P][P] flattened
+        coords_out,           // output [num_edges][2][P][P] flattened
+        Ji_ptr,               // Jacobian w.r.t. pose i
+        Jj_ptr,               // Jacobian w.r.t. pose j
+        Jz_ptr,               // Jacobian w.r.t. inverse depth
+        valid_ptr             // validity mask
     );
 
     // Output layout already matches Python coords.permute(0,1,4,2,3)
     // Each edge: [2][P][P] → 2 channels: u,v
+    // Jacobians are stored if output buffers were provided
 }
 
 
 
-void DPVO::terminate() {}
+
+void DPVO::terminate() 
+{
+    stopProcessingThread();
+}
+
+// -------------------------------------------------------------
+// Threading interface (similar to wnc_app)
+// -------------------------------------------------------------
+void DPVO::startProcessingThread()
+{
+    m_processingThreadRunning = true;
+    m_processingThread = std::thread([this]() {
+        std::unique_lock<std::mutex> lock(m_queueMutex);
+        while (m_processingThreadRunning)
+        {
+            m_queueCV.wait_for(lock, std::chrono::milliseconds(1000), [this]() {
+                return !m_processingThreadRunning || !m_inputFrameQueue.empty();
+            });
+            if (!m_processingThreadRunning)
+                break;
+
+            if (!m_inputFrameQueue.empty())
+            {
+                InputFrame frame = std::move(m_inputFrameQueue.front());
+                m_inputFrameQueue.pop();
+                lock.unlock();
+                
+                m_bDone = false;
+                
+                // Call the main processing function
+                run(frame.timestamp, frame.image.data(), frame.intrinsics, frame.H, frame.W);
+                
+                m_bDone = true;
+                lock.lock();
+            }
+        }
+    });
+}
+
+void DPVO::stopProcessingThread()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_queueMutex);
+        m_processingThreadRunning = false;
+    }
+    m_queueCV.notify_one();
+    if (m_processingThread.joinable())
+        m_processingThread.join();
+}
+
+void DPVO::wakeProcessingThread()
+{
+    m_queueCV.notify_one();
+}
+
+void DPVO::updateInput(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W)
+{
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    
+    InputFrame frame;
+    frame.timestamp = timestamp;
+    frame.image.assign(image, image + H * W * 3);  // Copy image data (assuming RGB)
+    std::memcpy(frame.intrinsics, intrinsics, sizeof(float) * 4);
+    frame.H = H;
+    frame.W = W;
+    
+    m_inputFrameQueue.push(std::move(frame));
+    
+    // Limit queue size to prevent memory issues
+    const size_t MAX_QUEUE_SIZE = 10;
+    while (m_inputFrameQueue.size() > MAX_QUEUE_SIZE)
+    {
+        m_inputFrameQueue.pop();
+    }
+    
+    wakeProcessingThread();
+}
+
+bool DPVO::_hasWorkToDo()
+{
+    return !m_inputFrameQueue.empty();
+}
+
+bool DPVO::isProcessingComplete()
+{
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    return m_inputFrameQueue.empty() && m_bDone;
+}
