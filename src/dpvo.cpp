@@ -432,149 +432,16 @@ void DPVO::run(int64_t timestamp,
     // -------------------------------------------------
     // 2. Bookkeeping
     // -------------------------------------------------
-    // Use n_use (validated) instead of n (potentially corrupted)
-    printf("[DPVO] About to log bookkeeping start\n");
-    fflush(stdout);
-    if (logger) {
-        try {
-            logger->error("DPVO::run: Starting bookkeeping, n={} (using validated n_use={})", n, n_use);
-        } catch (...) {
-            fprintf(stderr, "[DPVO] EXCEPTION in logger during bookkeeping\n");
-            fflush(stderr);
-        }
-    }
+    if (logger) logger->info("DPVO::run: Starting bookkeeping, n={}", n_use);
     
-    printf("[DPVO] About to push timestamp to m_tlist\n");
-    fflush(stdout);
+    // Store timestamp in both m_tlist (for compatibility) and m_pg.m_tstamps (main storage)
+    m_tlist.push_back(timestamp);
+    m_pg.m_tstamps[n_use] = timestamp;
     
-    // CRITICAL: Skip m_tlist.push_back for now to avoid crash
-    // The object appears to be corrupted when accessed from the thread
-    // We'll store timestamp in m_pg.m_tstamps instead, which seems to work
-    printf("[DPVO] Skipping m_tlist.push_back due to object corruption issue\n");
-    fflush(stdout);
-    // TODO: Investigate why object members are inaccessible from thread context
-    // For now, we'll rely on m_pg.m_tstamps[n_use] to store the timestamp
+    // Store camera intrinsics
+    std::memcpy(m_pg.m_intrinsics[n_use], intrinsics, sizeof(float) * 4);
     
-    printf("[DPVO] About to access m_pg.m_tstamps[%d]\n", n_use);
-    fflush(stdout);
-    
-    // CRITICAL: We successfully accessed m_pg.m_n earlier (line 206), so m_pg should be accessible
-    // The issue might be with taking the address. Let's try direct access instead.
-    printf("[DPVO] Attempting direct access to m_pg.m_tstamps[%d]\n", n_use);
-    fflush(stdout);
-    
-    // CRITICAL: Before accessing m_pg arrays, verify that 'this' and m_pg are valid
-    // The crash when accessing m_pg.m_tstamps suggests the object might be invalid
-    printf("[DPVO] Verifying object validity before accessing m_pg arrays\n");
-    fflush(stdout);
-    
-    // Test if we can access 'this' pointer
-    volatile void* this_ptr = this;
-    (void)this_ptr;  // Suppress unused warning
-    printf("[DPVO] 'this' pointer is accessible: %p\n", (void*)this);
-    fflush(stdout);
-    
-    // Test if we can access m_pg member
-    volatile PatchGraph* pg_ptr = &m_pg;
-    (void)pg_ptr;  // Suppress unused warning
-    printf("[DPVO] m_pg pointer is accessible: %p (offset from this: %zu bytes)\n", 
-           (void*)pg_ptr, (char*)pg_ptr - (char*)this);
-    fflush(stdout);
-    
-    // CRITICAL: Re-validate 'this' pointer after patchifier.forward()
-    // The suspicious pointer values (0x3ebebebf3eaaaaab) suggest uninitialized/corrupted memory
-    // The pattern 0x3e... in the high bits is NOT a valid memory address on Linux x86_64
-    // Valid addresses should have high 16 bits as 0x0000 (heap) or 0x7fff/0xffff (stack, canonical form)
-    // If we see 0x3e..., the object is definitely corrupted
-    this_addr = reinterpret_cast<uintptr_t>(this);
-    high_bits = (this_addr >> 48) & 0xFFFF;
-    
-    // Check for the specific suspicious pattern we're seeing (0x3e...)
-    if ((high_bits & 0xFF00) == 0x3E00) {
-        fprintf(stderr, "[DPVO] CRITICAL: 'this' pointer has corrupted pattern after patchifier.forward(): %p (high bits: 0x%04x)\n", 
-                (void*)this, high_bits);
-        fflush(stderr);
-        fprintf(stderr, "[DPVO] CRITICAL: DPVO object is corrupted - pointer pattern 0x3e... indicates uninitialized memory\n");
-        fflush(stderr);
-        std::abort();  // Cannot safely return - abort immediately
-    }
-    
-    // Also check for NULL or obviously invalid addresses
-    if (this_addr == 0 || this_addr < 0x1000) {
-        fprintf(stderr, "[DPVO] CRITICAL: 'this' pointer is NULL or too small after patchifier.forward(): %p\n", (void*)this);
-        fflush(stderr);
-        std::abort();  // Cannot safely return - abort immediately
-    }
-    
-    // Test if we can read m_pg.m_n again - this might crash if m_pg is corrupted
-    printf("[DPVO] About to read m_pg.m_n\n");
-    fflush(stdout);
-    volatile int test_n = 0;
-    try {
-        // Use a volatile pointer to force memory access
-        volatile int* n_ptr = &m_pg.m_n;
-        test_n = *n_ptr;  // This might crash if memory is not readable
-        printf("[DPVO] m_pg.m_n is accessible: %d\n", test_n);
-        fflush(stdout);
-    } catch (...) {
-        fprintf(stderr, "[DPVO] CRITICAL: Cannot read m_pg.m_n - memory is not accessible!\n");
-        fflush(stderr);
-        // If we can't even read m_pg.m_n, we cannot safely continue
-        fprintf(stderr, "[DPVO] CRITICAL: Returning early - DPVO object appears to be corrupted\n");
-        fflush(stderr);
-        return;  // Return early - cannot safely access m_pg
-    }
-    
-    // Since m_pg.m_n is now valid (0), try to access m_pg arrays using memcpy for safety
-    // Validate n_use is within bounds
-    if (n_use < 0 || n_use >= PatchGraph::N) {
-        fprintf(stderr, "[DPVO] ERROR: n_use=%d is out of bounds [0, %d), skipping m_tstamps\n", n_use, PatchGraph::N);
-        fflush(stderr);
-    } else {
-        // Test if we can take the address of m_pg.m_tstamps[n_use]
-        printf("[DPVO] Testing address of m_pg.m_tstamps[%d]\n", n_use);
-        fflush(stdout);
-        try {
-            volatile int64_t* test_addr = &m_pg.m_tstamps[n_use];
-            printf("[DPVO] Address of m_pg.m_tstamps[%d] is: %p\n", n_use, (void*)test_addr);
-            fflush(stdout);
-            
-            // Use memcpy to write timestamp (safer than direct access)
-            int64_t timestamp_val = timestamp;
-            std::memcpy((void*)test_addr, &timestamp_val, sizeof(int64_t));
-            printf("[DPVO] Successfully wrote m_pg.m_tstamps[%d] using memcpy\n", n_use);
-            fflush(stdout);
-        } catch (...) {
-            fprintf(stderr, "[DPVO] EXCEPTION writing m_pg.m_tstamps[%d] with memcpy\n", n_use);
-            fflush(stderr);
-        }
-    }
-
-    printf("[DPVO] About to set m_pg.m_intrinsics[%d]\n", n_use);
-    fflush(stdout);
-    try {
-        if (n_use >= 0 && n_use < PatchGraph::N) {
-            // Use memcpy to write intrinsics (safer than direct access)
-            std::memcpy(m_pg.m_intrinsics[n_use], intrinsics, sizeof(float) * 4);
-            printf("[DPVO] m_pg.m_intrinsics[%d] set successfully using memcpy\n", n_use);
-            fflush(stdout);
-        } else {
-            fprintf(stderr, "[DPVO] ERROR: n_use=%d is out of bounds [0, %d), skipping m_intrinsics\n", n_use, PatchGraph::N);
-            fflush(stderr);
-        }
-    } catch (...) {
-        fprintf(stderr, "[DPVO] EXCEPTION accessing m_pg.m_intrinsics[%d]\n", n_use);
-        fflush(stderr);
-    }
-    
-    if (logger) {
-        try {
-            logger->info("DPVO::run: Bookkeeping completed");
-        } catch (...) {
-            fprintf(stderr, "[DPVO] EXCEPTION in logger after bookkeeping\n");
-            fflush(stderr);
-        }
-    }
+    if (logger) logger->info("DPVO::run: Bookkeeping completed");
 
     // -------------------------------------------------
     // 3. Pose initialization

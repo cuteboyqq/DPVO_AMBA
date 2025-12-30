@@ -394,9 +394,9 @@ bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap
             for (x = 0; x < outW; x++)
             {
                 // Log every iteration for first few elements to catch the crash
-                if (c == 0 && y == 0 && x < 5 && logger) {
-                    logger->info("INet: Loop iteration: c={}, y={}, x={}", c, y, x);
-                }
+                // if (c == 0 && y == 0 && x < 5 && logger) {
+                //     logger->info("INet: Loop iteration: c={}, y={}, x={}", c, y, x);
+                // }
                 
                 // Skip first element (already done)
                 if (c == 0 && y == 0 && x == 0) {
@@ -404,18 +404,18 @@ bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap
                     continue;
                 }
                 
-                if (c == 0 && y == 0 && x < 5 && logger) {
-                    logger->info("INet: Processing element (c={}, y={}, x={})", c, y, x);
-                }
+                // if (c == 0 && y == 0 && x < 5 && logger) {
+                //     logger->info("INet: Processing element (c={}, y={}, x={})", c, y, x);
+                // }
                 
                 // Tensor layout: [N=0, C, H, W]
                 tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
                 // Output layout: [C, H, W]
                 dst_idx = c * outH * outW + y * outW + x;
                 
-                if (c == 0 && y == 0 && x < 5 && logger) {
-                    logger->info("INet: Calculated indices: tensor_idx={}, dst_idx={}", tensor_idx, dst_idx);
-                }
+                // if (c == 0 && y == 0 && x < 5 && logger) {
+                //     logger->info("INet: Calculated indices: tensor_idx={}, dst_idx={}", tensor_idx, dst_idx);
+                // }
                 
                 if (static_cast<size_t>(tensor_idx) >= tensor_total_elements) {
                     if (logger) {
@@ -436,17 +436,17 @@ bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap
                     logger->info("INet: About to read tensor_data[{}]", tensor_idx);
                 }
                 volatile float val = tensor_data[tensor_idx];
-                if (c == 0 && y == 0 && x < 5 && logger) {
-                    logger->info("INet: Read tensor_data[{}] = {}", tensor_idx, val);
-                }
+                // if (c == 0 && y == 0 && x < 5 && logger) {
+                //     logger->info("INet: Read tensor_data[{}] = {}", tensor_idx, val);
+                // }
                 
-                if (c == 0 && y == 0 && x < 5 && logger) {
-                    logger->info("INet: About to write imap_out[{}]", dst_idx);
-                }
+                // if (c == 0 && y == 0 && x < 5 && logger) {
+                //     logger->info("INet: About to write imap_out[{}]", dst_idx);
+                // }
                 imap_out[dst_idx] = val / 4.0f;
-                if (c == 0 && y == 0 && x < 5 && logger) {
-                    logger->info("INet: Wrote imap_out[{}] successfully", dst_idx);
-                }
+                // if (c == 0 && y == 0 && x < 5 && logger) {
+                //     logger->info("INet: Wrote imap_out[{}] successfully", dst_idx);
+                // }
             }
         }
     }
