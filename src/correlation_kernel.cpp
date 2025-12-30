@@ -150,6 +150,7 @@ void computeCorrelation(
     int num_active,
     int M,
     int P,
+    int num_frames,  // Number of frames in pyramid buffers
     int fmap_H,
     int fmap_W,
     int feature_dim,
@@ -158,7 +159,7 @@ void computeCorrelation(
     // For each active edge
     for (int e = 0; e < num_active; e++) {
         int patch_idx = ii[e] % (M);       // circular buffer index for gmap
-        int frame_idx = jj[e] % fmap_H;    // circular buffer index for pyramid (simplified)
+        int frame_idx = jj[e] % num_frames; // circular buffer index for pyramid (use num_frames, not fmap_H!)
 
         for (int c = 0; c < 2; c++) { // two correlation channels: pyramid0, pyramid1
             const float* fmap = (c == 0) ? pyramid0 : pyramid1;

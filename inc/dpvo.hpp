@@ -27,12 +27,12 @@ struct DPVOConfig {
     int REMOVAL_WINDOW;
 
     DPVOConfig()
-        : PATCHES_PER_FRAME(16),
+        : PATCHES_PER_FRAME(8),
           BUFFER_SIZE(4096),
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
-          MAX_EDGE_AGE(1500),
+          MAX_EDGE_AGE(768),
           KEYFRAME_INDEX(2),
           KEYFRAME_THRESH(10),
           PATCH_LIFETIME(6),
@@ -74,8 +74,14 @@ public:
     
     // Set fnet and inet models for Patchifier
     void setPatchifierModels(Config_S* fnetConfig, Config_S* inetConfig);
+    
+    // Initialize threads (called from constructor, similar to WNC_APP::_init)
+    void _startThreads();
 
 private:
+    // Forward declaration for InputFrame (defined later in private section)
+    struct InputFrame;
+    
     void update();
     void keyframe();
 
@@ -163,11 +169,7 @@ private:
     
     // ---- Threading infrastructure (similar to wnc_app) ----
     struct InputFrame {
-#if defined(CV28) || defined(CV28_SIMULATOR)
-        ea_tensor_t* imgTensor;  // Store tensor pointer (tensor is managed externally)
-#else
-        std::vector<uint8_t> image;  // Store image data for non-CV28 platforms
-#endif
+        std::vector<uint8_t> image;  // Store converted image data [C, H, W] format
         int H, W;
     };
     

@@ -32,6 +32,7 @@
 #include <mutex>
 #include "config_reader.hpp"
 #include "wnc_app.hpp"
+#include "dpvo.hpp"
 #include "path_utils.hpp"
 #include "video_handler.hpp"
 // System includes
@@ -137,6 +138,7 @@ std::atomic<bool> terminateThreads(false);
 
 //
 void appThreadFunction(WNC_APP& wncApp);
+void appDPVOthreadFunction(DPVO& dpvo);
 void processInput(
 	const std::string& inputPath, 
 	std::shared_ptr<spdlog::logger> logger, 
@@ -147,6 +149,22 @@ void processInput(
 	global_param_t* G_param,
 	WNC_APP* wncApp);
 void processApp(
+	const std::string& inputPath,
+	const InputType& inputType,
+	const std::string& configPath,
+	const std::string& logFile, 
+	global_param_t* G_param,
+	std::shared_ptr<spdlog::logger> logger);
+void processDPVOInput(
+	const std::string& inputPath,
+	const InputType& inputType,
+	std::shared_ptr<spdlog::logger> logger, 
+	unsigned int& count, 
+	global_param_t* G_param,
+	DPVO* dpvo,
+	int modelH,
+	int modelW);
+void processDPVOApp(
 	const std::string& inputPath,
 	const InputType& inputType,
 	const std::string& configPath,

@@ -66,6 +66,36 @@ public:
     ~FNetInference();
     bool runInference(const uint8_t* image, int H, int W, float* fmap_out);
     
+    // Getters for model input dimensions
+    int getInputHeight() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_inputHeight; 
+#else
+        return 0;
+#endif
+    }
+    int getInputWidth() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_inputWidth; 
+#else
+        return 0;
+#endif
+    }
+    int getOutputHeight() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_outputHeight; 
+#else
+        return 0;
+#endif
+    }
+    int getOutputWidth() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_outputWidth; 
+#else
+        return 0;
+#endif
+    }
+    
 private:
 #if defined(CV28) || defined(CV28_SIMULATOR)
     void _initModelIO();
@@ -94,6 +124,36 @@ public:
     INetInference(Config_S* config);
     ~INetInference();
     bool runInference(const uint8_t* image, int H, int W, float* imap_out);
+    
+    // Getters for model input dimensions
+    int getInputHeight() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_inputHeight; 
+#else
+        return 0;
+#endif
+    }
+    int getInputWidth() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_inputWidth; 
+#else
+        return 0;
+#endif
+    }
+    int getOutputHeight() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_outputHeight; 
+#else
+        return 0;
+#endif
+    }
+    int getOutputWidth() const { 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        return m_outputWidth; 
+#else
+        return 0;
+#endif
+    }
     
 private:
 #if defined(CV28) || defined(CV28_SIMULATOR)

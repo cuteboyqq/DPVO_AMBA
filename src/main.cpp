@@ -733,7 +733,8 @@ static int start_run(global_param_t *G_param)
 					continue;
 				}
 				logger->info("\nProcessing: {}\n-------------------------------------------------", currentPath);
-				processApp(currentPath, inputType, CONFIG_FILE_PATH, entry->d_name, G_param, logger);
+				// processApp(currentPath, inputType, CONFIG_FILE_PATH, entry->d_name, G_param, logger);
+				processDPVOApp(currentPath, inputType, CONFIG_FILE_PATH, entry->d_name, G_param, logger);
 			}
 			closedir(dir);
 		}
@@ -808,6 +809,64 @@ void appThreadFunction(WNC_APP& wncApp)
 	catch (...) 
 	{
 		std::cerr << "Caught unknown exception in APP thread" << std::endl;
+	}
+}
+
+/**
+ * @brief Thread function for processing frames from the queue for DPVO
+ * 
+ * This function continuously checks the frame queue for new frames.
+ * If a frame is available, it is added to the DPVO instance.
+ * If no frame is available, it sleeps for a short duration to reduce CPU usage.
+ * 
+ * @param dpvo Reference to the DPVO instance
+ */
+void appDPVOthreadFunction(DPVO& dpvo)
+{
+	try 
+	{
+		while (true)
+		{
+			std::pair<ea_tensor_t*, int> framePair;
+			bool hasFrame = false;
+			{
+				std::unique_lock<std::mutex> lock(queueMutex);
+				if (frameQueue.empty())
+				{
+					if (terminateThreads)
+					{
+						// All frames processed and termination signal received
+						break;
+					}
+					frameCondVar.wait(lock);
+					continue;
+				}
+
+				framePair = std::move(frameQueue.front());
+				frameQueue.pop_front();
+				hasFrame = true;
+			}
+
+			if (hasFrame && framePair.first != NULL)
+			{
+				auto logger = spdlog::get("MAIN");
+				if (logger) logger->debug("appDPVOthreadFunction: Calling dpvo.addFrame");
+				dpvo.addFrame(framePair.first);
+				if (logger) logger->debug("appDPVOthreadFunction: dpvo.addFrame completed");
+			} 
+			else
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+		}
+	} 
+	catch (const std::exception& e) 
+	{
+		std::cerr << "Caught exception in DPVO thread: " << e.what() << std::endl;
+	} 
+	catch (...) 
+	{
+		std::cerr << "Caught unknown exception in DPVO thread" << std::endl;
 	}
 }
 
@@ -1050,6 +1109,341 @@ void processApp(
 		{
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			logger->info("Waiting for app thread to finish...");
+		}
+	}();
+
+	return;
+}
+
+/**
+ * @brief Process the input data for DPVO
+ * 
+ * This function processes the input data based on the input type for DPVO.
+ * It handles video files and image directories differently.
+ * 
+ * @param inputPath Path to the input data
+ * @param inputType Type of input data
+ * @param logger Logger for logging
+ * @param count Frame count
+ * @param G_param Global parameters
+ * @param dpvo DPVO instance
+ * @param modelH Model input height
+ * @param modelW Model input width
+ */
+void processDPVOInput(
+	const std::string& inputPath,
+	const InputType& inputType,
+	std::shared_ptr<spdlog::logger> logger, 
+	unsigned int& count, 
+	global_param_t* G_param,
+	DPVO* dpvo,
+	int modelH,
+	int modelW)
+{
+	int rval = EA_SUCCESS;
+
+	ea_tensor_t* tmpTensor = NULL;
+	ea_img_resource_data_t data;
+
+	std::string dataFolderPath;
+	if (inputType == InputType::Video) 
+	{
+		try
+		{
+			VideoHandler videoHandler(inputPath, logger.get());
+			std::string baseName = PathUtils::extractBaseName(inputPath);
+			dataFolderPath = std::string(DATA_FOLDER_PATH) + "/" + baseName;
+			unsigned int frameCount = 0;
+
+			logger->info("Generate images from video: {} for eazyai library reading", inputPath);
+			if (!fs::exists(dataFolderPath))
+			{
+				fs::create_directory(dataFolderPath);
+				while (true)
+				{
+					bool hasFrame = videoHandler.processNextFrame(frameCount, dataFolderPath);
+					if (!hasFrame) break;
+				}
+
+				logger->info("Saved {} frames for video: {} to {}", frameCount, inputPath, dataFolderPath);
+			}
+			else
+			{
+				logger->info("Video {} already processed, skipping", inputPath);
+			}
+
+		}
+		catch (const std::exception& e)
+		{
+			logger->error("Video processing error for {}: {}", inputPath, e.what());
+			throw;
+		}
+	}
+	else if (inputType == InputType::ImageDirectory) 
+	{
+		dataFolderPath = inputPath;
+		if (!fs::exists(dataFolderPath))
+		{
+			logger->error("Image directory {} does not exist", dataFolderPath);
+			exit(1);
+		}
+		else
+		{
+			logger->info("Image directory {} exists", dataFolderPath);
+		}
+	}
+	else
+	{
+		logger->error("Unknown input type, exit the program");
+		exit(1);
+	}
+
+	// Set up image resource
+	snprintf(G_param->input_dir, FILENAME_LENGTH, "%s", dataFolderPath.c_str());
+	if (!dataFolderPath.empty() && dataFolderPath.back() != '/')
+	{
+		strncat(G_param->input_dir, "/", FILENAME_LENGTH - strlen(G_param->input_dir) - 1);
+	}
+	logger->info("Set G_param->input_dir: {}", G_param->input_dir);
+
+	G_param->img_resource = ea_img_resource_new(EA_JPEG_FOLDER, (void *)G_param->input_dir);
+	logger->info("Updated G_param->img_resource");
+
+	// Process frames
+	bool firstFrame = true;
+	int actualH = 0, actualW = 0;
+	
+	while (run_flag)
+	{
+		memset(&data, 0, sizeof(data));
+		RVAL_OK(ea_img_resource_hold_data(G_param->img_resource, &data));
+
+		if (G_param->draw_mode == DRAW_MODE_VOUT || G_param->draw_mode == DRAW_MODE_STREAM)
+		{
+			RVAL_ASSERT(data.tensor_group != NULL);
+			RVAL_ASSERT(data.tensor_num >= 1);
+			tmpTensor = data.tensor_group[G_param->detection_pyd_idx];
+		}
+		else
+		{
+			if (data.tensor_group == NULL)
+			{
+				EA_LOG_NOTICE("All files are handled\n");
+				break;
+			}
+
+			tmpTensor = data.tensor_group[0];
+		}
+
+		ea_tensor_t* imgTensor = ea_tensor_new_from_other(tmpTensor, 0);
+
+		// Get actual image dimensions from tensor
+		const size_t* shape = ea_tensor_shape(imgTensor);
+		int tensorH = static_cast<int>(shape[EA_H]);
+		int tensorW = static_cast<int>(shape[EA_W]);
+		int tensorC = static_cast<int>(shape[EA_C]);
+
+		EA_LOG_DEBUG("Input img: %ldx%ldx%ld\n", shape[EA_W], shape[EA_H], shape[EA_C]);
+
+		// Validate dimensions on first frame
+		if (firstFrame) {
+			actualH = tensorH;
+			actualW = tensorW;
+			firstFrame = false;
+			
+			logger->info("First frame dimensions: {}x{} (DPVO expects {}x{} from model config)", 
+				actualH, actualW, modelH, modelW);
+			
+			// Note: DPVO is initialized with model input size (modelH x modelW)
+			// The actual frames (actualH x actualW) may be different
+			// fnet/inet models will resize internally, so this is expected
+			if (actualH != modelH || actualW != modelW) {
+				logger->info("Frame dimensions differ from model input size - models will resize internally");
+			}
+			
+			// Validate that dimensions are reasonable
+			if (actualH < 16 || actualW < 16) {
+				logger->error("Actual image dimensions {}x{} are too small (minimum 16x16)", actualH, actualW);
+				RVAL_OK(ea_img_resource_drop_data(G_param->img_resource, &data));
+				break;
+			}
+		} else {
+			// Validate that subsequent frames have same dimensions
+			if (tensorH != actualH || tensorW != actualW) {
+				logger->warn("Frame dimension mismatch: expected {}x{}, got {}x{}. Skipping frame.", 
+					actualH, actualW, tensorH, tensorW);
+				RVAL_OK(ea_img_resource_drop_data(G_param->img_resource, &data));
+				continue;
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(queueMutex);
+			logger->info("Input Source Frame Index = {}", count++);
+			frameQueue.emplace_back(std::pair<ea_tensor_t*, int>(imgTensor, 0));
+			logger->info("frameQueue.emplace_back imgTensor finished");
+		}
+
+		frameCondVar.notify_one();
+
+		// Wait for DPVO to process the frame BEFORE dropping the resource
+		// This ensures the tensor remains valid during conversion
+		// Since DPVO doesn't have a callback, we'll wait a bit and check
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		while (!dpvo->isProcessingComplete())
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+
+		// Drop the image resource data AFTER processing is complete
+		// This ensures the tensor is no longer needed
+		logger->info("Start ea_img_resource_drop_data (after processing complete)");
+		RVAL_OK(ea_img_resource_drop_data(G_param->img_resource, &data));
+		logger->info("ea_img_resource_drop_data finished");
+	}
+}
+
+/**
+ * @brief Process the DPVO application
+ * 
+ * This function processes the DPVO application based on the input type.
+ * It handles video files and image directories differently, similar to processApp
+ * but uses DPVO instead of WNC_APP.
+ * 
+ * @param inputPath Path to the input data
+ * @param inputType Type of input data
+ * @param configPath Path to the config file
+ * @param logFile Path to the log file
+ * @param G_param Global parameters
+ * @param logger Logger for logging
+ */
+void processDPVOApp(
+	const std::string& inputPath,
+	const InputType& inputType,
+	const std::string& configPath,
+	const std::string& logFile, 
+	global_param_t* G_param,
+	std::shared_ptr<spdlog::logger> logger)
+{
+	// Reset global state
+	frameQueue.clear();
+	terminateThreads = false;
+
+	// Remove old log file if exists
+	try {
+		std::remove(logFile.c_str());
+	}
+	catch (...) {
+		logger->error("Error while removing {}", logFile);
+	}
+
+	// Process with DPVO App
+	[&]() {
+		// Read config file
+		AppConfigReader appConfigReader;
+		appConfigReader.read(configPath);
+		Config_S* config = appConfigReader.getConfig();
+
+		// Create DPVOConfig with default values
+		DPVOConfig dpvoCfg;
+		// Reduce BUFFER_SIZE to prevent memory issues (4096 is too large)
+		dpvoCfg.BUFFER_SIZE = 36;  // Use same as PatchGraph::BUFFER_SIZE
+		dpvoCfg.PATCHES_PER_FRAME = 8;  // Use same as PatchGraph::PATCHES_PER_FRAME
+		// You can customize other DPVOConfig values here if needed
+
+		// Initialize fnet and inet models first to get their actual input dimensions
+		// This ensures DPVO is initialized with the correct dimensions
+		// Note: These temporary instances will be destroyed, and new ones created in Patchifier
+		FNetInference fnet(config);
+		INetInference inet(config);
+		
+		// Get model input dimensions (models resize internally, so we use their input size)
+		int ht = fnet.getInputHeight();
+		int wd = fnet.getInputWidth();
+		
+		// Validate that fnet and inet have same input dimensions
+		if (ht != inet.getInputHeight() || wd != inet.getInputWidth()) {
+			logger->error("FNet and INet have different input dimensions: FNet={}x{}, INet={}x{}", 
+				ht, wd, inet.getInputHeight(), inet.getInputWidth());
+			throw std::runtime_error("FNet and INet input dimension mismatch");
+		}
+		
+		// Validate dimensions to prevent bad_array_new_length
+		if (ht < 16 || wd < 16) {
+			logger->error("Invalid model input dimensions: {}x{}. Minimum size is 16x16", ht, wd);
+			throw std::runtime_error("Invalid model input dimensions for DPVO");
+		}
+		
+		logger->info("DPVO Config: BUFFER_SIZE={}, PATCHES_PER_FRAME={}, Model input size: {}x{} (from fnet/inet models)", 
+			dpvoCfg.BUFFER_SIZE, dpvoCfg.PATCHES_PER_FRAME, ht, wd);
+		logger->info("FNet output: {}x{}, INet output: {}x{}", 
+			fnet.getOutputHeight(), fnet.getOutputWidth(),
+			inet.getOutputHeight(), inet.getOutputWidth());
+		logger->info("Note: Actual frames are {}x{}, but models will resize to {}x{} internally", 
+			config->frameHeight, config->frameWidth, ht, wd);
+
+		// Drop loggers before creating DPVO (which will create models again via setPatchifierModels)
+		// This prevents "logger with name already exists" errors
+#ifdef SPDLOG_USE_SYSLOG
+		spdlog::drop("fnet");
+		spdlog::drop("inet");
+#else
+		spdlog::drop("fnet");
+		spdlog::drop("inet");
+#endif
+
+		// Create DPVO instance with model input dimensions
+		// This ensures fmap/imap buffers match what fnet/inet models output
+		std::unique_ptr<DPVO> dpvo(new DPVO(dpvoCfg, ht, wd, config));
+
+		// Set fnet and inet models for Patchifier (will create new model instances)
+		// This will also start the processing thread (via _startThreads)
+		dpvo->setPatchifierModels(config, config);
+
+		// Set up frame processed synchronization (similar to WNC_APP pattern)
+		std::mutex frameProcessedMutex;
+		std::condition_variable frameProcessedCV;
+		bool frameProcessed = false;
+
+		// Note: DPVO doesn't have a callback mechanism like WNC_APP,
+		// so we'll use a simpler approach - just wait for processing to complete
+		// after each frame is added. We can use a timer or check isProcessingComplete.
+		logger->error("Start dpvoThread");
+		std::thread dpvoThread(appDPVOthreadFunction, std::ref(*dpvo));
+		logger->error("dpvoThread started");
+		unsigned int count = 0;
+		
+		logger->error("Start processDPVOInput");
+		// Process input frames using the dedicated function
+		processDPVOInput(
+			inputPath,
+			inputType,
+			logger,
+			count,
+			G_param,
+			dpvo.get(),
+			ht,
+			wd);
+		logger->error("processDPVOInput finished");
+		// Signal completion and wait for thread
+		{
+			std::lock_guard<std::mutex> lock(queueMutex);
+			terminateThreads = true;
+		}
+		frameCondVar.notify_all();
+		
+		if (dpvoThread.joinable())
+		{
+			dpvoThread.join();
+		}
+
+		// Stop DPVO's internal processing thread
+		dpvo->stopProcessingThread();
+
+		while (!dpvo->isProcessingComplete())
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			logger->info("Waiting for DPVO thread to finish...");
 		}
 	}();
 

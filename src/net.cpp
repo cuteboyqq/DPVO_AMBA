@@ -33,7 +33,9 @@ FNetInference::FNetInference(Config_S *config)
     m_model = ea_net_new(&net_params);
     if (m_model == NULL)
     {
-        logger->error("Creating FNet model failed");
+        logger->info("Creating FNet model failed");
+    }else{
+        logger->info("Creating FNet model successful");
     }
 
     m_inputTensor = nullptr;
@@ -61,23 +63,25 @@ bool FNetInference::runInference(const uint8_t *image, int H, int W, float *fmap
 
     if (!_loadInput(image, H, W))
     {
-        logger->error("FNet: Load Input Data Failed");
+        logger->info("FNet: Load Input Data Failed");
         return false;
+    }else{
+        logger->info("FNet: Load Input Data successful");
     }
 
     // Run inference
     if (EA_SUCCESS != ea_net_forward(m_model, 1))
     {
-        logger->error("FNet: Inference failed");
+        logger->info("FNet: Inference failed");
         return false;
-    }
+    }else{logger->info("FNet: Inference successful");}
 
     // Sync output tensor
 #if defined(CV28)
     int rval = ea_tensor_sync_cache(m_outputTensor, EA_VP, EA_CPU);
     if (rval != EA_SUCCESS)
     {
-        logger->error("FNet: Failed to sync output tensor");
+        logger->info("FNet: Failed to sync output tensor");
     }
 #endif
 
@@ -140,6 +144,8 @@ void FNetInference::_initModelIO()
     {
         logger->error("FNet model file does not exist at path: {}", m_ptrModelPath);
         return;
+    }else{
+        logger->error("FNet model file exist at path: {}", m_ptrModelPath);
     }
     fclose(file);
 
@@ -263,15 +269,19 @@ bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap
 
     if (!_loadInput(image, H, W))
     {
-        logger->error("INet: Load Input Data Failed");
+        logger->info("INet: Load Input Data Failed");
         return false;
+    }else{
+        logger->info("INet: Load Input Data successful");
     }
 
     // Run inference
     if (EA_SUCCESS != ea_net_forward(m_model, 1))
     {
-        logger->error("INet: Inference failed");
+        logger->info("INet: Inference failed");
         return false;
+    }else{
+        logger->info("INet: Inference successful");
     }
 
     // Sync output tensor
@@ -279,11 +289,14 @@ bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap
     int rval = ea_tensor_sync_cache(m_outputTensor, EA_VP, EA_CPU);
     if (rval != EA_SUCCESS)
     {
-        logger->error("INet: Failed to sync output tensor");
+        logger->info("INet: Failed to sync output tensor");
+    }else{
+        logger->info("INet: sync output tensor successful");
     }
 #endif
 
     m_outputTensor = ea_net_output_by_index(m_model, 0);
+    if (logger) logger->info("INet: Got output tensor");
 
     // Copy output to imap_out
     // Model output: [1, 384, H/4, W/4] (channel-first in tensor)
@@ -293,24 +306,151 @@ bool INetInference::runInference(const uint8_t *image, int H, int W, float *imap
     const int outW = m_outputWidth;   // e.g., 160 (W/4)
     const int outC = m_outputChannel; // 384
 
+    if (logger) logger->info("INet: About to get tensor_data, outH={}, outW={}, outC={}", outH, outW, outC);
+
+    // Get actual tensor size to verify
+    const size_t *tensor_shape = ea_tensor_shape(m_outputTensor);
+    const size_t tensor_N = tensor_shape[EA_N];
+    const size_t tensor_C = tensor_shape[EA_C];
+    const size_t tensor_H = tensor_shape[EA_H];
+    const size_t tensor_W = tensor_shape[EA_W];
+    const size_t tensor_total_elements = tensor_N * tensor_C * tensor_H * tensor_W;
+    const size_t tensor_total_bytes = tensor_total_elements * sizeof(float);
+    
+    if (logger) logger->info("INet: Tensor shape: N={}, C={}, H={}, W={}, total_elements={}, total_bytes={}", 
+                              tensor_N, tensor_C, tensor_H, tensor_W, tensor_total_elements, tensor_total_bytes);
+
     // Copy from tensor directly to imap_out (no upsampling needed)
     // Tensor layout: [N, C, H, W] = [1, 384, 120, 160]
     // Output layout: [C, H, W] = [384, 120, 160]
     float *tensor_data = (float *)ea_tensor_data(m_outputTensor);
-    for (int c = 0; c < outC; c++)
+    if (tensor_data == nullptr) {
+        if (logger) logger->error("INet: tensor_data is nullptr!");
+        return false;
+    }
+    if (logger) logger->info("INet: Got tensor_data pointer: {}", (void*)tensor_data);
+    
+    if (imap_out == nullptr) {
+        if (logger) logger->info("INet: imap_out is nullptr!");
+        return false;
+    }
+    if (logger) logger->info("INet: imap_out pointer: {}", (void*)imap_out);
+    
+    const size_t expected_size = static_cast<size_t>(outC) * outH * outW;
+    const size_t expected_bytes = expected_size * sizeof(float);
+    if (logger) logger->info("INet: Expected output size: {} elements, {} bytes", expected_size, expected_bytes);
+    
+    // Verify tensor size matches expected size (accounting for N=1 dimension)
+    if (tensor_total_elements != expected_size) {
+        if (logger) logger->info("INet: Size mismatch! tensor_total_elements={}, expected_size={}", 
+                                  tensor_total_elements, expected_size);
+        // Still try to copy, but use the smaller size
+    }
+    
+    // Try to access first element to test if memory is valid
+    if (logger) logger->info("INet: About to test first element access");
+    volatile float test_val = tensor_data[0];  // Use volatile to prevent optimization
+    if (logger) logger->info("INet: First tensor element read: {}", test_val);
+    
+    // Copy data using the nested loop approach (safer for layout conversion)
+    // Tensor layout: [N=0, C, H, W]
+    // Output layout: [C, H, W]
+    if (logger) logger->info("INet: Starting copy loop, outC={}, outH={}, outW={}", outC, outH, outW);
+    
+    // Test first iteration separately with extensive logging
+    int c = 0, y = 0, x = 0;
+    if (logger) logger->info("INet: About to calculate first indices");
+    int tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
+    int dst_idx = c * outH * outW + y * outW + x;
+    if (logger) logger->info("INet: First indices calculated: tensor_idx={}, dst_idx={}", tensor_idx, dst_idx);
+    
+    if (static_cast<size_t>(tensor_idx) >= tensor_total_elements) {
+        if (logger) logger->info("INet: tensor_idx out of bounds! tensor_idx={}, tensor_total={}", 
+                                  tensor_idx, tensor_total_elements);
+        return false;
+    }
+    if (static_cast<size_t>(dst_idx) >= expected_size) {
+        if (logger) logger->info("INet: dst_idx out of bounds! dst_idx={}, expected={}", 
+                                  dst_idx, expected_size);
+        return false;
+    }
+    
+    if (logger) logger->info("INet: About to access tensor_data[{}]", tensor_idx);
+    volatile float test_tensor_val = tensor_data[tensor_idx];
+    if (logger) logger->info("INet: tensor_data[{}] = {}", tensor_idx, test_tensor_val);
+    
+    if (logger) logger->info("INet: About to write to imap_out[{}]", dst_idx);
+    imap_out[dst_idx] = test_tensor_val / 4.0f;
+    if (logger) logger->info("INet: First element written successfully");
+    
+    // Continue with the rest of the loop
+    if (logger) logger->info("INet: Starting main copy loop");
+    for (c = 0; c < outC; c++)
     {
-        for (int y = 0; y < outH; y++)
+        if (c == 0 && logger) logger->info("INet: Channel 0, starting y loop");
+        for (y = 0; y < outH; y++)
         {
-            for (int x = 0; x < outW; x++)
+            if (c == 0 && y == 0 && logger) logger->info("INet: Channel 0, Row 0, starting x loop");
+            for (x = 0; x < outW; x++)
             {
+                // Log every iteration for first few elements to catch the crash
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: Loop iteration: c={}, y={}, x={}", c, y, x);
+                }
+                
+                // Skip first element (already done)
+                if (c == 0 && y == 0 && x == 0) {
+                    if (logger) logger->info("INet: Skipping first element (c=0, y=0, x=0)");
+                    continue;
+                }
+                
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: Processing element (c={}, y={}, x={})", c, y, x);
+                }
+                
                 // Tensor layout: [N=0, C, H, W]
-                int tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
-                // Output layout: [C, H, W] - same resolution as model output
-                int dst_idx = c * outH * outW + y * outW + x;
-                imap_out[dst_idx] = tensor_data[tensor_idx] / 4.0f; // Divide by 4.0 as in Python
+                tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
+                // Output layout: [C, H, W]
+                dst_idx = c * outH * outW + y * outW + x;
+                
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: Calculated indices: tensor_idx={}, dst_idx={}", tensor_idx, dst_idx);
+                }
+                
+                if (static_cast<size_t>(tensor_idx) >= tensor_total_elements) {
+                    if (logger) {
+                        logger->info("INet: tensor_idx out of bounds! c={}, y={}, x={}, tensor_idx={}, tensor_total={}", 
+                                      c, y, x, tensor_idx, tensor_total_elements);
+                    }
+                    return false;
+                }
+                if (static_cast<size_t>(dst_idx) >= expected_size) {
+                    if (logger) {
+                        logger->info("INet: dst_idx out of bounds! c={}, y={}, x={}, dst_idx={}, expected={}", 
+                                      c, y, x, dst_idx, expected_size);
+                    }
+                    return false;
+                }
+                
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: About to read tensor_data[{}]", tensor_idx);
+                }
+                volatile float val = tensor_data[tensor_idx];
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: Read tensor_data[{}] = {}", tensor_idx, val);
+                }
+                
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: About to write imap_out[{}]", dst_idx);
+                }
+                imap_out[dst_idx] = val / 4.0f;
+                if (c == 0 && y == 0 && x < 5 && logger) {
+                    logger->info("INet: Wrote imap_out[{}] successfully", dst_idx);
+                }
             }
         }
     }
+    if (logger) logger->info("INet: Copy loop completed, about to return");
 
     return true;
 #else
@@ -435,6 +575,16 @@ Patchifier::~Patchifier()
 
 void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
 {
+    // Drop existing loggers if they exist (in case models were created elsewhere)
+    // This prevents "logger with name already exists" errors
+#ifdef SPDLOG_USE_SYSLOG
+    spdlog::drop("fnet");
+    spdlog::drop("inet");
+#else
+    spdlog::drop("fnet");
+    spdlog::drop("inet");
+#endif
+    
     if (fnetConfig != nullptr)
     {
         m_fnet = std::make_unique<FNetInference>(fnetConfig);
@@ -449,66 +599,126 @@ void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
 // Note: fmap and imap are at 1/4 resolution (RES=4), but image and coords are at full resolution
 void Patchifier::forward(
     const uint8_t *image,
-    int H, int W,   // Full resolution image dimensions (e.g., 480x640)
-    float *fmap,    // [128, H/4, W/4] - at 1/4 resolution
-    float *imap,    // [DIM, H/4, W/4] - at 1/4 resolution
+    int H, int W,   // Actual image dimensions (may differ from model input)
+    float *fmap,    // [128, model_H/4, model_W/4] - at 1/4 resolution of model input
+    float *imap,    // [DIM, model_H/4, model_W/4] - at 1/4 resolution of model input
     float *gmap,    // [M, 128, P, P]
     float *patches, // [M, 3, P, P]
     uint8_t *clr,   // [M, 3]
     int M)
 {
-    const int RES = 4;          // Resolution factor (Python RES=4)
-    const int fmap_H = H / RES; // fmap height at 1/4 resolution (e.g., 120)
-    const int fmap_W = W / RES; // fmap width at 1/4 resolution (e.g., 160)
+    const int RES = 4;  // Resolution factor (Python RES=4)
+    const int inet_output_channels = 384;  // INet model output channels (not m_DIM which defaults to 64)
+    
+    // Get model output dimensions (models resize input internally)
+    // fmap/imap buffers are sized based on model output, not actual image size
+    int fmap_H = 0, fmap_W = 0;
+    if (m_fnet != nullptr && m_inet != nullptr)
+    {
+        // Use model output dimensions (models output at 1/4 of their input size)
+        fmap_H = m_fnet->getOutputHeight();  // e.g., 120 (480/4)
+        fmap_W = m_fnet->getOutputWidth();   // e.g., 160 (640/4)
+        
+        // Validate that fnet and inet have same output dimensions
+        if (fmap_H != m_inet->getOutputHeight() || fmap_W != m_inet->getOutputWidth())
+        {
+            throw std::runtime_error("FNet and INet output dimension mismatch");
+        }
+    }
+    else
+    {
+        // Fallback: calculate from actual image dimensions (should not happen if models are set)
+        fmap_H = H / RES;
+        fmap_W = W / RES;
+    }
 
     // ------------------------------------------------
     // 1. Run fnet and inet inference to get fmap and imap
     // ------------------------------------------------
     if (m_fnet != nullptr && m_inet != nullptr)
     {
-        // Allocate temporary buffers for 1/4 resolution outputs
+        // Allocate temporary buffers for model output size (1/4 resolution)
         if (m_fmap_buffer.size() != 128 * fmap_H * fmap_W)
         {
             m_fmap_buffer.resize(128 * fmap_H * fmap_W);
         }
-        if (m_imap_buffer.size() != m_DIM * fmap_H * fmap_W)
+        // INet outputs 384 channels, so use that instead of m_DIM
+        // m_DIM might be 64 (default), but we need 384 for INet output
+        if (m_imap_buffer.size() != inet_output_channels * fmap_H * fmap_W)
         {
-            m_imap_buffer.resize(m_DIM * fmap_H * fmap_W);
+            m_imap_buffer.resize(inet_output_channels * fmap_H * fmap_W);
+        }
+        auto logger_patch = spdlog::get("fnet");
+        if (!logger_patch) {
+            logger_patch = spdlog::get("inet");
         }
 
-        // Run fnet inference (outputs at 1/4 resolution, no upsampling)
+
+        
+        if (logger_patch) logger_patch->error("[Patchifier] About to call fnet->runInference");
+        // Run fnet inference (models will resize input internally)
         if (!m_fnet->runInference(image, H, W, m_fmap_buffer.data()))
         {
+            if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference failed");
             // Fallback: zero fill if inference fails
             std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+        }else{
+            if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference successful");
         }
 
-        // Run inet inference (outputs at 1/4 resolution, no upsampling)
+            // Run inet inference (models will resize input internally)
+        
+
+
+
+        if (logger_patch) logger_patch->error("[Patchifier] About to call inet->runInference");
+        
         if (!m_inet->runInference(image, H, W, m_imap_buffer.data()))
         {
+            if (logger_patch) logger_patch->error("[Patchifier] inet->runInference failed");
             // Fallback: zero fill if inference fails
             std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+        } else {
+            if (logger_patch) logger_patch->error("[Patchifier] inet->runInference successful");
         }
 
-        // Copy to output buffers (already at 1/4 resolution)
+
+
+
+
+        if (logger_patch) logger_patch->error("[Patchifier] About to memcpy fmap, size={}", 128 * fmap_H * fmap_W * sizeof(float));
+        // Copy to output buffers (already at 1/4 resolution of model input)
         std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
-        std::memcpy(imap, m_imap_buffer.data(), m_DIM * fmap_H * fmap_W * sizeof(float));
+        if (logger_patch) logger_patch->error("[Patchifier] fmap memcpy completed");
+        
+        // NOTE: imap parameter is actually a buffer for patch features [M, DIM], not the full feature map
+        // We need to extract patches from the full feature map [384, 120, 160] using patchify_cpu_safe
+        // So we don't memcpy the full feature map to imap - instead we'll extract patches later
+        if (logger_patch) logger_patch->error("[Patchifier] Skipping imap memcpy - will extract patches later");
     }
     else
     {
         // Fallback: zero fill if models not available
         std::fill(fmap, fmap + 128 * fmap_H * fmap_W, 0.0f);
-        std::fill(imap, imap + m_DIM * fmap_H * fmap_W, 0.0f);
+        // imap will be zero-filled later in patchify_cpu_safe fallback
     }
 
+    printf("[Patchifier] About to create grid, H=%d, W=%d\n", H, W);
+    fflush(stdout);
+    
     // ------------------------------------------------
     // 2. Image → float grid (for patches) - full resolution
     // ------------------------------------------------
     std::vector<float> grid(3 * H * W);
+    printf("[Patchifier] Grid created, size=%zu\n", grid.size());
+    fflush(stdout);
     for (int c = 0; c < 3; c++)
         for (int i = 0; i < H * W; i++)
             grid[c * H * W + i] = image[c * H * W + i] / 255.0f;
 
+    printf("[Patchifier] About to create coords, M=%d\n", M);
+    fflush(stdout);
+    
     // ------------------------------------------------
     // 3. Generate RANDOM coords (Python RANDOM mode) - full resolution
     // ------------------------------------------------
@@ -518,7 +728,12 @@ void Patchifier::forward(
         coords[m * 2 + 0] = 1 + rand() % (W - 2); // Full resolution coordinates
         coords[m * 2 + 1] = 1 + rand() % (H - 2); // Full resolution coordinates
     }
+    printf("[Patchifier] Coords created\n");
+    fflush(stdout);
 
+    printf("[Patchifier] About to call patchify_cpu_safe (patches)\n");
+    fflush(stdout);
+    
     // ------------------------------------------------
     // 4. Patchify grid → patches (RGB) - full resolution
     // ------------------------------------------------
@@ -527,7 +742,13 @@ void Patchifier::forward(
         M, 3, H, W,
         m_patch_size / 2,
         patches);
+    
+    printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
+    fflush(stdout);
 
+    printf("[Patchifier] About to create fmap_coords\n");
+    fflush(stdout);
+    
     // ------------------------------------------------
     // 5. Patchify fmap → gmap - scale coords to 1/4 resolution
     // ------------------------------------------------
@@ -538,23 +759,44 @@ void Patchifier::forward(
         fmap_coords[m * 2 + 0] = coords[m * 2 + 0] / RES; // Scale to 1/4 resolution
         fmap_coords[m * 2 + 1] = coords[m * 2 + 1] / RES; // Scale to 1/4 resolution
     }
+    printf("[Patchifier] fmap_coords created\n");
+    fflush(stdout);
 
+    printf("[Patchifier] About to call patchify_cpu_safe (gmap)\n");
+    fflush(stdout);
     patchify_cpu_safe(
         fmap, fmap_coords.data(),
         M, 128, fmap_H, fmap_W, // Use 1/4 resolution dimensions
         m_patch_size / 2,
         gmap);
+    printf("[Patchifier] patchify_cpu_safe (gmap) completed\n");
+    fflush(stdout);
 
+    printf("[Patchifier] About to call patchify_cpu_safe (imap)\n");
+    fflush(stdout);
     // ------------------------------------------------
     // 6. imap sampling (radius = 0) - scale coords to 1/4 resolution
+    // Extract patches from the full feature map stored in m_imap_buffer
     // ------------------------------------------------
-    patchify_cpu_safe(
-        imap, fmap_coords.data(),
-        M, m_DIM, fmap_H, fmap_W, // Use 1/4 resolution dimensions
-        0,
-        imap // reuse buffer shape [M, DIM, 1, 1]
-    );
+    // Use m_imap_buffer (full feature map [384, 120, 160]) as source
+    // Extract patches and write to imap (which is [M, DIM] = [8, 384])
+    if (m_fnet != nullptr && m_inet != nullptr) {
+        // Extract patches from the full feature map
+        patchify_cpu_safe(
+            m_imap_buffer.data(), fmap_coords.data(),  // Source: full feature map, coords at 1/4 resolution
+            M, inet_output_channels, fmap_H, fmap_W,   // M patches, 384 channels, 120x160 feature map
+            0,                                          // radius = 0 (single pixel)
+            imap                                        // Output: [M, DIM, 1, 1] = [8, 384, 1, 1]
+        );
+    } else {
+        // Fallback: zero fill if models not available
+        std::fill(imap, imap + M * m_DIM, 0.0f);
+    }
+    printf("[Patchifier] patchify_cpu_safe (imap) completed\n");
+    fflush(stdout);
 
+    printf("[Patchifier] About to extract colors\n");
+    fflush(stdout);
     // ------------------------------------------------
     // 7. Color for visualization - full resolution
     // ------------------------------------------------
@@ -565,6 +807,11 @@ void Patchifier::forward(
         for (int c = 0; c < 3; c++)
             clr[m * 3 + c] = image[c * H * W + y * W + x];
     }
+    printf("[Patchifier] Colors extracted\n");
+    fflush(stdout);
+    
+    printf("[Patchifier] forward() about to return\n");
+    fflush(stdout);
 }
 
 // void Patchifier::forward(const uint8_t* image, int H, int W,

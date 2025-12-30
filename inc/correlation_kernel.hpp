@@ -46,6 +46,7 @@ void computeCorrelation(
     int num_active,
     int M,      // PATCHES_PER_FRAME
     int P,
+    int num_frames,  // Number of frames in pyramid buffers (e.g., m_mem)
     int fmap_H, int fmap_W,
     int feature_dim,
     float* corr_out);
