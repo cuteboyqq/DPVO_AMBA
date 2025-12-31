@@ -1,5 +1,6 @@
 #include "projective_ops.hpp"
 #include <algorithm>
+#include <cmath>
 
 namespace pops {
 
@@ -296,6 +297,151 @@ void transformWithJacobians(
                     Jz_out[jz_idx] = Jz(c, 0);
                 }
             }
+        }
+    }
+}
+
+// ------------------------------------------------------------
+// flow_mag(): Compute flow magnitude for motion estimation
+// ------------------------------------------------------------
+void flow_mag(
+    const SE3* poses,
+    const float* patches_flat,
+    const float* intrinsics_flat,
+    const int* ii,
+    const int* jj,
+    const int* kk,
+    int num_edges,
+    int M,
+    int P,
+    float beta,
+    float* flow_out,
+    float* valid_out)
+{
+    // Allocate temporary buffers for coordinates
+    std::vector<float> coords0(num_edges * 2 * P * P);  // transform from i to i (identity)
+    std::vector<float> coords1(num_edges * 2 * P * P);   // transform from i to j (full)
+    std::vector<float> coords2(num_edges * 2 * P * P);   // transform from i to j (translation only)
+    std::vector<float> valid_temp(num_edges * P * P);    // validity mask
+    
+    // coords0: transform from frame i to frame i (identity - original coordinates)
+    // We can use transform() with jj = ii
+    std::vector<int> jj_identity(num_edges);
+    for (int e = 0; e < num_edges; e++) {
+        jj_identity[e] = ii[e];  // target = source (identity transform)
+    }
+    transform(poses, patches_flat, intrinsics_flat, ii, jj_identity.data(), kk, num_edges, M, P, coords0.data());
+    
+    // coords1: transform from frame i to frame j (full transform)
+    transform(poses, patches_flat, intrinsics_flat, ii, jj, kk, num_edges, M, P, coords1.data());
+    
+    // coords2: transform from frame i to frame j (translation only)
+    // We need to modify the transform to use translation only (identity rotation)
+    for (int e = 0; e < num_edges; e++) {
+        int i = ii[e];
+        int j = jj[e];
+        int k = kk[e];
+        
+        const SE3& Ti = poses[i];
+        const SE3& Tj = poses[j];
+        SE3 Gij = Tj * Ti.inverse();
+        
+        // Create translation-only transform: keep translation, set rotation to identity
+        SE3 Gij_tonly;
+        Gij_tonly.t = Gij.t;  // Keep translation
+        Gij_tonly.q = Eigen::Quaternionf::Identity();  // Identity rotation
+        
+        const float* intr_i = &intrinsics_flat[i * 4];
+        const float* intr_j = &intrinsics_flat[j * 4];
+        
+        for (int y = 0; y < P; y++) {
+            for (int x = 0; x < P; x++) {
+                int idx = y * P + x;
+                
+                // Inverse projection
+                float px = patches_flat[((i * M + k) * 3 + 0) * P * P + idx];
+                float py = patches_flat[((i * M + k) * 3 + 1) * P * P + idx];
+                float pd = patches_flat[((i * M + k) * 3 + 2) * P * P + idx];
+                
+                float X0 = (px - intr_i[2]) / intr_i[0];
+                float Y0 = (py - intr_i[3]) / intr_i[1];
+                float Z0 = 1.0f;
+                float W0 = pd;
+                
+                // Transform with translation only (no rotation)
+                Eigen::Vector3f p0(X0, Y0, Z0);
+                Eigen::Vector3f p1 = p0 + Gij_tonly.t * W0;  // Only translation, no rotation
+                
+                // Project
+                float z = std::max(p1.z(), 0.1f);
+                float d = 1.0f / z;
+                
+                float u = intr_j[0] * (d * p1.x()) + intr_j[2];
+                float v = intr_j[1] * (d * p1.y()) + intr_j[3];
+                
+                // Store coordinates
+                int base = e * 2 * P * P;
+                coords2[base + 0 * P * P + idx] = u;
+                coords2[base + 1 * P * P + idx] = v;
+                
+                // Compute validity (Z > 0.2)
+                if (valid_out != nullptr) {
+                    valid_temp[e * P * P + idx] = (p1.z() > 0.2f) ? 1.0f : 0.0f;
+                }
+            }
+        }
+    }
+    
+    // Compute flow magnitudes: beta * flow1 + (1-beta) * flow2
+    // flow1 = norm(coords1 - coords0)
+    // flow2 = norm(coords2 - coords0)
+    for (int e = 0; e < num_edges; e++) {
+        float sum_flow = 0.0f;
+        float sum_valid = 0.0f;
+        
+        for (int y = 0; y < P; y++) {
+            for (int x = 0; x < P; x++) {
+                int idx = y * P + x;
+                int base = e * 2 * P * P;
+                
+                // Get coordinates
+                float u0 = coords0[base + 0 * P * P + idx];
+                float v0 = coords0[base + 1 * P * P + idx];
+                float u1 = coords1[base + 0 * P * P + idx];
+                float v1 = coords1[base + 1 * P * P + idx];
+                float u2 = coords2[base + 0 * P * P + idx];
+                float v2 = coords2[base + 1 * P * P + idx];
+                
+                // Compute flow1 and flow2
+                float dx1 = u1 - u0;
+                float dy1 = v1 - v0;
+                float flow1 = std::sqrt(dx1 * dx1 + dy1 * dy1);
+                
+                float dx2 = u2 - u0;
+                float dy2 = v2 - v0;
+                float flow2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
+                
+                // Combined flow
+                float flow = beta * flow1 + (1.0f - beta) * flow2;
+                
+                // Check validity (use coords1 validity)
+                bool valid = true;
+                if (valid_out != nullptr) {
+                    valid = (valid_temp[e * P * P + idx] > 0.5f);
+                }
+                
+                if (valid) {
+                    sum_flow += flow;
+                    sum_valid += 1.0f;
+                }
+            }
+        }
+        
+        // Mean flow over valid pixels
+        flow_out[e] = (sum_valid > 0.0f) ? (sum_flow / sum_valid) : 0.0f;
+        
+        if (valid_out != nullptr) {
+            valid_out[e] = (sum_valid > 0.0f) ? 1.0f : 0.0f;
         }
     }
 }

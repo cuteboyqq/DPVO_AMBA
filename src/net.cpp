@@ -655,7 +655,7 @@ void Patchifier::forward(
 
 
         
-        if (logger_patch) logger_patch->error("[Patchifier] About to call fnet->runInference");
+        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference");
         // Run fnet inference (models will resize input internally)
         if (!m_fnet->runInference(image, H, W, m_fmap_buffer.data()))
         {
@@ -663,7 +663,7 @@ void Patchifier::forward(
             // Fallback: zero fill if inference fails
             std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
         }else{
-            if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference successful");
+            if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference successful");
         }
 
             // Run inet inference (models will resize input internally)
@@ -671,7 +671,7 @@ void Patchifier::forward(
 
 
 
-        if (logger_patch) logger_patch->error("[Patchifier] About to call inet->runInference");
+        if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference");
         
         if (!m_inet->runInference(image, H, W, m_imap_buffer.data()))
         {
@@ -679,17 +679,17 @@ void Patchifier::forward(
             // Fallback: zero fill if inference fails
             std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
         } else {
-            if (logger_patch) logger_patch->error("[Patchifier] inet->runInference successful");
+            if (logger_patch) logger_patch->info("[Patchifier] inet->runInference successful");
         }
 
 
 
 
 
-        if (logger_patch) logger_patch->error("[Patchifier] About to memcpy fmap, size={}", 128 * fmap_H * fmap_W * sizeof(float));
+        if (logger_patch) logger_patch->info("[Patchifier] About to memcpy fmap, size={}", 128 * fmap_H * fmap_W * sizeof(float));
         // Copy to output buffers (already at 1/4 resolution of model input)
         std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
-        if (logger_patch) logger_patch->error("[Patchifier] fmap memcpy completed");
+        if (logger_patch) logger_patch->info("[Patchifier] fmap memcpy completed");
         
         // NOTE: imap parameter is actually a buffer for patch features [M, DIM], not the full feature map
         // We need to extract patches from the full feature map [384, 120, 160] using patchify_cpu_safe
@@ -1343,16 +1343,20 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
     m_bProcessed = false;
 
     // STEP 1: load input tensors
+    logger->info("DPVOUpdate::_run: About to call _loadInput, frameIdx={}", frameIdx);
     if (!_loadInput(netData, inpData, corrData, iiData, jjData, kkData))
     {
         logger->error("Load Input Data Failed");
         return false;
     }
+    logger->info("DPVOUpdate::_run: _loadInput completed");
 
     // STEP 2: inference
     // STEP 2-1: check if the tensors are already saved, pass the inference
+    logger->info("DPVOUpdate::_run: About to check saved tensor, frameIdx={}", frameIdx);
     if (_checkSavedTensor(frameIdx))
     {
+        logger->info("DPVOUpdate::_run: Using saved tensor, allocating buffers");
         // Allocate memory for all output tensors
         m_pred.netOutBuff = new float[m_netOutBufferSize];
         m_pred.dOutBuff = new float[m_dOutBufferSize];
@@ -1362,59 +1366,177 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
         std::memcpy(m_pred.netOutBuff, (float *)m_netOutBuff, m_netOutBufferSize * sizeof(float));
         std::memcpy(m_pred.dOutBuff, (float *)m_dOutBuff, m_dOutBufferSize * sizeof(float));
         std::memcpy(m_pred.wOutBuff, (float *)m_wOutBuff, m_wOutBufferSize * sizeof(float));
+        logger->info("DPVOUpdate::_run: Saved tensor copy completed");
     }
     else
     {
+        logger->info("DPVOUpdate::_run: Saved tensor not found, running inference");
         // STEP 2-2: run inference using Ambarella's eazyai library
         if (m_estimateTime)
             time_1 = std::chrono::high_resolution_clock::now();
 
-        if (EA_SUCCESS != ea_net_forward(m_model, 1))
-        {
-            _releaseInputTensors();
-            _releaseOutputTensors();
-            _releaseTensorBuffers();
-            _releaseModel();
+        // Validate model before calling forward
+        logger->info("DPVOUpdate::_run: Validating model before forward pass");
+        if (m_model == nullptr) {
+            logger->error("DPVOUpdate::_run: m_model is null - cannot run inference");
+            return false;
         }
-        else
+        logger->info("DPVOUpdate::_run: Model is valid, m_model={}", (void*)m_model);
+        
+        // Validate input tensors are still valid
+        logger->info("DPVOUpdate::_run: Re-validating input tensors before forward");
+        if (m_inputNetTensor == nullptr || m_inputInpTensor == nullptr || m_inputCorrTensor == nullptr ||
+            m_inputIiTensor == nullptr || m_inputJjTensor == nullptr || m_inputKkTensor == nullptr) {
+            logger->error("DPVOUpdate::_run: Input tensors became null before forward pass");
+            return false;
+        }
+        logger->info("DPVOUpdate::_run: All input tensors are still valid");
+        
+        // Log input tensor data pointers one more time
+        void* net_data_check = ea_tensor_data(m_inputNetTensor);
+        void* inp_data_check = ea_tensor_data(m_inputInpTensor);
+        void* corr_data_check = ea_tensor_data(m_inputCorrTensor);
+        logger->info("DPVOUpdate::_run: Input tensor data pointers - net={}, inp={}, corr={}",
+                     (void*)net_data_check, (void*)inp_data_check, (void*)corr_data_check);
+        
+        if (net_data_check == nullptr || inp_data_check == nullptr || corr_data_check == nullptr) {
+            logger->error("DPVOUpdate::_run: Input tensor data pointers are null before forward");
+            return false;
+        }
+        
+        // Test read from input tensors to ensure they're accessible
+        logger->info("DPVOUpdate::_run: Testing read access to input tensor data");
+        volatile float test_net = static_cast<float*>(net_data_check)[0];
+        volatile float test_inp = static_cast<float*>(inp_data_check)[0];
+        volatile float test_corr = static_cast<float*>(corr_data_check)[0];
+        logger->info("DPVOUpdate::_run: Test read successful - net[0]={}, inp[0]={}, corr[0]={}",
+                     test_net, test_inp, test_corr);
+
+        // Check if net input is all zeros (which might cause inference to fail)
+        bool net_all_zero = true;
+        for (size_t i = 0; i < m_netBufferSize && net_all_zero; i++) {
+            if (m_netBuff[i] != 0.0f) {
+                net_all_zero = false;
+            }
+        }
+        if (net_all_zero) {
+            logger->warn("DPVOUpdate::_run: WARNING - net input buffer is all zeros ({} elements)", m_netBufferSize);
+            logger->warn("DPVOUpdate::_run: This might cause ea_net_forward to fail - net state may not be initialized");
+        }
+        
+        // Log input tensor statistics one more time before forward
+        if (net_data_check != nullptr && m_netBufferSize > 0) {
+            float* net_array = static_cast<float*>(net_data_check);
+            float net_tensor_min = *std::min_element(net_array, net_array + m_netBufferSize);
+            float net_tensor_max = *std::max_element(net_array, net_array + m_netBufferSize);
+            logger->info("DPVOUpdate::_run: Net tensor data range before forward: [{}, {}]", net_tensor_min, net_tensor_max);
+        }
+        
+        logger->info("DPVOUpdate::_run: About to call ea_net_forward(m_model={}, batch=1)", (void*)m_model);
+        int forward_result = ea_net_forward(m_model, 1);
+        logger->info("DPVOUpdate::_run: ea_net_forward returned: {} (EA_SUCCESS={})", forward_result, EA_SUCCESS);
+        
+        if (EA_SUCCESS != forward_result)
         {
-            // Sync output tensors between VP and CPU
+            logger->error("DPVOUpdate::_run: ea_net_forward failed with error code: {} (EA_SUCCESS={})", 
+                         forward_result, EA_SUCCESS);
+            logger->error("DPVOUpdate::_run: Error code meanings: 0=EA_SUCCESS, -1=EA_FAIL, -11=EAGAIN, -4=EINTR");
+            logger->error("DPVOUpdate::_run: Model state - m_model={}, input tensors valid={}",
+                         (void*)m_model,
+                         (m_inputNetTensor != nullptr && m_inputInpTensor != nullptr && m_inputCorrTensor != nullptr));
+            
+            // Check if this is a recoverable error (EAGAIN or EINTR)
+            if (forward_result == -11) {  // EAGAIN
+                logger->warn("DPVOUpdate::_run: Inference interrupted by other net (EAGAIN) - this is recoverable");
+            } else if (forward_result == -4) {  // EINTR
+                logger->warn("DPVOUpdate::_run: Inference interrupted by signal (EINTR) - this is recoverable");
+            } else {
+                logger->error("DPVOUpdate::_run: Inference failed with unrecoverable error (likely EA_FAIL=-1)");
+                logger->error("DPVOUpdate::_run: Possible causes: invalid input data, model state corruption, or hardware error");
+            }
+            
+            // Don't release model/tensors on single inference failure - allow retry on next call
+            // Only release in destructor or on critical errors
+            return false;
+        }
+        logger->info("DPVOUpdate::_run: ea_net_forward completed successfully");
+        
+        // Get output tensors AFTER forward pass (they may have changed)
+        logger->info("DPVOUpdate::_run: About to get output tensors by index");
+        m_outputTensors[0] = ea_net_output_by_index(m_model, 0);
+        m_outputTensors[1] = ea_net_output_by_index(m_model, 1);
+        m_outputTensors[2] = ea_net_output_by_index(m_model, 2);
+        logger->info("DPVOUpdate::_run: Output tensors retrieved");
+
+        // Validate output tensors before syncing
+        if (m_outputTensors[0] == nullptr || m_outputTensors[1] == nullptr || m_outputTensors[2] == nullptr) {
+            logger->error("DPVOUpdate::_run: One or more output tensors are null after retrieval");
+            return false;
+        }
+        
+        // Sync output tensors between VP and CPU (AFTER getting them)
 #if defined(CV28)
-            rval = ea_tensor_sync_cache(m_outputTensors[0], EA_VP, EA_CPU);
-            if (rval != EA_SUCCESS)
-            {
-                logger->error("Failed to sync output tensor 0");
-            }
-            rval = ea_tensor_sync_cache(m_outputTensors[1], EA_VP, EA_CPU);
-            if (rval != EA_SUCCESS)
-            {
-                logger->error("Failed to sync output tensor 1");
-            }
-            rval = ea_tensor_sync_cache(m_outputTensors[2], EA_VP, EA_CPU);
-            if (rval != EA_SUCCESS)
-            {
-                logger->error("Failed to sync output tensor 2");
-            }
+        logger->info("DPVOUpdate::_run: About to sync output tensors");
+        rval = ea_tensor_sync_cache(m_outputTensors[0], EA_VP, EA_CPU);
+        if (rval != EA_SUCCESS)
+        {
+            logger->error("Failed to sync output tensor 0, rval={}", rval);
+        }
+        rval = ea_tensor_sync_cache(m_outputTensors[1], EA_VP, EA_CPU);
+        if (rval != EA_SUCCESS)
+        {
+            logger->error("Failed to sync output tensor 1, rval={}", rval);
+        }
+        rval = ea_tensor_sync_cache(m_outputTensors[2], EA_VP, EA_CPU);
+        if (rval != EA_SUCCESS)
+        {
+            logger->error("Failed to sync output tensor 2, rval={}", rval);
+        }
+        logger->info("DPVOUpdate::_run: Tensor sync completed");
 #endif
 
-            m_outputTensors[0] = ea_net_output_by_index(m_model, 0);
-            m_outputTensors[1] = ea_net_output_by_index(m_model, 1);
-            m_outputTensors[2] = ea_net_output_by_index(m_model, 2);
+        // Validate output tensors
+        if (m_outputTensors[0] == nullptr || m_outputTensors[1] == nullptr || m_outputTensors[2] == nullptr) {
+            logger->error("DPVOUpdate::_run: One or more output tensors are null");
+            return false;
+        }
 
-            // Allocate memory for all output tensors
-            m_pred.netOutBuff = new float[m_netOutBufferSize];
-            m_pred.dOutBuff = new float[m_dOutBufferSize];
-            m_pred.wOutBuff = new float[m_wOutBufferSize];
+        logger->info("DPVOUpdate::_run: About to allocate prediction buffers");
+        // Allocate memory for all output tensors
+        m_pred.netOutBuff = new float[m_netOutBufferSize];
+        m_pred.dOutBuff = new float[m_dOutBufferSize];
+        m_pred.wOutBuff = new float[m_wOutBufferSize];
+        logger->info("DPVOUpdate::_run: Prediction buffers allocated");
 
-            // Copy output tensors to prediction buffers
-            std::memcpy(m_pred.netOutBuff, (float *)ea_tensor_data(m_outputTensors[0]), m_netOutBufferSize * sizeof(float));
-            std::memcpy(m_pred.dOutBuff, (float *)ea_tensor_data(m_outputTensors[1]), m_dOutBufferSize * sizeof(float));
-            std::memcpy(m_pred.wOutBuff, (float *)ea_tensor_data(m_outputTensors[2]), m_wOutBufferSize * sizeof(float));
+        // Get tensor data pointers and validate
+        logger->info("DPVOUpdate::_run: About to get tensor data pointers");
+        void* tensor0_data = ea_tensor_data(m_outputTensors[0]);
+        void* tensor1_data = ea_tensor_data(m_outputTensors[1]);
+        void* tensor2_data = ea_tensor_data(m_outputTensors[2]);
+        
+        if (tensor0_data == nullptr || tensor1_data == nullptr || tensor2_data == nullptr) {
+            logger->error("DPVOUpdate::_run: One or more tensor data pointers are null");
+            delete[] m_pred.netOutBuff;
+            delete[] m_pred.dOutBuff;
+            delete[] m_pred.wOutBuff;
+            m_pred.netOutBuff = nullptr;
+            m_pred.dOutBuff = nullptr;
+            m_pred.wOutBuff = nullptr;
+            return false;
+        }
+        logger->info("DPVOUpdate::_run: Tensor data pointers retrieved, about to memcpy");
+
+        // Copy output tensors to prediction buffers
+        std::memcpy(m_pred.netOutBuff, (float *)tensor0_data, m_netOutBufferSize * sizeof(float));
+        logger->info("DPVOUpdate::_run: Copied tensor 0");
+        std::memcpy(m_pred.dOutBuff, (float *)tensor1_data, m_dOutBufferSize * sizeof(float));
+        logger->info("DPVOUpdate::_run: Copied tensor 1");
+        std::memcpy(m_pred.wOutBuff, (float *)tensor2_data, m_wOutBufferSize * sizeof(float));
+        logger->info("DPVOUpdate::_run: Copied tensor 2, memcpy completed");
 
 #if defined(SAVE_OUTPUT_TENSOR)
-            _saveOutputTensor(frameIdx);
+        _saveOutputTensor(frameIdx);
 #endif
-        }
     }
 
     m_bProcessed = true;
@@ -1462,25 +1584,111 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
                                  : std::chrono::time_point<std::chrono::high_resolution_clock>{};
     auto time_1 = std::chrono::time_point<std::chrono::high_resolution_clock>{};
 
+    // Validate input data pointers
+    if (netData == nullptr || inpData == nullptr || corrData == nullptr ||
+        iiData == nullptr || jjData == nullptr || kkData == nullptr) {
+        logger->error("DPVOUpdate::_loadInput: One or more input data pointers are null");
+        return false;
+    }
+    
+    logger->info("DPVOUpdate::_loadInput: Buffer sizes - net={}, inp={}, corr={}, ii={}, jj={}, kk={}",
+                 m_netBufferSize, m_inpBufferSize, m_corrBufferSize, m_iiBufferSize, m_jjBufferSize, m_kkBufferSize);
+    
     // Copy input data to working buffers
+    logger->info("DPVOUpdate::_loadInput: Copying data to working buffers");
     std::memcpy(m_netBuff, netData, m_netBufferSize * sizeof(float));
     std::memcpy(m_inpBuff, inpData, m_inpBufferSize * sizeof(float));
     std::memcpy(m_corrBuff, corrData, m_corrBufferSize * sizeof(float));
     std::memcpy(m_iiBuff, iiData, m_iiBufferSize * sizeof(int32_t));
     std::memcpy(m_jjBuff, jjData, m_jjBufferSize * sizeof(int32_t));
     std::memcpy(m_kkBuff, kkData, m_kkBufferSize * sizeof(int32_t));
+    logger->info("DPVOUpdate::_loadInput: Data copied to working buffers");
+    
+    // Log sample values for debugging
+    if (m_netBufferSize > 0) {
+        float net_min = *std::min_element(m_netBuff, m_netBuff + m_netBufferSize);
+        float net_max = *std::max_element(m_netBuff, m_netBuff + m_netBufferSize);
+        logger->info("DPVOUpdate::_loadInput: net buffer range: [{}, {}], first={}, last={}",
+                     net_min, net_max, m_netBuff[0], m_netBuff[m_netBufferSize - 1]);
+    }
+    if (m_iiBufferSize > 0) {
+        int32_t ii_min = *std::min_element(m_iiBuff, m_iiBuff + m_iiBufferSize);
+        int32_t ii_max = *std::max_element(m_iiBuff, m_iiBuff + m_iiBufferSize);
+        logger->info("DPVOUpdate::_loadInput: ii buffer range: [{}, {}], first={}, last={}",
+                     ii_min, ii_max, m_iiBuff[0], m_iiBuff[m_iiBufferSize - 1]);
+    }
 
     // Copy data to input tensors
 #if defined(CV28) || defined(CV28_SIMULATOR)
+    // Validate input tensors before using them
+    logger->info("DPVOUpdate::_loadInput: Validating input tensors");
+    if (m_inputNetTensor == nullptr || m_inputInpTensor == nullptr || m_inputCorrTensor == nullptr ||
+        m_inputIiTensor == nullptr || m_inputJjTensor == nullptr || m_inputKkTensor == nullptr) {
+        logger->error("DPVOUpdate::_loadInput: One or more input tensors are null - model may have been released");
+        logger->error("DPVOUpdate::_loadInput: net={}, inp={}, corr={}, ii={}, jj={}, kk={}",
+                     (void*)m_inputNetTensor, (void*)m_inputInpTensor, (void*)m_inputCorrTensor,
+                     (void*)m_inputIiTensor, (void*)m_inputJjTensor, (void*)m_inputKkTensor);
+        return false;
+    }
+    logger->info("DPVOUpdate::_loadInput: All input tensors are valid");
+    
+    // Log tensor shapes
+    const size_t* net_shape = ea_tensor_shape(m_inputNetTensor);
+    const size_t* inp_shape = ea_tensor_shape(m_inputInpTensor);
+    const size_t* corr_shape = ea_tensor_shape(m_inputCorrTensor);
+    if (net_shape && inp_shape && corr_shape) {
+        logger->info("DPVOUpdate::_loadInput: Tensor shapes - net=[{}x{}x{}x{}], inp=[{}x{}x{}x{}], corr=[{}x{}x{}x{}]",
+                     net_shape[0], net_shape[1], net_shape[2], net_shape[3],
+                     inp_shape[0], inp_shape[1], inp_shape[2], inp_shape[3],
+                     corr_shape[0], corr_shape[1], corr_shape[2], corr_shape[3]);
+    }
+    
+    // Validate tensor data pointers
+    logger->info("DPVOUpdate::_loadInput: Getting tensor data pointers");
+    void* net_data = ea_tensor_data(m_inputNetTensor);
+    void* inp_data = ea_tensor_data(m_inputInpTensor);
+    void* corr_data = ea_tensor_data(m_inputCorrTensor);
+    void* ii_data = ea_tensor_data(m_inputIiTensor);
+    void* jj_data = ea_tensor_data(m_inputJjTensor);
+    void* kk_data = ea_tensor_data(m_inputKkTensor);
+    
+    if (net_data == nullptr || inp_data == nullptr || corr_data == nullptr ||
+        ii_data == nullptr || jj_data == nullptr || kk_data == nullptr) {
+        logger->error("DPVOUpdate::_loadInput: One or more tensor data pointers are null");
+        logger->error("DPVOUpdate::_loadInput: net_data={}, inp_data={}, corr_data={}, ii_data={}, jj_data={}, kk_data={}",
+                     (void*)net_data, (void*)inp_data, (void*)corr_data,
+                     (void*)ii_data, (void*)jj_data, (void*)kk_data);
+        return false;
+    }
+    logger->info("DPVOUpdate::_loadInput: All tensor data pointers are valid");
+    
+    // Log tensor sizes
+    size_t net_tensor_size = ea_tensor_size(m_inputNetTensor);
+    size_t inp_tensor_size = ea_tensor_size(m_inputInpTensor);
+    size_t corr_tensor_size = ea_tensor_size(m_inputCorrTensor);
+    logger->info("DPVOUpdate::_loadInput: Tensor sizes - net={} bytes, inp={} bytes, corr={} bytes",
+                 net_tensor_size, inp_tensor_size, corr_tensor_size);
+    logger->info("DPVOUpdate::_loadInput: Expected buffer sizes - net={} bytes, inp={} bytes, corr={} bytes",
+                 m_netBufferSize * sizeof(float), m_inpBufferSize * sizeof(float), m_corrBufferSize * sizeof(float));
+    
     // Copy float tensors
-    std::memcpy(ea_tensor_data(m_inputNetTensor), m_netBuff, m_netBufferSize * sizeof(float));
-    std::memcpy(ea_tensor_data(m_inputInpTensor), m_inpBuff, m_inpBufferSize * sizeof(float));
-    std::memcpy(ea_tensor_data(m_inputCorrTensor), m_corrBuff, m_corrBufferSize * sizeof(float));
+    logger->info("DPVOUpdate::_loadInput: Copying float tensors (net, inp, corr)");
+    std::memcpy(net_data, m_netBuff, m_netBufferSize * sizeof(float));
+    logger->info("DPVOUpdate::_loadInput: Copied net tensor ({} bytes)", m_netBufferSize * sizeof(float));
+    std::memcpy(inp_data, m_inpBuff, m_inpBufferSize * sizeof(float));
+    logger->info("DPVOUpdate::_loadInput: Copied inp tensor ({} bytes)", m_inpBufferSize * sizeof(float));
+    std::memcpy(corr_data, m_corrBuff, m_corrBufferSize * sizeof(float));
+    logger->info("DPVOUpdate::_loadInput: Copied corr tensor ({} bytes)", m_corrBufferSize * sizeof(float));
 
     // Copy int32 tensors
-    std::memcpy(ea_tensor_data(m_inputIiTensor), m_iiBuff, m_iiBufferSize * sizeof(int32_t));
-    std::memcpy(ea_tensor_data(m_inputJjTensor), m_jjBuff, m_jjBufferSize * sizeof(int32_t));
-    std::memcpy(ea_tensor_data(m_inputKkTensor), m_kkBuff, m_kkBufferSize * sizeof(int32_t));
+    logger->info("DPVOUpdate::_loadInput: Copying int32 tensors (ii, jj, kk)");
+    std::memcpy(ii_data, m_iiBuff, m_iiBufferSize * sizeof(int32_t));
+    logger->info("DPVOUpdate::_loadInput: Copied ii tensor ({} bytes)", m_iiBufferSize * sizeof(int32_t));
+    std::memcpy(jj_data, m_jjBuff, m_jjBufferSize * sizeof(int32_t));
+    logger->info("DPVOUpdate::_loadInput: Copied jj tensor ({} bytes)", m_jjBufferSize * sizeof(int32_t));
+    std::memcpy(kk_data, m_kkBuff, m_kkBufferSize * sizeof(int32_t));
+    logger->info("DPVOUpdate::_loadInput: Copied kk tensor ({} bytes)", m_kkBufferSize * sizeof(int32_t));
+    logger->info("DPVOUpdate::_loadInput: All tensors copied successfully");
 #endif
 
     if (m_estimateTime)

@@ -68,4 +68,35 @@ void transformWithJacobians(
     float* valid_out
 );
 
+/**
+ * Compute flow magnitude between frames for motion estimation.
+ * 
+ * @param poses        SE3 poses [num_frames]
+ * @param patches_flat Flattened patches array
+ * @param intrinsics_flat Flattened intrinsics
+ * @param ii           Source frame indices [num_edges]
+ * @param jj           Target frame indices [num_edges]
+ * @param kk           Patch indices [num_edges]
+ * @param num_edges    Number of edges
+ * @param M            Patches per frame
+ * @param P            Patch size
+ * @param beta         Weighting factor (default 0.5)
+ * @param flow_out     Output flow magnitudes [num_edges] (per edge, mean over patch)
+ * @param valid_out    Output validity mask [num_edges] (optional, can be nullptr)
+ */
+void flow_mag(
+    const SE3* poses,
+    const float* patches_flat,
+    const float* intrinsics_flat,
+    const int* ii,
+    const int* jj,
+    const int* kk,
+    int num_edges,
+    int M,
+    int P,
+    float beta,
+    float* flow_out,
+    float* valid_out = nullptr
+);
+
 } // namespace pops
