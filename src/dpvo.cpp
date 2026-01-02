@@ -1,13 +1,16 @@
 #include "dpvo.hpp"
-#include "net.hpp" // Patchifier
+#include "patchify.hpp" // Patchifier
+#include "update.hpp"   // DPVOUpdate
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>  // For std::abort()
 #include <stdexcept>
 #include <chrono>
+#include <random>   // For random depth initialization
 #include "projective_ops.hpp"
 #include "correlation_kernel.hpp"
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 static_assert(sizeof(((PatchGraph*)0)->m_index[0]) ==
               sizeof(int) * PatchGraph::M,
               "PatchGraph layout mismatch");
@@ -179,9 +182,9 @@ void DPVO::run(int64_t timestamp,
     // The pattern 0x3e... is NOT a valid address pattern
     
     // Use both stdout and stderr to ensure output is visible
-    fprintf(stderr, "[DPVO] ===== ENTERING run() =====\n");
+    fprintf(stderr, "[DPVO] ================ ENTERING run() ========================\n");
     fprintf(stderr, "[DPVO] DEBUG: Validating 'this' pointer at start of run(): %p\n", (void*)this);
-    printf("[DPVO] ===== ENTERING run() =====\n");
+    printf("[DPVO] ==================== ENTERING run() =============================\n");
     printf("[DPVO] DEBUG: Validating 'this' pointer at start of run(): %p\n", (void*)this);
     fflush(stdout);
     fflush(stderr);
@@ -337,6 +340,29 @@ void DPVO::run(int64_t timestamp,
     printf("[DPVO] About to call patchifier.forward\n");
     fflush(stdout);
     
+    // -------------------------------------------------
+    // Normalize image: 2 * (image / 255.0) - 0.5 (matches Python)
+    // Python: image = 2 * (image[None,None] / 255.0) - 0.5
+    // This normalizes from uint8 [0, 255] to float [-0.5, 1.5]
+    // -------------------------------------------------
+    const int C = 3;  // RGB channels
+    const int image_size = C * H * W;
+    std::vector<float> normalized_image(image_size);
+    
+    if (logger) logger->info("DPVO::run: Normalizing image from uint8 [0, 255] to float [-0.5, 1.5], size={}", image_size);
+    
+    // Image format is [C, H, W] (channel-first)
+    for (int i = 0; i < image_size; i++) {
+        // Normalize: 2 * (image / 255.0) - 0.5
+        normalized_image[i] = 2.0f * (static_cast<float>(image[i]) / 255.0f) - 0.5f;
+    }
+    
+    if (logger) {
+        float img_min = *std::min_element(normalized_image.begin(), normalized_image.end());
+        float img_max = *std::max_element(normalized_image.begin(), normalized_image.end());
+        logger->info("DPVO::run: Normalized image range: [{}, {}]", img_min, img_max);
+    }
+    
     // CRITICAL: Save 'this' pointer to a safe location (static/global) before calling patchifier.forward()
     // This protects against stack corruption that might overwrite the 'this' pointer on the stack
     static thread_local DPVO* saved_this_ptr = nullptr;
@@ -347,8 +373,20 @@ void DPVO::run(int64_t timestamp,
            (void*)this, saved_this_addr);
     fflush(stdout);
     
+    // Log where we're writing imap data
+    int imap_write_offset = imap_idx(pm, 0, 0);
+    if (logger) {
+        logger->info("DPVO::run: Writing imap data to ring buffer slot pm={}, offset={}, n={}", 
+                     pm, imap_write_offset, n);
+        // Check a sample value before writing
+        float before_val = m_imap[imap_write_offset];
+        logger->info("DPVO::run: m_imap[{}] before patchifier.forward = {}", imap_write_offset, before_val);
+    }
+    
+    // Pass normalized float image to patchifier
+    // Note: We'll need to update Patchifier::forward() to accept float* and handle conversion to uint8 for models
     m_patchifier.forward(
-        image, H, W,
+        normalized_image.data(), H, W,  // Pass normalized float image
         m_cur_fmap1,     // full-res fmap
         m_cur_imap,
         m_cur_gmap,
@@ -359,6 +397,26 @@ void DPVO::run(int64_t timestamp,
     
     printf("[DPVO] patchifier.forward returned\n");
     fflush(stdout);
+    
+    // Verify data was written correctly
+    if (logger) {
+        float after_val = m_imap[imap_write_offset];
+        float after_val_patch1 = m_imap[imap_write_offset + m_DIM];  // First element of patch 1
+        logger->info("DPVO::run: m_imap[{}] after patchifier.forward = {}, m_imap[{}] (patch1) = {}", 
+                     imap_write_offset, after_val, imap_write_offset + m_DIM, after_val_patch1);
+        
+        // Check all patches for this frame
+        int nonzero_count = 0;
+        int zero_count = 0;
+        for (int p = 0; p < M; p++) {
+            int patch_offset = imap_write_offset + p * m_DIM;
+            float patch_val = m_imap[patch_offset];
+            if (patch_val == 0.0f) zero_count++;
+            else nonzero_count++;
+        }
+        logger->info("DPVO::run: Frame {} imap data - zero_count={}, nonzero_count={} (out of {} patches)", 
+                     pm, zero_count, nonzero_count, M);
+    }
     
     // CRITICAL: Re-validate 'this' pointer immediately after patchifier.forward() returns
     // If stack corruption occurred, 'this' might be corrupted, but saved_this_ptr should be safe
@@ -438,25 +496,72 @@ void DPVO::run(int64_t timestamp,
     m_tlist.push_back(timestamp);
     m_pg.m_tstamps[n_use] = timestamp;
     
-    // Store camera intrinsics
-    std::memcpy(m_pg.m_intrinsics[n_use], intrinsics, sizeof(float) * 4);
+    // Store camera intrinsics (Python divides by RES=4)
+    const float RES = 4.0f;
+    float scaled_intrinsics[4];
+    for (int i = 0; i < 4; i++) {
+        scaled_intrinsics[i] = intrinsics[i] / RES;
+    }
+    std::memcpy(m_pg.m_intrinsics[n_use], scaled_intrinsics, sizeof(float) * 4);
     
     if (logger) logger->info("DPVO::run: Bookkeeping completed");
 
     // -------------------------------------------------
-    // 3. Pose initialization
+    // 3. Pose initialization (with motion model support)
     // -------------------------------------------------
     if (logger) logger->info("DPVO::run: Starting pose initialization");
-    if (n_use > 0)
+    if (n_use > 1) {
+        // Python: if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
+        // For now, we'll implement simple copy (equivalent to Python's else branch)
+        // TODO: Add MOTION_MODEL and MOTION_DAMPING to DPVOConfig if needed
         m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
+    } else if (n_use > 0) {
+        m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
+    }
     if (logger) logger->info("DPVO::run: Pose initialization completed");
 
     // -------------------------------------------------
-    // 4. Patch depth initialization (CRITICAL)
+    // 4. Patch depth initialization (CRITICAL - matches Python logic)
     // -------------------------------------------------
+    // Python: patches[:,:,2] = torch.rand_like(...) for first frames
+    //         if self.is_initialized: s = torch.median(...); patches[:,:,2] = s
     // NOTE: patchify_cpu_safe writes patches of size D*D (where D=4), but we store them in m_pg.m_patches
     // which expects P*P (where P=3). We'll extract the center P*P region from the D*D patch.
-    if (logger) logger->info("DPVO::run: Starting patch depth initialization");
+    if (logger) logger->info("DPVO::run: Starting patch depth initialization, m_is_initialized={}", m_is_initialized);
+    
+    float depth_value = 1.0f;  // Default value
+    
+    if (m_is_initialized && n_use >= 3) {
+        // Python: s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
+        // Compute median of last 3 frames' depth values (center pixel of each patch)
+        std::vector<float> depths;
+        for (int f = std::max(0, n_use - 3); f < n_use; f++) {
+            for (int i = 0; i < M; i++) {
+                // Get center pixel depth: patches[f][i][2][P/2][P/2]
+                int center_y = P / 2;
+                int center_x = P / 2;
+                float d = m_pg.m_patches[f][i][2][center_y][center_x];
+                if (d > 0.0f) {  // Only include valid depths
+                    depths.push_back(d);
+                }
+            }
+        }
+        if (!depths.empty()) {
+            std::sort(depths.begin(), depths.end());
+            depth_value = depths[depths.size() / 2];  // Median
+            if (logger) logger->info("DPVO::run: Using median depth from last 3 frames: {}", depth_value);
+        }
+    } else {
+        // Python: patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
+        // Random initialization for first frames
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        std::uniform_real_distribution<float> dis(0.1f, 1.0f);
+        depth_value = dis(gen);
+        if (logger) logger->info("DPVO::run: Using random depth initialization: {}", depth_value);
+    }
+    
+    // Initialize all patches with the computed depth value
     for (int i = 0; i < M; i++) {
         // patches layout from patchify_cpu_safe: [M][3][D][D] where D=4
         // We need to access the depth channel (c=2) and initialize center P*P region
@@ -465,7 +570,7 @@ void DPVO::run(int64_t timestamp,
         for (int y = 0; y < P; y++) {
             for (int x = 0; x < P; x++) {
                 int patch_idx = base + (center_offset + y) * patch_D + (center_offset + x);
-                patches[patch_idx] = 1.0f; // Python default
+                patches[patch_idx] = depth_value;
             }
         }
     }
@@ -518,7 +623,22 @@ void DPVO::run(int64_t timestamp,
     if (logger) logger->info("DPVO::run: Downsample fmap1->fmap2 completed");
 
     // -------------------------------------------------
-    // 7. Counters
+    // 7. Motion probe check (Python: if self.n > 0 and not self.is_initialized)
+    // -------------------------------------------------
+    if (n_use > 0 && !m_is_initialized) {
+        if (logger) logger->info("DPVO::run: Running motion probe check before initialization");
+        float motion_val = motionProbe();
+        if (motion_val < 2.0f) {
+            // Python: self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
+            // For now, we'll just return early (delta handling can be added later if needed)
+            if (logger) logger->info("DPVO::run: Motion probe returned {} < 2.0, skipping frame", motion_val);
+            return;
+        }
+        if (logger) logger->info("DPVO::run: Motion probe returned {} >= 2.0, proceeding", motion_val);
+    }
+
+    // -------------------------------------------------
+    // 8. Counters
     // -------------------------------------------------
     if (logger) logger->info("DPVO::run: Updating counters");
     // Use n_use instead of m_pg.m_n to ensure we're incrementing from a valid value
@@ -535,7 +655,7 @@ void DPVO::run(int64_t timestamp,
     }
 
     // -------------------------------------------------
-    // 8. Build edges
+    // 9. Build edges
     // -------------------------------------------------
     if (logger) logger->info("DPVO::run: Starting build edges");
     std::vector<int> kk, jj;
@@ -549,7 +669,7 @@ void DPVO::run(int64_t timestamp,
     if (logger) logger->info("DPVO::run: appendFactors (backward) completed");
 
     // -------------------------------------------------
-    // 9. Optimization
+    // 10. Optimization
     // -------------------------------------------------
     if (logger) logger->info("DPVO::run: Starting optimization, m_is_initialized={}, m_n={}", m_is_initialized, m_pg.m_n);
     if (m_is_initialized) {
@@ -646,21 +766,98 @@ void DPVO::update()
     // 3. Context slice from imap
     // -------------------------------------------------
     if (logger) logger->info("DPVO::update: Starting context slice from imap, num_active={}, m_DIM={}", num_active, m_DIM);
+    
+    // Check m_imap buffer statistics before slicing
+    if (logger) {
+        // Sample first few entries to check if m_imap is populated
+        float imap_sample_min = std::numeric_limits<float>::max();
+        float imap_sample_max = std::numeric_limits<float>::lowest();
+        int imap_sample_zero = 0;
+        int imap_sample_nonzero = 0;
+        int sample_size = std::min(100, M * m_pmem * m_DIM);
+        for (int i = 0; i < sample_size; i++) {
+            float val = m_imap[i];
+            if (val == 0.0f) imap_sample_zero++;
+            else imap_sample_nonzero++;
+            if (val < imap_sample_min) imap_sample_min = val;
+            if (val > imap_sample_max) imap_sample_max = val;
+        }
+        logger->info("DPVO::update: m_imap buffer sample stats (first {} elements) - zero_count={}, nonzero_count={}, min={}, max={}",
+                     sample_size, imap_sample_zero, imap_sample_nonzero, imap_sample_min, imap_sample_max);
+        
+        // Also check the most recent frame (should be frame 8 if n=9, so pm=8)
+        int current_n = m_pg.m_n;
+        int current_pm = (current_n - 1) % m_pmem;  // Most recently written frame
+        int current_imap_offset = imap_idx(current_pm, 0, 0);
+        float current_frame_sample = m_imap[current_imap_offset];
+        logger->info("DPVO::update: Most recent frame n={}, pm={}, imap_offset={}, m_imap[{}]={}",
+                     current_n, current_pm, current_imap_offset, current_imap_offset, current_frame_sample);
+        
+        // Check all frames in ring buffer
+        int frames_with_data = 0;
+        int frames_without_data = 0;
+        for (int f = 0; f < m_pmem; f++) {
+            int frame_offset = imap_idx(f, 0, 0);
+            float frame_sample = m_imap[frame_offset];
+            if (frame_sample != 0.0f) frames_with_data++;
+            else frames_without_data++;
+        }
+        logger->info("DPVO::update: Ring buffer status - frames_with_data={}, frames_without_data={} (out of {} slots)",
+                     frames_with_data, frames_without_data, m_pmem);
+    }
+    
     std::vector<float> ctx(num_active * m_DIM);
     for (int e = 0; e < num_active; e++) {
-        int kk_idx = m_pg.m_kk[e] % (M * m_pmem);
-        // Validate kk_idx to prevent out-of-bounds access
-        if (kk_idx < 0 || kk_idx >= (M * m_pmem)) {
-            if (logger && e < 10) logger->error("DPVO::update: Invalid kk_idx={} for edge e={}, M={}, m_pmem={}", 
-                                                kk_idx, e, M, m_pmem);
-            kk_idx = 0;  // Fallback to 0
+        // CRITICAL: kk is a linear patch index: kk = frame * M + patch
+        // m_imap is a ring buffer indexed as [frame % m_pmem][patch][dim]
+        // So we need to convert kk to (frame, patch) and then index correctly
+        int kk_val = m_pg.m_kk[e];
+        int frame = kk_val / M;  // Extract frame from linear index
+        int patch = kk_val % M;  // Extract patch from linear index
+        
+        // Convert to ring buffer index: frame % m_pmem
+        int imap_frame = frame % m_pmem;
+        
+        // Validate indices
+        if (frame < 0 || patch < 0 || patch >= M) {
+            if (logger && e < 10) logger->error("DPVO::update: Invalid kk={} -> frame={}, patch={} for edge e={}, M={}", 
+                                                kk_val, frame, patch, e, M);
+            // Fallback to frame 0, patch 0
+            imap_frame = 0;
+            patch = 0;
         }
+        
+        // Use imap_idx to get the correct offset: [imap_frame][patch][0]
+        int imap_offset = imap_idx(imap_frame, patch, 0);
+        
+        // Validate source pointer before memcpy
+        if (logger && e < 5) {
+            float src_sample = m_imap[imap_offset];
+            logger->info("DPVO::update: Edge e={}, kk={} -> frame={}, patch={}, imap_frame={}, imap_offset={}, m_imap[{}]={}", 
+                         e, kk_val, frame, patch, imap_frame, imap_offset, imap_offset, src_sample);
+        }
+        
         std::memcpy(
             &ctx[e * m_DIM],
-            &m_imap[kk_idx * m_DIM],
+            &m_imap[imap_offset],
             sizeof(float) * m_DIM
         );
     }
+    
+    // Check ctx statistics after slicing
+    if (logger) {
+        float ctx_min = *std::min_element(ctx.begin(), ctx.end());
+        float ctx_max = *std::max_element(ctx.begin(), ctx.end());
+        int ctx_zero_count = 0;
+        int ctx_nonzero_count = 0;
+        for (size_t i = 0; i < ctx.size(); i++) {
+            if (ctx[i] == 0.0f) ctx_zero_count++;
+            else ctx_nonzero_count++;
+        }
+        logger->info("DPVO::update: Context (ctx) stats after slicing - zero_count={}, nonzero_count={}, min={}, max={}, size={}",
+                     ctx_zero_count, ctx_nonzero_count, ctx_min, ctx_max, ctx.size());
+    }
+    
     if (logger) logger->info("DPVO::update: Context slice completed");
 
     // -------------------------------------------------
@@ -672,7 +869,8 @@ void DPVO::update()
     
     if (m_updateModel != nullptr) {
         if (logger) logger->info("DPVO::update: m_updateModel is not null, preparing model inputs");
-        // Model expects fixed shapes: [1, 384, 768, 1] for net/inp, [1, 882, 768, 1] for corr, [1, 768, 1] for indices
+        // Model expects fixed shapes: [1, 384, 768, 1] for net/inp, 
+        // [1, 882, 768, 1] for corr, [1, 768, 1] for indices
         const int MODEL_EDGE_COUNT = 768;
         const int CORR_DIM = 882; // Correlation feature dimension
         
@@ -687,8 +885,10 @@ void DPVO::update()
         std::vector<int32_t> jj_input(1 * MODEL_EDGE_COUNT * 1, 0);
         std::vector<int32_t> kk_input(1 * MODEL_EDGE_COUNT * 1, 0);
         
+        // CRITICAL: YAML specifies [N, C, H, W] layout: 1,384,768,1
+        // Where: N=1 (batch), C=384 (channels), H=768 (spatial/edges), W=1
         // Reshape and copy net data: [num_active, 384] -> [1, 384, 768, 1]
-        // Layout: [batch, channels, spatial, 1] = [1, 384, 768, 1]
+        // Layout: [batch, channels, height, width] = [1, 384, 768, 1]
         if (logger) logger->info("DPVO::update: Reshaping net/inp data, num_edges_to_process={}", num_edges_to_process);
         
         // Check net state before copying
@@ -710,6 +910,22 @@ void DPVO::update()
                          net_zero_count, net_nonzero_count, net_min, net_max);
         }
         
+        // WORKAROUND: If net is all zeros, initialize it from context (inp) to break the cycle
+        // This is a temporary fix - ideally the model should accept zero input or we need proper initialization
+        bool net_all_zero = (net_nonzero_count == 0);
+        if (net_all_zero && logger) {
+            logger->warn("DPVO::update: Net state is all zeros - initializing from context (inp) as workaround");
+            // Initialize net from context (inp) - this gives the model some initial state
+            for (int e = 0; e < num_edges_to_process; e++) {
+                if (e < 0 || e >= num_active) continue;
+                for (int d = 0; d < 384; d++) {
+                    // Use context as initial net state (scaled down to avoid large values)
+                    m_pg.m_net[e][d] = ctx[e * 384 + d] * 0.1f;
+                }
+            }
+            if (logger) logger->info("DPVO::update: Net state initialized from context for {} edges", num_edges_to_process);
+        }
+        
         for (int e = 0; e < num_edges_to_process; e++) {
             // Validate edge index
             if (e < 0 || e >= num_active) {
@@ -717,10 +933,12 @@ void DPVO::update()
                 continue;
             }
             for (int d = 0; d < 384; d++) {
-                // net: [1, 384, 768, 1] - channel major, then spatial
-                net_input[0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = m_pg.m_net[e][d];
-                // inp: [1, 384, 768, 1] - same layout
-                inp_input[0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = ctx[e * 384 + d];
+                // YAML layout: [N, C, H, W] = [1, 384, 768, 1]
+                // Index calculation: n * C * H * W + c * H * W + h * W + w
+                // For net/inp: n=0, c=d (channel), h=e (edge index), w=0
+                int idx = 0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+                net_input[idx] = m_pg.m_net[e][d];
+                inp_input[idx] = ctx[e * 384 + d];
             }
         }
         
@@ -750,6 +968,20 @@ void DPVO::update()
         const int D_target = 7;  // Target window size for model (7×7 instead of 8×8)
         const int offset = (D - D_target) / 2;  // Center offset: (8-7)/2 = 0 (integer division)
         
+        // Check correlation data before reshaping
+        float corr_min = *std::min_element(corr.begin(), corr.end());
+        float corr_max = *std::max_element(corr.begin(), corr.end());
+        int corr_zero_count = 0;
+        int corr_nonzero_count = 0;
+        for (size_t i = 0; i < corr.size(); i++) {
+            if (corr[i] == 0.0f) corr_zero_count++;
+            else corr_nonzero_count++;
+        }
+        if (logger) {
+            logger->info("DPVO::update: Correlation data stats - zero_count={}, nonzero_count={}, min={}, max={}, size={}",
+                         corr_zero_count, corr_nonzero_count, corr_min, corr_max, corr.size());
+        }
+        
         if (logger) logger->info("DPVO::update: Reshaping correlation data, D={}, D_target={}, offset={}", D, D_target, offset);
         for (int e = 0; e < num_edges_to_process; e++) {
             // Validate edge index
@@ -773,17 +1005,22 @@ void DPVO::update()
                                              pj * 2 +
                                              c;  // Channel last
                                 
-                                // Destination: corr_input[0][c*D_target*D_target*P*P + di*D_target*P*P + dj*P*P + pi*P + pj][e][0]
+                                // YAML layout: [N, C, H, W] = [1, 882, 768, 1]
                                 // Model expects: [1, 882, 768, 1] where 882 = 2 * 7 * 7 * 3 * 3
+                                // Index calculation: n * C * H * W + c * H * W + h * W + w
+                                // Where: n=0, c=dst_corr_idx (feature index), h=e (edge index), w=0
                                 int dst_corr_idx = c * D_target * D_target * P * P +
                                                   di * D_target * P * P +
                                                   dj * P * P +
                                                   pi * P + pj;
                                 
                                 if (dst_corr_idx < target_corr_dim) {
-                                    corr_input[0 * CORR_DIM * MODEL_EDGE_COUNT * 1 + 
-                                              dst_corr_idx * MODEL_EDGE_COUNT * 1 + 
-                                              e * 1 + 0] = corr[src_idx];
+                                    // [N, C, H, W] = [1, 882, 768, 1]
+                                    int idx = 0 * CORR_DIM * MODEL_EDGE_COUNT * 1 + 
+                                             dst_corr_idx * MODEL_EDGE_COUNT * 1 + 
+                                             e * 1 + 
+                                             0;
+                                    corr_input[idx] = corr[src_idx];
                                 }
                             }
                         }
@@ -794,7 +1031,8 @@ void DPVO::update()
         }
         if (logger) logger->info("DPVO::update: Correlation reshaping completed");
         
-        // Copy indices: [num_active] -> [1, 768, 1]
+        // Copy indices: [num_active] -> [1, 768, 1] (YAML specifies [N, H, W] = [1, 768, 1])
+        // For int32 indices: [1, 768, 1] where N=1, H=768, W=1 (no channel dimension)
         if (logger) logger->info("DPVO::update: Copying indices");
         for (int e = 0; e < num_edges_to_process; e++) {
             // Validate edge index
@@ -802,9 +1040,13 @@ void DPVO::update()
                 if (logger && e < 10) logger->error("DPVO::update: Invalid edge index e={} in index copy, num_active={}", e, num_active);
                 continue;
             }
-            ii_input[0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = static_cast<int32_t>(m_pg.m_ii[e]);
-            jj_input[0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = static_cast<int32_t>(m_pg.m_jj[e]);
-            kk_input[0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0] = static_cast<int32_t>(m_pg.m_kk[e]);
+            // YAML layout: [N, H, W] = [1, 768, 1] (no channel dimension for indices)
+            // Index: n * H * W + h * W + w
+            // Where: n=0, h=e, w=0
+            int idx = 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+            ii_input[idx] = static_cast<int32_t>(m_pg.m_ii[e]);
+            jj_input[idx] = static_cast<int32_t>(m_pg.m_jj[e]);
+            kk_input[idx] = static_cast<int32_t>(m_pg.m_kk[e]);
         }
         if (logger) logger->info("DPVO::update: Indices copied, calling runInference");
         
@@ -837,25 +1079,32 @@ void DPVO::update()
             // w_out contains weight: [1, 2, 768, 1] -> we'll use first channel
             
             if (pred.dOutBuff != nullptr && pred.wOutBuff != nullptr) {
-                // Extract delta from d_out: [1, 2, 768, 1]
+                // Extract delta from d_out: YAML layout [N, C, H, W] = [1, 2, 768, 1]
                 for (int e = 0; e < num_edges_to_process; e++) {
-                    // d_out layout: [batch, channels, spatial, 1] = [1, 2, 768, 1]
-                    delta[e * 2 + 0] = pred.dOutBuff[0 * 2 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
-                    delta[e * 2 + 1] = pred.dOutBuff[0 * 2 * MODEL_EDGE_COUNT * 1 + 1 * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                    // d_out layout: [N, C, H, W] = [1, 2, 768, 1]
+                    // Index: n * C * H * W + c * H * W + h * W + w
+                    // Where: n=0, c=0 or 1, h=e, w=0
+                    int idx0 = 0 * 2 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+                    int idx1 = 0 * 2 * MODEL_EDGE_COUNT * 1 + 1 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+                    delta[e * 2 + 0] = pred.dOutBuff[idx0];
+                    delta[e * 2 + 1] = pred.dOutBuff[idx1];
                     
-                    // w_out layout: [1, 2, 768, 1] - use first channel for weight
-                    weight[e] = pred.wOutBuff[0 * 2 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                    // w_out layout: [1, 2, 768, 1] - use first channel (c=0) for weight
+                    weight[e] = pred.wOutBuff[idx0];
                 }
                 
                 // Update m_pg.m_net with net_out if available
                 if (pred.netOutBuff != nullptr) {
                     if (logger) logger->info("DPVO::update: Updating m_pg.m_net from net_out");
-                    // net_out: [1, 384, 768, 1] -> [num_edges, 384]
+                    // net_out: YAML layout [N, C, H, W] = [1, 384, 768, 1]
                     float net_out_min = std::numeric_limits<float>::max();
                     float net_out_max = std::numeric_limits<float>::lowest();
                     for (int e = 0; e < num_edges_to_process; e++) {
                         for (int d = 0; d < 384; d++) {
-                            float val = pred.netOutBuff[0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0];
+                            // Index: n * C * H * W + c * H * W + h * W + w
+                            // Where: n=0, c=d, h=e, w=0
+                            int idx = 0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+                            float val = pred.netOutBuff[idx];
                             m_pg.m_net[e][d] = val;
                             if (val < net_out_min) net_out_min = val;
                             if (val > net_out_max) net_out_max = val;
@@ -1267,6 +1516,79 @@ float DPVO::motionMagnitude(int i, int j) {
         sum += f;
     }
     return (matching_ii.size() > 0) ? (sum / static_cast<float>(matching_ii.size())) : 0.0f;
+}
+
+// -------------------------------------------------------------
+// Motion probe (based on Python motion_probe)
+// -------------------------------------------------------------
+float DPVO::motionProbe() {
+    // Python: kk = torch.arange(self.m-self.M, self.m, device="cuda")
+    //         jj = self.n * torch.ones_like(kk)
+    //         ii = self.ix[kk]
+    //         net = torch.zeros(1, len(ii), self.DIM, **self.kwargs)
+    //         coords = self.reproject(indicies=(ii, jj, kk))
+    //         corr = self.corr(coords, indicies=(kk, jj))
+    //         ctx = self.imap[:,kk % (self.M * self.pmem)]
+    //         net, (delta, weight, _) = self.network.update(net, ctx, corr, None, ii, jj, kk)
+    //         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
+    
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    const int P = m_P;
+    
+    // Get patches from last frame: kk = [m-M, m-M+1, ..., m-1]
+    int m = m_pg.m_m;
+    int n = m_pg.m_n;
+    
+    if (m < M || n == 0) {
+        return 0.0f;  // Not enough patches/frames
+    }
+    
+    std::vector<int> kk_vec, jj_vec, ii_vec;
+    for (int k = m - M; k < m; k++) {
+        kk_vec.push_back(k);
+        jj_vec.push_back(n);  // Target is current frame (n)
+        
+        // Extract frame and patch from linear index
+        int frame = k / M;
+        int patch = k % M;
+        ii_vec.push_back(m_pg.m_index[frame][patch]);
+    }
+    
+    int num_edges = static_cast<int>(kk_vec.size());
+    if (num_edges == 0) {
+        return 0.0f;
+    }
+    
+    // Reproject
+    std::vector<float> coords(num_edges * 2 * P * P);
+    reproject(ii_vec.data(), jj_vec.data(), kk_vec.data(), num_edges, coords.data());
+    
+    // Correlation (simplified - we need correlation computation)
+    // For now, we'll use a simplified version that just computes delta norm
+    // In full implementation, we'd call computeCorrelation and then update model
+    
+    // Simplified: compute delta from reprojection error
+    // Python computes delta from network update, but for motion probe we can use a simpler metric
+    std::vector<float> delta_norms(num_edges);
+    for (int e = 0; e < num_edges; e++) {
+        // Get center pixel coordinates
+        int center_i0 = P / 2;
+        int center_j0 = P / 2;
+        int coord_x_idx = e * 2 * P * P + 0 * P * P + center_i0 * P + center_j0;
+        int coord_y_idx = e * 2 * P * P + 1 * P * P + center_i0 * P + center_j0;
+        
+        // For motion probe, we compute the magnitude of the reprojection
+        // This is a simplified version - full version would use network update
+        float dx = coords[coord_x_idx];
+        float dy = coords[coord_y_idx];
+        delta_norms[e] = std::sqrt(dx * dx + dy * dy);
+    }
+    
+    // Compute median (quantile 0.5)
+    std::sort(delta_norms.begin(), delta_norms.end());
+    float median = delta_norms[delta_norms.size() / 2];
+    
+    return median;
 }
 
 

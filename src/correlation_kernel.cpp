@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <cstdio>
 
 inline bool within_bounds(int h, int w, int H, int W)
 {
@@ -109,8 +110,17 @@ void patchify_cpu_safe(
     // --------------------------------------------------
     for (int m = 0; m < M; m++) {
 
-        const int cx = static_cast<int>(std::floor(coords[m*2 + 0]));
-        const int cy = static_cast<int>(std::floor(coords[m*2 + 1]));
+        const float coord_x = coords[m*2 + 0];
+        const float coord_y = coords[m*2 + 1];
+        const int cx = static_cast<int>(std::floor(coord_x));
+        const int cy = static_cast<int>(std::floor(coord_y));
+
+        // Debug logging for first few patches
+        if (m < 3) {
+            printf("[patchify_cpu_safe] Patch %d: coords=(%.2f, %.2f), floor=(%d, %d), H=%d, W=%d, radius=%d, D=%d\n",
+                   m, coord_x, coord_y, cx, cy, H, W, radius, D);
+            fflush(stdout);
+        }
 
         const int gmap_m_offset = m * C * D * D;
 
@@ -121,14 +131,35 @@ void patchify_cpu_safe(
 
             for (int ii = 0; ii < D; ii++) {
                 const int y = cy + ii - radius;
-                if ((unsigned)y >= (unsigned)H) continue;
+                if ((unsigned)y >= (unsigned)H) {
+                    if (m < 3 && c == 0 && ii == 0) {
+                        printf("[patchify_cpu_safe] Patch %d, channel %d: y=%d out of bounds (H=%d)\n", m, c, y, H);
+                        fflush(stdout);
+                    }
+                    continue;
+                }
 
                 for (int jj = 0; jj < D; jj++) {
                     const int x = cx + jj - radius;
-                    if ((unsigned)x >= (unsigned)W) continue;
+                    if ((unsigned)x >= (unsigned)W) {
+                        if (m < 3 && c == 0 && ii == 0 && jj == 0) {
+                            printf("[patchify_cpu_safe] Patch %d, channel %d: x=%d out of bounds (W=%d)\n", m, c, x, W);
+                            fflush(stdout);
+                        }
+                        continue;
+                    }
 
-                    gmap[gmap_c_offset + ii * D + jj] =
-                        src[fmap_c_offset + y * W + x];
+                    int src_idx = fmap_c_offset + y * W + x;
+                    int dst_idx = gmap_c_offset + ii * D + jj;
+                    
+                    // Debug first few samples
+                    if (m < 3 && c == 0 && ii == 0 && jj == 0) {
+                        printf("[patchify_cpu_safe] Patch %d, channel %d: src[%d]=%f -> gmap[%d]\n",
+                               m, c, src_idx, src[src_idx], dst_idx);
+                        fflush(stdout);
+                    }
+                    
+                    gmap[dst_idx] = src[src_idx];
                 }
             }
         }

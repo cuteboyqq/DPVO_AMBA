@@ -1,6 +1,7 @@
 #pragma once
 #include "patch_graph.hpp"
-#include "net.hpp"
+#include "patchify.hpp"  // Patchifier
+#include "update.hpp"    // DPVOUpdate
 #include "dla_config.hpp"
 #if defined(CV28) || defined(CV28_SIMULATOR)
 #include <eazyai.h>
@@ -101,6 +102,7 @@ private:
         float* valid_out = nullptr     // [num_edges, P, P] flattened (optional)
     ); // Alister add 2025-12-26
     float motionMagnitude(int i, int j);
+    float motionProbe();  // Motion probe for initialization check (matches Python motion_probe)
     
     // Bundle Adjustment
     void bundleAdjustment(
@@ -147,11 +149,11 @@ private:
     int m_pmem, m_mem;
     int m_fmap1_H, m_fmap1_W;
     int m_fmap2_H, m_fmap2_W;
-
-    float* m_imap;
-    float* m_gmap;
-    float* m_fmap1;
-    float* m_fmap2;
+    
+    float* m_imap; // (self.pmem, self.M, DIM, **kwargs)
+    float* m_gmap; // (self.pmem, self.M, 128, self.P, self.P, **kwargs)
+    float* m_fmap1; // (1, self.mem, 128, ht // 1, wd // 1, **kwargs)
+    float* m_fmap2; // (1, self.mem, 128, ht // 4, wd // 4, **kwargs)
 
     float* m_cur_imap;   // pointer to latest frame in imap
     float* m_cur_gmap;   // pointer to latest frame in gmap

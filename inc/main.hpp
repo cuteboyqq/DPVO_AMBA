@@ -33,6 +33,8 @@
 #include "config_reader.hpp"
 #include "wnc_app.hpp"
 #include "dpvo.hpp"
+#include "fnet.hpp"  // FNetInference
+#include "inet.hpp"  // INetInference
 #include "path_utils.hpp"
 #include "video_handler.hpp"
 // System includes
