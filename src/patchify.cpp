@@ -164,7 +164,7 @@ void Patchifier::forward(
         // NOTE: imap parameter is actually a buffer for patch features [M, DIM], not the full feature map
         // We need to extract patches from the full feature map [384, 120, 160] using patchify_cpu_safe
         // So we don't memcpy the full feature map to imap - instead we'll extract patches later
-        if (logger_patch) logger_patch->error("[Patchifier] Skipping imap memcpy - will extract patches later");
+        if (logger_patch) logger_patch->info("[Patchifier] Skipping imap memcpy - will extract patches later");
     }
     else
     {
@@ -222,14 +222,20 @@ void Patchifier::forward(
     fflush(stdout);
     
     // ------------------------------------------------
-    // 6. Patchify fmap → gmap - scale coords to 1/4 resolution
+    // 6. Patchify fmap → gmap - scale coords to feature map resolution
     // ------------------------------------------------
-    // fmap is at 1/4 resolution, so scale coordinates
+    // fmap is at model output resolution (fmap_H x fmap_W), not necessarily 1/4 of image
+    // Scale coordinates by the ratio of feature map to image dimensions
     std::vector<float> fmap_coords(M * 2);
+    float scale_x = static_cast<float>(fmap_W) / static_cast<float>(W);
+    float scale_y = static_cast<float>(fmap_H) / static_cast<float>(H);
     for (int m = 0; m < M; m++)
     {
-        fmap_coords[m * 2 + 0] = coords[m * 2 + 0] / RES; // Scale to 1/4 resolution
-        fmap_coords[m * 2 + 1] = coords[m * 2 + 1] / RES; // Scale to 1/4 resolution
+        float fx = coords[m * 2 + 0] * scale_x;
+        float fy = coords[m * 2 + 1] * scale_y;
+        // Clamp to feature map bounds to prevent out-of-bounds access
+        fmap_coords[m * 2 + 0] = std::max(0.0f, std::min(static_cast<float>(fmap_W - 1), fx));
+        fmap_coords[m * 2 + 1] = std::max(0.0f, std::min(static_cast<float>(fmap_H - 1), fy));
     }
     printf("[Patchifier] fmap_coords created\n");
     fflush(stdout);

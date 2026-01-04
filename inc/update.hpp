@@ -181,3 +181,27 @@ private:
     bool m_estimateTime = false;
 };
 
+// Helper function to reshape inputs for DPVO update model
+// This function handles all the reshaping and copying logic from DPVO::update
+// Uses pre-allocated buffers to avoid memory allocation overhead
+int reshapeInput(
+    int num_active,
+    float (*m_net)[384],  // Pointer to 2D array [MAX_EDGES][384]
+    const float* ctx,     // Context data [num_active * 384]
+    const std::vector<float>& corr,  // Correlation data [num_active * D * D * P * P * 2]
+    const int* m_ii,      // Indices [num_active]
+    const int* m_jj,      // Indices [num_active]
+    const int* m_kk,      // Indices [num_active]
+    int D,                // Correlation window size (typically 8)
+    int P,                // Patch size (typically 3)
+    // Output buffers (pre-allocated, reused)
+    std::vector<float>& net_input,
+    std::vector<float>& inp_input,
+    std::vector<float>& corr_input,
+    std::vector<int32_t>& ii_input,
+    std::vector<int32_t>& jj_input,
+    std::vector<int32_t>& kk_input,
+    const int MODEL_EDGE_COUNT = 768,
+    const int CORR_DIM = 882
+);
+

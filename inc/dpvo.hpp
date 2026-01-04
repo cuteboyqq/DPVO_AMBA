@@ -169,6 +169,14 @@ private:
     std::unique_ptr<DPVOUpdate> m_updateModel;
     int m_updateFrameCounter = 0;
     
+    // Pre-allocated buffers for reshapeInput (reused to avoid memory allocation overhead)
+    std::vector<float> m_reshape_net_input;
+    std::vector<float> m_reshape_inp_input;
+    std::vector<float> m_reshape_corr_input;
+    std::vector<int32_t> m_reshape_ii_input;
+    std::vector<int32_t> m_reshape_jj_input;
+    std::vector<int32_t> m_reshape_kk_input;
+    
     // ---- Threading infrastructure (similar to wnc_app) ----
     struct InputFrame {
         std::vector<uint8_t> image;  // Store converted image data [C, H, W] format

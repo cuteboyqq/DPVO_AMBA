@@ -103,6 +103,16 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
         m_intrinsics[2] = static_cast<float>(wd) * 0.5f;  // cx
         m_intrinsics[3] = static_cast<float>(ht) * 0.5f;  // cy
     }
+    
+    // Pre-allocate buffers for reshapeInput to avoid memory allocation overhead
+    const int MODEL_EDGE_COUNT = 768;
+    const int CORR_DIM = 882;
+    m_reshape_net_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
+    m_reshape_inp_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
+    m_reshape_corr_input.resize(1 * CORR_DIM * MODEL_EDGE_COUNT * 1, 0.0f);
+    m_reshape_ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
+    m_reshape_jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
+    m_reshape_kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
 }
 
 void DPVO::_startThreads()
@@ -643,6 +653,13 @@ void DPVO::run(int64_t timestamp,
     if (logger) logger->info("DPVO::run: Updating counters");
     // Use n_use instead of m_pg.m_n to ensure we're incrementing from a valid value
     // If n was corrupted, n_use will be 0, so we'll start counting from 0
+    // 
+    // NOTE: The increment happens here: m_pg.m_n = n_use + 1
+    // On the next call to run(), n will be read from m_pg.m_n (line 291), so:
+    //   Call 1: n=0 → m_pg.m_n = 1
+    //   Call 2: n=1 → m_pg.m_n = 2
+    //   Call 3: n=2 → m_pg.m_n = 3
+    // This ensures m_pg.m_n increments correctly each iteration.
     try {
         m_pg.m_n = n_use + 1;  // Set to n_use + 1 (next frame index)
         m_pg.m_m += M;
@@ -869,201 +886,44 @@ void DPVO::update()
     
     if (m_updateModel != nullptr) {
         if (logger) logger->info("DPVO::update: m_updateModel is not null, preparing model inputs");
-        // Model expects fixed shapes: [1, 384, 768, 1] for net/inp, 
-        // [1, 882, 768, 1] for corr, [1, 768, 1] for indices
+        
+        // Reshape inputs using helper function (reuses pre-allocated buffers)
         const int MODEL_EDGE_COUNT = 768;
-        const int CORR_DIM = 882; // Correlation feature dimension
-        
-        // Prepare input data - pad or truncate to MODEL_EDGE_COUNT
-        const int num_edges_to_process = std::min(num_active, MODEL_EDGE_COUNT);
-        
-        // Allocate model input buffers
-        std::vector<float> net_input(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
-        std::vector<float> inp_input(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
-        std::vector<float> corr_input(1 * CORR_DIM * MODEL_EDGE_COUNT * 1, 0.0f);
-        std::vector<int32_t> ii_input(1 * MODEL_EDGE_COUNT * 1, 0);
-        std::vector<int32_t> jj_input(1 * MODEL_EDGE_COUNT * 1, 0);
-        std::vector<int32_t> kk_input(1 * MODEL_EDGE_COUNT * 1, 0);
-        
-        // CRITICAL: YAML specifies [N, C, H, W] layout: 1,384,768,1
-        // Where: N=1 (batch), C=384 (channels), H=768 (spatial/edges), W=1
-        // Reshape and copy net data: [num_active, 384] -> [1, 384, 768, 1]
-        // Layout: [batch, channels, height, width] = [1, 384, 768, 1]
-        if (logger) logger->info("DPVO::update: Reshaping net/inp data, num_edges_to_process={}", num_edges_to_process);
-        
-        // Check net state before copying
-        int net_zero_count = 0;
-        int net_nonzero_count = 0;
-        float net_min = std::numeric_limits<float>::max();
-        float net_max = std::numeric_limits<float>::lowest();
-        for (int e = 0; e < std::min(num_edges_to_process, num_active); e++) {
-            for (int d = 0; d < 384; d++) {
-                float val = m_pg.m_net[e][d];
-                if (val == 0.0f) net_zero_count++;
-                else net_nonzero_count++;
-                if (val < net_min) net_min = val;
-                if (val > net_max) net_max = val;
-            }
-        }
-        if (logger) {
-            logger->info("DPVO::update: Net state stats - zero_count={}, nonzero_count={}, min={}, max={}",
-                         net_zero_count, net_nonzero_count, net_min, net_max);
-        }
-        
-        // WORKAROUND: If net is all zeros, initialize it from context (inp) to break the cycle
-        // This is a temporary fix - ideally the model should accept zero input or we need proper initialization
-        bool net_all_zero = (net_nonzero_count == 0);
-        if (net_all_zero && logger) {
-            logger->warn("DPVO::update: Net state is all zeros - initializing from context (inp) as workaround");
-            // Initialize net from context (inp) - this gives the model some initial state
-            for (int e = 0; e < num_edges_to_process; e++) {
-                if (e < 0 || e >= num_active) continue;
-                for (int d = 0; d < 384; d++) {
-                    // Use context as initial net state (scaled down to avoid large values)
-                    m_pg.m_net[e][d] = ctx[e * 384 + d] * 0.1f;
-                }
-            }
-            if (logger) logger->info("DPVO::update: Net state initialized from context for {} edges", num_edges_to_process);
-        }
-        
-        for (int e = 0; e < num_edges_to_process; e++) {
-            // Validate edge index
-            if (e < 0 || e >= num_active) {
-                if (logger && e < 10) logger->error("DPVO::update: Invalid edge index e={}, num_active={}", e, num_active);
-                continue;
-            }
-            for (int d = 0; d < 384; d++) {
-                // YAML layout: [N, C, H, W] = [1, 384, 768, 1]
-                // Index calculation: n * C * H * W + c * H * W + h * W + w
-                // For net/inp: n=0, c=d (channel), h=e (edge index), w=0
-                int idx = 0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
-                net_input[idx] = m_pg.m_net[e][d];
-                inp_input[idx] = ctx[e * 384 + d];
-            }
-        }
-        
-        // Check input data statistics after copying
-        float net_input_min = *std::min_element(net_input.begin(), net_input.end());
-        float net_input_max = *std::max_element(net_input.begin(), net_input.end());
-        float inp_input_min = *std::min_element(inp_input.begin(), inp_input.end());
-        float inp_input_max = *std::max_element(inp_input.begin(), inp_input.end());
-        float corr_input_min = *std::min_element(corr_input.begin(), corr_input.end());
-        float corr_input_max = *std::max_element(corr_input.begin(), corr_input.end());
-        
-        if (logger) {
-            logger->info("DPVO::update: Input data ranges - net=[{}, {}], inp=[{}, {}], corr=[{}, {}]",
-                         net_input_min, net_input_max, inp_input_min, inp_input_max, corr_input_min, corr_input_max);
-        }
-        
-        if (logger) logger->info("DPVO::update: Net/inp data reshaping completed");
-        
-        // Reshape correlation: [num_active, D, D, P, P, 2] -> [1, 882, 768, 1]
-        // Python CUDA kernel outputs: [B, M, D, D, H, W] per channel
-        // Python stacks: torch.stack([corr1, corr2], -1) -> [B, M, D, D, H, W, 2]
-        // C++ output matches: [num_active, D, D, P, P, 2] (channel last, matching Python)
-        // Total per edge: D * D * P * P * 2 = 8 * 8 * 3 * 3 * 2 = 1152
-        // Model expects [1, 882, 768, 1] - we need to downsample from 8×8 to 7×7 window
-        // 882 = 2 * 7 * 7 * 9 = 2 * 7 * 7 * 3 * 3 (2 channels, 7×7 window, 3×3 patch)
-        const int target_corr_dim = CORR_DIM; // 882
-        const int D_target = 7;  // Target window size for model (7×7 instead of 8×8)
-        const int offset = (D - D_target) / 2;  // Center offset: (8-7)/2 = 0 (integer division)
-        
-        // Check correlation data before reshaping
-        float corr_min = *std::min_element(corr.begin(), corr.end());
-        float corr_max = *std::max_element(corr.begin(), corr.end());
-        int corr_zero_count = 0;
-        int corr_nonzero_count = 0;
-        for (size_t i = 0; i < corr.size(); i++) {
-            if (corr[i] == 0.0f) corr_zero_count++;
-            else corr_nonzero_count++;
-        }
-        if (logger) {
-            logger->info("DPVO::update: Correlation data stats - zero_count={}, nonzero_count={}, min={}, max={}, size={}",
-                         corr_zero_count, corr_nonzero_count, corr_min, corr_max, corr.size());
-        }
-        
-        if (logger) logger->info("DPVO::update: Reshaping correlation data, D={}, D_target={}, offset={}", D, D_target, offset);
-        for (int e = 0; e < num_edges_to_process; e++) {
-            // Validate edge index
-            if (e < 0 || e >= num_active) {
-                if (logger && e < 10) logger->error("DPVO::update: Invalid edge index e={} in correlation reshape, num_active={}", e, num_active);
-                continue;
-            }
-            // Source layout: corr[e][di][dj][pi][pj][c] = [num_active, D, D, P, P, 2]
-            // We need to extract center 7×7 region from 8×8 window
-            for (int c = 0; c < 2; c++) {
-                for (int di = 0; di < D_target && (di + offset) < D; di++) {
-                    for (int dj = 0; dj < D_target && (dj + offset) < D; dj++) {
-                        for (int pi = 0; pi < P; pi++) {
-                            for (int pj = 0; pj < P; pj++) {
-                                // Source: corr[e][di+offset][dj+offset][pi][pj][c]
-                                // Layout: [num_active, D, D, P, P, 2]
-                                int src_idx = e * D * D * P * P * 2 +
-                                             (di + offset) * D * P * P * 2 +
-                                             (dj + offset) * P * P * 2 +
-                                             pi * P * 2 +
-                                             pj * 2 +
-                                             c;  // Channel last
-                                
-                                // YAML layout: [N, C, H, W] = [1, 882, 768, 1]
-                                // Model expects: [1, 882, 768, 1] where 882 = 2 * 7 * 7 * 3 * 3
-                                // Index calculation: n * C * H * W + c * H * W + h * W + w
-                                // Where: n=0, c=dst_corr_idx (feature index), h=e (edge index), w=0
-                                int dst_corr_idx = c * D_target * D_target * P * P +
-                                                  di * D_target * P * P +
-                                                  dj * P * P +
-                                                  pi * P + pj;
-                                
-                                if (dst_corr_idx < target_corr_dim) {
-                                    // [N, C, H, W] = [1, 882, 768, 1]
-                                    int idx = 0 * CORR_DIM * MODEL_EDGE_COUNT * 1 + 
-                                             dst_corr_idx * MODEL_EDGE_COUNT * 1 + 
-                                             e * 1 + 
-                                             0;
-                                    corr_input[idx] = corr[src_idx];
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Rest of CORR_DIM is zero-padded (already initialized to 0)
-        }
-        if (logger) logger->info("DPVO::update: Correlation reshaping completed");
-        
-        // Copy indices: [num_active] -> [1, 768, 1] (YAML specifies [N, H, W] = [1, 768, 1])
-        // For int32 indices: [1, 768, 1] where N=1, H=768, W=1 (no channel dimension)
-        if (logger) logger->info("DPVO::update: Copying indices");
-        for (int e = 0; e < num_edges_to_process; e++) {
-            // Validate edge index
-            if (e < 0 || e >= num_active) {
-                if (logger && e < 10) logger->error("DPVO::update: Invalid edge index e={} in index copy, num_active={}", e, num_active);
-                continue;
-            }
-            // YAML layout: [N, H, W] = [1, 768, 1] (no channel dimension for indices)
-            // Index: n * H * W + h * W + w
-            // Where: n=0, h=e, w=0
-            int idx = 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
-            ii_input[idx] = static_cast<int32_t>(m_pg.m_ii[e]);
-            jj_input[idx] = static_cast<int32_t>(m_pg.m_jj[e]);
-            kk_input[idx] = static_cast<int32_t>(m_pg.m_kk[e]);
-        }
-        if (logger) logger->info("DPVO::update: Indices copied, calling runInference");
+        const int CORR_DIM = 882;
+        const int num_edges_to_process = reshapeInput(
+            num_active,
+            m_pg.m_net,  // Pointer to 2D array [MAX_EDGES][384]
+            ctx.data(),  // Context data [num_active * 384]
+            corr,        // Correlation data [num_active * D * D * P * P * 2]
+            m_pg.m_ii,   // Indices [num_active]
+            m_pg.m_jj,   // Indices [num_active]
+            m_pg.m_kk,   // Indices [num_active]
+            D,           // Correlation window size (typically 8)
+            P,           // Patch size (typically 3)
+            m_reshape_net_input,   // Pre-allocated output buffers
+            m_reshape_inp_input,
+            m_reshape_corr_input,
+            m_reshape_ii_input,
+            m_reshape_jj_input,
+            m_reshape_kk_input,
+            MODEL_EDGE_COUNT,
+            CORR_DIM
+        );
         
         // Call update model inference synchronously
         DPVOUpdate_Prediction pred;
         if (logger) {
             logger->info("DPVO::update: About to call m_updateModel->runInference");
             logger->info("DPVO::update: Input data ready - net_input size={}, inp_input size={}, corr_input size={}",
-                         net_input.size(), inp_input.size(), corr_input.size());
+                         m_reshape_net_input.size(), m_reshape_inp_input.size(), m_reshape_corr_input.size());
         }
         bool inference_success = m_updateModel->runInference(
-                net_input.data(),
-                inp_input.data(),
-                corr_input.data(),
-                ii_input.data(),
-                jj_input.data(),
-                kk_input.data(),
+                m_reshape_net_input.data(),
+                m_reshape_inp_input.data(),
+                m_reshape_corr_input.data(),
+                m_reshape_ii_input.data(),
+                m_reshape_jj_input.data(),
+                m_reshape_kk_input.data(),
                 m_updateFrameCounter++,
                 pred);
         
@@ -1421,10 +1281,10 @@ void DPVO::removeFactors(const bool* mask, bool store) {
     bool m[MAX_EDGES];
 
     for (int i = 0; i < num_active; i++) {
-        m[i] = mask ? mask[i] : false;
+        m[i] = mask ? mask[i] : false; // if mask exists, set m[i] to mask[i], otherwise set m[i] to false
     }
 
-    // store inactive
+    // store inactive edges if requested
     if (store) {
         int w = pg.m_num_edges_inac;
         for (int i = 0; i < num_active; i++) {
@@ -1441,7 +1301,7 @@ void DPVO::removeFactors(const bool* mask, bool store) {
         pg.m_num_edges_inac = w;
     }
 
-    // compact
+    // compact active edges
     int write = 0;
     for (int read = 0; read < num_active; read++) {
         if (m[read]) continue;
