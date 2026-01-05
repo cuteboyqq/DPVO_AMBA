@@ -104,15 +104,19 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
         m_intrinsics[3] = static_cast<float>(ht) * 0.5f;  // cy
     }
     
+    // Initialize max edge count for model input
+    // To change this value, simply modify the number below (e.g., 256, 384, 512, 768)
+    // Note: You must also update your ONNX model and AMBA conversion YAML to match this value
+    m_maxEdge = 768;
+    
     // Pre-allocate buffers for reshapeInput to avoid memory allocation overhead
-    const int MODEL_EDGE_COUNT = 768;
     const int CORR_DIM = 882;
-    m_reshape_net_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
-    m_reshape_inp_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
-    m_reshape_corr_input.resize(1 * CORR_DIM * MODEL_EDGE_COUNT * 1, 0.0f);
-    m_reshape_ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
-    m_reshape_jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
-    m_reshape_kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
+    m_reshape_net_input.resize(1 * 384 * m_maxEdge * 1, 0.0f);
+    m_reshape_inp_input.resize(1 * 384 * m_maxEdge * 1, 0.0f);
+    m_reshape_corr_input.resize(1 * CORR_DIM * m_maxEdge * 1, 0.0f);
+    m_reshape_ii_input.resize(1 * 1 * m_maxEdge * 1, 0);
+    m_reshape_jj_input.resize(1 * 1 * m_maxEdge * 1, 0);
+    m_reshape_kk_input.resize(1 * 1 * m_maxEdge * 1, 0);
 }
 
 void DPVO::_startThreads()
@@ -887,10 +891,9 @@ void DPVO::update()
     if (m_updateModel != nullptr) {
         if (logger) logger->info("DPVO::update: m_updateModel is not null, preparing model inputs");
         
-        // Reshape inputs using helper function (reuses pre-allocated buffers)
-        const int MODEL_EDGE_COUNT = 768;
+        // Reshape inputs using member function (reuses pre-allocated buffers)
         const int CORR_DIM = 882;
-        const int num_edges_to_process = reshapeInput(
+        const int num_edges_to_process = m_updateModel->reshapeInput(
             num_active,
             m_pg.m_net,  // Pointer to 2D array [MAX_EDGES][384]
             ctx.data(),  // Context data [num_active * 384]
@@ -906,7 +909,7 @@ void DPVO::update()
             m_reshape_ii_input,
             m_reshape_jj_input,
             m_reshape_kk_input,
-            MODEL_EDGE_COUNT,
+            m_maxEdge,   // Use member variable instead of hardcoded constant
             CORR_DIM
         );
         
@@ -934,36 +937,36 @@ void DPVO::update()
         if (inference_success)
         {
             if (logger) logger->info("DPVO::update: runInference returned true, extracting outputs");
-            // Extract outputs: net_out [1, 384, 768, 1], d_out [1, 2, 768, 1], w_out [1, 2, 768, 1]
-            // d_out contains delta: [1, 2, 768, 1] -> [num_edges, 2]
-            // w_out contains weight: [1, 2, 768, 1] -> we'll use first channel
+            // Extract outputs: net_out [1, 384, 384, 1], d_out [1, 2, 384, 1], w_out [1, 2, 384, 1]
+            // d_out contains delta: [1, 2, 384, 1] -> [num_edges, 2]
+            // w_out contains weight: [1, 2, 384, 1] -> we'll use first channel
             
             if (pred.dOutBuff != nullptr && pred.wOutBuff != nullptr) {
-                // Extract delta from d_out: YAML layout [N, C, H, W] = [1, 2, 768, 1]
+                // Extract delta from d_out: YAML layout [N, C, H, W] = [1, 2, m_maxEdge, 1]
                 for (int e = 0; e < num_edges_to_process; e++) {
-                    // d_out layout: [N, C, H, W] = [1, 2, 768, 1]
+                    // d_out layout: [N, C, H, W] = [1, 2, m_maxEdge, 1]
                     // Index: n * C * H * W + c * H * W + h * W + w
                     // Where: n=0, c=0 or 1, h=e, w=0
-                    int idx0 = 0 * 2 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
-                    int idx1 = 0 * 2 * MODEL_EDGE_COUNT * 1 + 1 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+                    int idx0 = 0 * 2 * m_maxEdge * 1 + 0 * m_maxEdge * 1 + e * 1 + 0;
+                    int idx1 = 0 * 2 * m_maxEdge * 1 + 1 * m_maxEdge * 1 + e * 1 + 0;
                     delta[e * 2 + 0] = pred.dOutBuff[idx0];
                     delta[e * 2 + 1] = pred.dOutBuff[idx1];
                     
-                    // w_out layout: [1, 2, 768, 1] - use first channel (c=0) for weight
+                    // w_out layout: [1, 2, 384, 1] - use first channel (c=0) for weight
                     weight[e] = pred.wOutBuff[idx0];
                 }
                 
                 // Update m_pg.m_net with net_out if available
                 if (pred.netOutBuff != nullptr) {
                     if (logger) logger->info("DPVO::update: Updating m_pg.m_net from net_out");
-                    // net_out: YAML layout [N, C, H, W] = [1, 384, 768, 1]
+                    // net_out: YAML layout [N, C, H, W] = [1, 384, m_maxEdge, 1]
                     float net_out_min = std::numeric_limits<float>::max();
                     float net_out_max = std::numeric_limits<float>::lowest();
                     for (int e = 0; e < num_edges_to_process; e++) {
                         for (int d = 0; d < 384; d++) {
                             // Index: n * C * H * W + c * H * W + h * W + w
                             // Where: n=0, c=d, h=e, w=0
-                            int idx = 0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+                            int idx = 0 * 384 * m_maxEdge * 1 + d * m_maxEdge * 1 + e * 1 + 0;
                             float val = pred.netOutBuff[idx];
                             m_pg.m_net[e][d] = val;
                             if (val < net_out_min) net_out_min = val;

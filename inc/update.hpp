@@ -19,9 +19,9 @@ struct DPVOUpdate_Prediction
 {
     bool    isProcessed = false;
 
-    float*  netOutBuff;  // [1, 384, 768, 1]
-    float*  dOutBuff;    // [1, 2, 768, 1]
-    float*  wOutBuff;    // [1, 2, 768, 1]
+    float*  netOutBuff;  // [1, 384, 384, 1]
+    float*  dOutBuff;    // [1, 2, 384, 1]
+    float*  wOutBuff;    // [1, 2, 384, 1]
 
     DPVOUpdate_Prediction()
         : isProcessed(false),
@@ -65,6 +65,30 @@ public:
     // Debug
     void getDebugProfiles(float& inferenceTime, int& inputBufferSize, int& outBufferSize);
 
+    // Reshape inputs for DPVO update model
+    // This function handles all the reshaping and copying logic from DPVO::update
+    // Uses pre-allocated buffers to avoid memory allocation overhead
+    int reshapeInput(
+        int num_active,
+        float (*m_net)[384],  // Pointer to 2D array [MAX_EDGES][384]
+        const float* ctx,     // Context data [num_active * 384]
+        const std::vector<float>& corr,  // Correlation data [num_active * D * D * P * P * 2]
+        const int* m_ii,      // Indices [num_active]
+        const int* m_jj,      // Indices [num_active]
+        const int* m_kk,      // Indices [num_active]
+        int D,                // Correlation window size (typically 8)
+        int P,                // Patch size (typically 3)
+        // Output buffers (pre-allocated, reused)
+        std::vector<float>& net_input,
+        std::vector<float>& inp_input,
+        std::vector<float>& corr_input,
+        std::vector<int32_t>& ii_input,
+        std::vector<int32_t>& jj_input,
+        std::vector<int32_t>& kk_input,
+        const int MODEL_EDGE_COUNT = 384,
+        const int CORR_DIM = 882
+    );
+
     // Thread Management
     bool m_bInferenced      = true;
     bool m_bProcessed       = true;
@@ -102,18 +126,21 @@ private:
     std::condition_variable m_condition;
     WakeCallback            m_wakeFunc;
 
+    // Maximum edge count for model input (default: 384, can be changed)
+    int m_maxEdge = 384;
+    
     // Input buffer sizes (used in constructor, must be outside conditional)
-    size_t m_netBufferSize   = 0;  // 1 * 384 * 768 * 1
-    size_t m_inpBufferSize   = 0;  // 1 * 384 * 768 * 1
-    size_t m_corrBufferSize  = 0;  // 1 * 882 * 768 * 1
-    size_t m_iiBufferSize    = 0;  // 1 * 768 * 1
-    size_t m_jjBufferSize    = 0;  // 1 * 768 * 1
-    size_t m_kkBufferSize    = 0;  // 1 * 768 * 1
+    size_t m_netBufferSize   = 0;  // 1 * 384 * m_maxEdge * 1
+    size_t m_inpBufferSize   = 0;  // 1 * 384 * m_maxEdge * 1
+    size_t m_corrBufferSize  = 0;  // 1 * 882 * m_maxEdge * 1
+    size_t m_iiBufferSize    = 0;  // 1 * m_maxEdge * 1
+    size_t m_jjBufferSize    = 0;  // 1 * m_maxEdge * 1
+    size_t m_kkBufferSize    = 0;  // 1 * m_maxEdge * 1
     
     // Output buffer sizes
-    size_t m_netOutBufferSize = 0;  // 1 * 384 * 768 * 1
-    size_t m_dOutBufferSize   = 0;  // 1 * 2 * 768 * 1
-    size_t m_wOutBufferSize   = 0;  // 1 * 2 * 768 * 1
+    size_t m_netOutBufferSize = 0;  // 1 * 384 * m_maxEdge * 1
+    size_t m_dOutBufferSize   = 0;  // 1 * 2 * m_maxEdge * 1
+    size_t m_wOutBufferSize   = 0;  // 1 * 2 * m_maxEdge * 1
 
 #if defined(CV28) || defined(CV28_SIMULATOR)
     std::string m_modelPathStr;    // Store model path as string
@@ -180,28 +207,4 @@ private:
     float m_inferenceTime = 0.0f;
     bool m_estimateTime = false;
 };
-
-// Helper function to reshape inputs for DPVO update model
-// This function handles all the reshaping and copying logic from DPVO::update
-// Uses pre-allocated buffers to avoid memory allocation overhead
-int reshapeInput(
-    int num_active,
-    float (*m_net)[384],  // Pointer to 2D array [MAX_EDGES][384]
-    const float* ctx,     // Context data [num_active * 384]
-    const std::vector<float>& corr,  // Correlation data [num_active * D * D * P * P * 2]
-    const int* m_ii,      // Indices [num_active]
-    const int* m_jj,      // Indices [num_active]
-    const int* m_kk,      // Indices [num_active]
-    int D,                // Correlation window size (typically 8)
-    int P,                // Patch size (typically 3)
-    // Output buffers (pre-allocated, reused)
-    std::vector<float>& net_input,
-    std::vector<float>& inp_input,
-    std::vector<float>& corr_input,
-    std::vector<int32_t>& ii_input,
-    std::vector<int32_t>& jj_input,
-    std::vector<int32_t>& kk_input,
-    const int MODEL_EDGE_COUNT = 768,
-    const int CORR_DIM = 882
-);
 

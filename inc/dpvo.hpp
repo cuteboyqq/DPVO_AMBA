@@ -33,7 +33,7 @@ struct DPVOConfig {
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
-          MAX_EDGE_AGE(768),
+          MAX_EDGE_AGE(384),
           KEYFRAME_INDEX(2),
           KEYFRAME_THRESH(10),
           PATCH_LIFETIME(6),
@@ -149,6 +149,7 @@ private:
     int m_pmem, m_mem;
     int m_fmap1_H, m_fmap1_W;
     int m_fmap2_H, m_fmap2_W;
+    int m_maxEdge;   // Maximum edge count for model input (default: 384, can be changed)
     
     float* m_imap; // (self.pmem, self.M, DIM, **kwargs)
     float* m_gmap; // (self.pmem, self.M, 128, self.P, self.P, **kwargs)

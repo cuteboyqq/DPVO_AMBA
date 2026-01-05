@@ -5,7 +5,7 @@
 constexpr int BUFFER_SIZE = 36;
 constexpr int PATCHES_PER_FRAME = 8;
 constexpr int PATCH_SIZE = 3;
-constexpr int MAX_EDGES = 768;
+constexpr int MAX_EDGES = 384;
 constexpr int NET_DIM = 384;
 
 struct Vec2 { float x, y; };
