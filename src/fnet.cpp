@@ -79,7 +79,9 @@ bool FNetInference::runInference(const float *image, int H, int W, float *fmap_o
     {
         logger->info("FNet: Inference failed");
         return false;
-    }else{logger->info("FNet: Inference successful");}
+    }else{
+        logger->info("\033[33mFNet: Inference successful\033[0m");
+    }
 
     // Sync output tensor
 #if defined(CV28)

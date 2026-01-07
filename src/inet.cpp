@@ -78,7 +78,7 @@ bool INetInference::runInference(const float *image, int H, int W, float *imap_o
         logger->info("INet: Inference failed");
         return false;
     }else{
-        logger->info("INet: Inference successful");
+        logger->info("\033[33mINet: Inference successful\033[0m");
     }
 
     // Sync output tensor

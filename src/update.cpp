@@ -446,6 +446,8 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
         {
             if (logger) logger->error("DPVOUpdate::_run: ea_net_forward failed with error code: {}", forward_result);
             return false;
+        } else {
+            if (logger) logger->info("\033[33mDPVOUpdate: Inference successful\033[0m");
         }
         
         // Sync output tensors between VP and CPU (sync existing tensors from initialization, matching YOLOv8 pattern)
@@ -507,6 +509,70 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
         std::memcpy(m_pred.dOutBuff, (float *)tensor1_data, m_dOutBufferSize * sizeof(float));
         std::memcpy(m_pred.wOutBuff, (float *)tensor2_data, m_wOutBufferSize * sizeof(float));
 
+        // Log delta and weight output values with blue text
+        if (logger) {
+            // Calculate statistics for delta values (dOutBuff: [1, 2, m_maxEdge, 1])
+            float* dOut = m_pred.dOutBuff;
+            float d_min = std::numeric_limits<float>::max();
+            float d_max = std::numeric_limits<float>::lowest();
+            float d_sum = 0.0f;
+            size_t d_zero_count = 0;
+            size_t d_nonzero_count = 0;
+            
+            for (size_t i = 0; i < m_dOutBufferSize; i++) {
+                float val = dOut[i];
+                if (val < d_min) d_min = val;
+                if (val > d_max) d_max = val;
+                d_sum += val;
+                if (val == 0.0f) d_zero_count++;
+                else d_nonzero_count++;
+            }
+            float d_mean = (m_dOutBufferSize > 0) ? d_sum / m_dOutBufferSize : 0.0f;
+            
+            // Calculate statistics for weight values (wOutBuff: [1, 2, m_maxEdge, 1])
+            float* wOut = m_pred.wOutBuff;
+            float w_min = std::numeric_limits<float>::max();
+            float w_max = std::numeric_limits<float>::lowest();
+            float w_sum = 0.0f;
+            size_t w_zero_count = 0;
+            size_t w_nonzero_count = 0;
+            
+            for (size_t i = 0; i < m_wOutBufferSize; i++) {
+                float val = wOut[i];
+                if (val < w_min) w_min = val;
+                if (val > w_max) w_max = val;
+                w_sum += val;
+                if (val == 0.0f) w_zero_count++;
+                else w_nonzero_count++;
+            }
+            float w_mean = (m_wOutBufferSize > 0) ? w_sum / m_wOutBufferSize : 0.0f;
+            
+            // Log with blue text (\033[34m for blue, \033[0m to reset)
+            logger->info("\033[34mDPVOUpdate::_run: Delta output (dOut) - size={}, range=[{}, {}], mean={}, zero_count={}, nonzero_count={}\033[0m",
+                         m_dOutBufferSize, d_min, d_max, d_mean, d_zero_count, d_nonzero_count);
+            logger->info("\033[34mDPVOUpdate::_run: Weight output (wOut) - size={}, range=[{}, {}], mean={}, zero_count={}, nonzero_count={}\033[0m",
+                         m_wOutBufferSize, w_min, w_max, w_mean, w_zero_count, w_nonzero_count);
+            
+            // Show sample values for first few edges (each edge has 2 delta values and 2 weight values)
+            const int num_sample_edges = std::min(5, static_cast<int>(m_maxEdge));
+            logger->info("\033[34mDPVOUpdate::_run: Sample delta and weight values (first {} edges):\033[0m", num_sample_edges);
+            for (int e = 0; e < num_sample_edges; e++) {
+                // dOut shape: [1, 2, m_maxEdge, 1] -> index = 0*2*m_maxEdge*1 + c*1*m_maxEdge*1 + e*1 + 0 = c*m_maxEdge + e
+                // For c=0: idx = e, for c=1: idx = m_maxEdge + e
+                size_t d_idx0 = e;  // First delta value for edge e
+                size_t d_idx1 = m_maxEdge + e;  // Second delta value for edge e
+                size_t w_idx0 = e;  // First weight value for edge e
+                size_t w_idx1 = m_maxEdge + e;  // Second weight value for edge e
+                
+                logger->info("\033[34m  Edge[{}]: delta=[{}, {}], weight=[{}, {}]\033[0m",
+                             e, 
+                             (d_idx0 < m_dOutBufferSize ? dOut[d_idx0] : 0.0f),
+                             (d_idx1 < m_dOutBufferSize ? dOut[d_idx1] : 0.0f),
+                             (w_idx0 < m_wOutBufferSize ? wOut[w_idx0] : 0.0f),
+                             (w_idx1 < m_wOutBufferSize ? wOut[w_idx1] : 0.0f));
+            }
+        }
+
 #if defined(SAVE_OUTPUT_TENSOR)
         _saveOutputTensor(frameIdx);
 #endif
@@ -557,6 +623,82 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     std::memcpy(m_iiBuff, iiData, m_iiBufferSize * sizeof(int32_t));
     std::memcpy(m_jjBuff, jjData, m_jjBufferSize * sizeof(int32_t));
     std::memcpy(m_kkBuff, kkData, m_kkBufferSize * sizeof(int32_t));
+
+    // Log input data statistics and first 10 values
+    if (logger) {
+        // Calculate statistics for net input
+        size_t net_zero_count = 0;
+        size_t net_nonzero_count = 0;
+        for (size_t i = 0; i < m_netBufferSize; i++) {
+            if (m_netBuff[i] == 0.0f) net_zero_count++;
+            else net_nonzero_count++;
+        }
+        
+        // Calculate statistics for inp input
+        size_t inp_zero_count = 0;
+        size_t inp_nonzero_count = 0;
+        for (size_t i = 0; i < m_inpBufferSize; i++) {
+            if (m_inpBuff[i] == 0.0f) inp_zero_count++;
+            else inp_nonzero_count++;
+        }
+        
+        // Calculate statistics for corr input
+        size_t corr_zero_count = 0;
+        size_t corr_nonzero_count = 0;
+        for (size_t i = 0; i < m_corrBufferSize; i++) {
+            if (m_corrBuff[i] == 0.0f) corr_zero_count++;
+            else corr_nonzero_count++;
+        }
+        
+        // Log statistics with green text (\033[32m for green, \033[0m to reset)
+        logger->info("\033[32mDPVOUpdate::_loadInput: net input - size={}, zero_count={}, nonzero_count={}\033[0m",
+                     m_netBufferSize, net_zero_count, net_nonzero_count);
+        logger->info("\033[32mDPVOUpdate::_loadInput: inp input - size={}, zero_count={}, nonzero_count={}\033[0m",
+                     m_inpBufferSize, inp_zero_count, inp_nonzero_count);
+        logger->info("\033[32mDPVOUpdate::_loadInput: corr input - size={}, zero_count={}, nonzero_count={}\033[0m",
+                     m_corrBufferSize, corr_zero_count, corr_nonzero_count);
+        
+        // Log first 10 values with green text
+        const int num_samples = 10;
+        logger->info("\033[32mDPVOUpdate::_loadInput: First {} net values: [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]\033[0m",
+                     num_samples,
+                     (m_netBufferSize > 0 ? m_netBuff[0] : 0.0f),
+                     (m_netBufferSize > 1 ? m_netBuff[1] : 0.0f),
+                     (m_netBufferSize > 2 ? m_netBuff[2] : 0.0f),
+                     (m_netBufferSize > 3 ? m_netBuff[3] : 0.0f),
+                     (m_netBufferSize > 4 ? m_netBuff[4] : 0.0f),
+                     (m_netBufferSize > 5 ? m_netBuff[5] : 0.0f),
+                     (m_netBufferSize > 6 ? m_netBuff[6] : 0.0f),
+                     (m_netBufferSize > 7 ? m_netBuff[7] : 0.0f),
+                     (m_netBufferSize > 8 ? m_netBuff[8] : 0.0f),
+                     (m_netBufferSize > 9 ? m_netBuff[9] : 0.0f));
+        
+        logger->info("\033[32mDPVOUpdate::_loadInput: First {} inp values: [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]\033[0m",
+                     num_samples,
+                     (m_inpBufferSize > 0 ? m_inpBuff[0] : 0.0f),
+                     (m_inpBufferSize > 1 ? m_inpBuff[1] : 0.0f),
+                     (m_inpBufferSize > 2 ? m_inpBuff[2] : 0.0f),
+                     (m_inpBufferSize > 3 ? m_inpBuff[3] : 0.0f),
+                     (m_inpBufferSize > 4 ? m_inpBuff[4] : 0.0f),
+                     (m_inpBufferSize > 5 ? m_inpBuff[5] : 0.0f),
+                     (m_inpBufferSize > 6 ? m_inpBuff[6] : 0.0f),
+                     (m_inpBufferSize > 7 ? m_inpBuff[7] : 0.0f),
+                     (m_inpBufferSize > 8 ? m_inpBuff[8] : 0.0f),
+                     (m_inpBufferSize > 9 ? m_inpBuff[9] : 0.0f));
+        
+        logger->info("\033[32mDPVOUpdate::_loadInput: First {} corr values: [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]\033[0m",
+                     num_samples,
+                     (m_corrBufferSize > 0 ? m_corrBuff[0] : 0.0f),
+                     (m_corrBufferSize > 1 ? m_corrBuff[1] : 0.0f),
+                     (m_corrBufferSize > 2 ? m_corrBuff[2] : 0.0f),
+                     (m_corrBufferSize > 3 ? m_corrBuff[3] : 0.0f),
+                     (m_corrBufferSize > 4 ? m_corrBuff[4] : 0.0f),
+                     (m_corrBufferSize > 5 ? m_corrBuff[5] : 0.0f),
+                     (m_corrBufferSize > 6 ? m_corrBuff[6] : 0.0f),
+                     (m_corrBufferSize > 7 ? m_corrBuff[7] : 0.0f),
+                     (m_corrBufferSize > 8 ? m_corrBuff[8] : 0.0f),
+                     (m_corrBufferSize > 9 ? m_corrBuff[9] : 0.0f));
+    }
 
     // Copy data to input tensors
 #if defined(CV28) || defined(CV28_SIMULATOR)
