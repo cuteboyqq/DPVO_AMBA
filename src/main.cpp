@@ -1416,6 +1416,11 @@ void processDPVOApp(
 		// Set fnet and inet models for Patchifier (will create new model instances)
 		// This will also start the processing thread (via _startThreads)
 		dpvo->setPatchifierModels(config, config);
+		
+		// Enable visualization (optional)
+		// NOTE: Requires Pangolin library to be installed and linked
+		// Visualization displays 3D point cloud, camera trajectory, and current video frame
+		dpvo->enableVisualization(true);
 
 		// Set up frame processed synchronization (similar to WNC_APP pattern)
 		std::mutex frameProcessedMutex;

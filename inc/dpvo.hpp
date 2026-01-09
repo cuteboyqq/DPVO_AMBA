@@ -15,6 +15,9 @@
 #include <atomic>
 #include <queue>
 
+// Forward declaration
+class DPVOViewer;
+
 struct DPVOConfig {
     int PATCHES_PER_FRAME;
     int BUFFER_SIZE;
@@ -78,6 +81,10 @@ public:
     
     // Initialize threads (called from constructor, similar to WNC_APP::_init)
     void _startThreads();
+    
+    // Visualization
+    void enableVisualization(bool enable = true);
+    void updateViewer();  // Update viewer with current state
 
 private:
     // Forward declaration for InputFrame (defined later in private section)
@@ -197,4 +204,11 @@ private:
     
     // Helper function to check if there's work to do
     bool _hasWorkToDo();
+    
+    // Visualization (optional)
+    std::unique_ptr<DPVOViewer> m_viewer;
+    bool m_visualizationEnabled{false};
+    
+    // Helper to compute point cloud from patches and poses
+    void computePointCloud();
 };

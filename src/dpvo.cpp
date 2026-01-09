@@ -1,6 +1,7 @@
 #include "dpvo.hpp"
 #include "patchify.hpp" // Patchifier
 #include "update.hpp"   // DPVOUpdate
+#include "dpvo_viewer.hpp"  // DPVOViewer
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>  // For std::abort()
@@ -551,7 +552,7 @@ void DPVO::run(int64_t timestamp,
         // Compute median of last 3 frames' depth values (center pixel of each patch)
         std::vector<float> depths;
         for (int f = std::max(0, n_use - 3); f < n_use; f++) {
-    for (int i = 0; i < M; i++) {
+            for (int i = 0; i < M; i++) {
                 // Get center pixel depth: patches[f][i][2][P/2][P/2]
                 int center_y = P / 2;
                 int center_x = P / 2;
@@ -701,6 +702,26 @@ void DPVO::run(int64_t timestamp,
         if (logger) logger->info("DPVO::run: Calling keyframe()");
         keyframe();
         if (logger) logger->info("DPVO::run: keyframe() completed");
+        
+        // Update viewer after optimization
+        if (m_visualizationEnabled) {
+            updateViewer();
+            // Update viewer with current image (convert from [C,H,W] to [H,W,C] for display)
+            if (m_viewer != nullptr) {
+                // Image is in [C, H, W] format, convert to [H, W, C] for viewer
+                std::vector<uint8_t> image_rgb(H * W * 3);
+                for (int c = 0; c < 3; c++) {
+                    for (int h = 0; h < H; h++) {
+                        for (int w = 0; w < W; w++) {
+                            int src_idx = c * H * W + h * W + w;
+                            int dst_idx = h * W * 3 + w * 3 + c;
+                            image_rgb[dst_idx] = image[src_idx];
+                        }
+                    }
+                }
+                m_viewer->updateImage(image_rgb.data(), W, H);
+            }
+        }
     } else if (m_pg.m_n >= 8) {
         if (logger) logger->info("DPVO::run: Initializing with 12 update() calls");
         m_is_initialized = true;
@@ -1047,9 +1068,13 @@ void DPVO::update()
     if (logger) logger->info("DPVO::update: update() completed successfully");
 
     // -------------------------------------------------
-    // 7. Update point cloud
+    // 7. Update point cloud and viewer
     // -------------------------------------------------
-//     updatePointCloud(); // implement pops::point_cloud equivalent
+    // Compute point cloud from patches and poses
+    if (m_visualizationEnabled) {
+        computePointCloud();
+        updateViewer();
+    }
 }
 
 
@@ -1828,5 +1853,113 @@ bool DPVO::isProcessingComplete()
 {
     std::lock_guard<std::mutex> lock(m_queueMutex);
     return m_inputFrameQueue.empty() && m_bDone;
+}
+
+// -------------------------------------------------------------
+// Visualization
+// -------------------------------------------------------------
+void DPVO::enableVisualization(bool enable)
+{
+#ifdef ENABLE_PANGOLIN_VIEWER
+    m_visualizationEnabled = enable;
+    
+    if (enable && m_viewer == nullptr) {
+        // Initialize viewer with current image dimensions
+        try {
+            m_viewer = std::make_unique<DPVOViewer>(m_wd, m_ht, PatchGraph::N, PatchGraph::N * m_cfg.PATCHES_PER_FRAME);
+            auto logger = spdlog::get("dpvo");
+            if (logger) logger->info("DPVO: Visualization enabled");
+        } catch (const std::exception& e) {
+            auto logger = spdlog::get("dpvo");
+            if (logger) logger->error("DPVO: Failed to initialize viewer: {}", e.what());
+            m_visualizationEnabled = false;
+        }
+    } else if (!enable && m_viewer != nullptr) {
+        m_viewer->close();
+        m_viewer->join();
+        m_viewer.reset();
+        auto logger = spdlog::get("dpvo");
+        if (logger) logger->info("DPVO: Visualization disabled");
+    }
+#else
+    // Viewer not compiled in - log warning if trying to enable
+    if (enable) {
+        auto logger = spdlog::get("dpvo");
+        if (logger) logger->warn("DPVO: Visualization requested but not available (Pangolin not enabled). "
+                                 "Compile with -DENABLE_PANGOLIN_VIEWER and link against Pangolin to enable.");
+    }
+    m_visualizationEnabled = false;
+#endif
+}
+
+void DPVO::computePointCloud()
+{
+    // Compute 3D points from patches and poses
+    // For each patch, backproject using pose and intrinsics
+    const int n = m_pg.m_n;
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    const int P = m_P;
+    
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < M; k++) {
+            int idx = i * M + k;
+            
+            // Get patch center coordinates and depth
+            int center_y = P / 2;
+            int center_x = P / 2;
+            float px = m_pg.m_patches[i][k][0][center_y][center_x];
+            float py = m_pg.m_patches[i][k][1][center_y][center_x];
+            float pd = m_pg.m_patches[i][k][2][center_y][center_x];  // inverse depth
+            
+            // Get intrinsics (scaled by RES=4)
+            const float* intr = m_pg.m_intrinsics[i];
+            float fx = intr[0];
+            float fy = intr[1];
+            float cx = intr[2];
+            float cy = intr[3];
+            
+            // Inverse projection: X0 = [X, Y, Z, W] in homogeneous coordinates
+            float X0 = (px - cx) / fx;
+            float Y0 = (py - cy) / fy;
+            float Z0 = 1.0f;
+            float W0 = pd;  // inverse depth
+            
+            // Transform to world coordinates using pose
+            const SE3& T = m_pg.m_poses[i];
+            Eigen::Vector3f p0(X0, Y0, Z0);
+            Eigen::Vector3f p_world = T.R() * p0 + T.t * W0;
+            
+            // Store point
+            m_pg.m_points[idx].x = p_world.x();
+            m_pg.m_points[idx].y = p_world.y();
+            m_pg.m_points[idx].z = p_world.z();
+        }
+    }
+}
+
+void DPVO::updateViewer()
+{
+    if (!m_visualizationEnabled || m_viewer == nullptr) {
+        return;
+    }
+    
+    try {
+        // Update poses
+        if (m_pg.m_n > 0) {
+            m_viewer->updatePoses(m_pg.m_poses, m_pg.m_n);
+        }
+        
+        // Compute and update point cloud
+        computePointCloud();
+        int num_points = m_pg.m_n * m_cfg.PATCHES_PER_FRAME;
+        if (num_points > 0) {
+            // Flatten colors array: m_colors[N][M][3] -> uint8_t* with num_points * 3 elements
+            uint8_t* colors_flat = reinterpret_cast<uint8_t*>(m_pg.m_colors);
+            m_viewer->updatePoints(m_pg.m_points, colors_flat, num_points);
+        }
+    } catch (const std::exception& e) {
+        auto logger = spdlog::get("dpvo");
+        if (logger) logger->error("DPVO: Error updating viewer: {}", e.what());
+    }
 }
 
