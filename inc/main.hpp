@@ -140,7 +140,7 @@ std::atomic<bool> terminateThreads(false);
 //
 void appDPVOthreadFunction(DPVO& dpvo);
 void processDPVOInput(
-	const std::string& inputPath,
+	const std::string& inputPath, 
 	const InputType& inputType,
 	std::shared_ptr<spdlog::logger> logger, 
 	unsigned int& count, 

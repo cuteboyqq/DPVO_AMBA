@@ -18,8 +18,9 @@
 #include <map>
 #include <opencv2/core.hpp>
 
-#include "bounding_box.hpp"
-#include "object.hpp"
+// DEPRECATED: bounding_box.hpp, object.hpp removed
+// #include "bounding_box.hpp"
+// #include "object.hpp"
 #include "syslog.h"
 
 #define MAX_NUM_OBJ 100 // 32
@@ -114,28 +115,31 @@ struct WNC_APP_Results
     bool                isDetectLine      = false;
     int                 eventType         = 0;
     int                 frameID           = 0;
-    std::vector<BoundingBox>  detectObjList;
-    std::vector<Object>       trackObjList;
-    std::vector<BoundingBox>  faceObjList;
-    std::vector<BoundingBox>  vehicleObjList;
-    std::vector<BoundingBox>  riderObjList;
-    std::vector<BoundingBox>  poseObjList;
+    // DEPRECATED: BoundingBox and Object removed
+    // std::vector<BoundingBox>  detectObjList;
+    // std::vector<Object>       trackObjList;
+    // std::vector<BoundingBox>  faceObjList;
+    // std::vector<BoundingBox>  vehicleObjList;
+    // std::vector<BoundingBox>  riderObjList;
+    // std::vector<BoundingBox>  poseObjList;
 
     WNC_APP_Results()
         : isDetectLine(),
-          eventType(),
-          trackObjList(),
-          faceObjList(),
-          vehicleObjList(),
-          riderObjList(),
-          poseObjList()
+          eventType()
+          // DEPRECATED: trackObjList, faceObjList, etc. removed
+          // trackObjList(),
+          // faceObjList(),
+          // vehicleObjList(),
+          // riderObjList(),
+          // poseObjList()
     {   
-        detectObjList.reserve(MAX_NUM_OBJ);
-        trackObjList.reserve(MAX_NUM_OBJ);
-        faceObjList.reserve(MAX_NUM_OBJ);
-        vehicleObjList.reserve(MAX_NUM_OBJ);
-        riderObjList.reserve(MAX_NUM_OBJ);
-        poseObjList.reserve(MAX_NUM_OBJ);
+        // DEPRECATED: reserve calls removed
+        // detectObjList.reserve(MAX_NUM_OBJ);
+        // trackObjList.reserve(MAX_NUM_OBJ);
+        // faceObjList.reserve(MAX_NUM_OBJ);
+        // vehicleObjList.reserve(MAX_NUM_OBJ);
+        // riderObjList.reserve(MAX_NUM_OBJ);
+        // poseObjList.reserve(MAX_NUM_OBJ);
     }
 };
 

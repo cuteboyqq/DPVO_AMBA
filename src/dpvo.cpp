@@ -510,7 +510,7 @@ void DPVO::run(int64_t timestamp,
     // Store timestamp in both m_tlist (for compatibility) and m_pg.m_tstamps (main storage)
     m_tlist.push_back(timestamp);
     m_pg.m_tstamps[n_use] = timestamp;
-    
+
     // Store camera intrinsics (Python divides by RES=4)
     const float RES = 4.0f;
     float scaled_intrinsics[4];
@@ -551,7 +551,7 @@ void DPVO::run(int64_t timestamp,
         // Compute median of last 3 frames' depth values (center pixel of each patch)
         std::vector<float> depths;
         for (int f = std::max(0, n_use - 3); f < n_use; f++) {
-            for (int i = 0; i < M; i++) {
+    for (int i = 0; i < M; i++) {
                 // Get center pixel depth: patches[f][i][2][P/2][P/2]
                 int center_y = P / 2;
                 int center_x = P / 2;
@@ -667,8 +667,8 @@ void DPVO::run(int64_t timestamp,
     // This ensures m_pg.m_n increments correctly each iteration.
     try {
         m_pg.m_n = n_use + 1;  // Set to n_use + 1 (next frame index)
-        m_pg.m_m += M;
-        m_counter++;
+    m_pg.m_m += M;
+    m_counter++;
         if (logger) logger->info("DPVO::run: Counters updated, m_n={}, m_m={}", m_pg.m_n, m_pg.m_m);
     } catch (...) {
         fprintf(stderr, "[DPVO] EXCEPTION updating counters, m_pg might be corrupted\n");
@@ -707,7 +707,7 @@ void DPVO::run(int64_t timestamp,
         for (int i = 0; i < 12; i++) {
             if (logger) logger->info("DPVO::run: Initialization update() call {}/12", i+1);
             update();
-        }
+    }
         if (logger) logger->info("DPVO::run: Initialization completed");
     }
     if (logger) logger->info("DPVO::run: Optimization completed");
@@ -888,7 +888,7 @@ void DPVO::update()
     if (logger) logger->info("DPVO::update: Starting network update, m_updateModel={}", (void*)m_updateModel.get());
     std::vector<float> delta(num_active * 2);
     std::vector<float> weight(num_active);
-    
+
     if (m_updateModel != nullptr) {
         if (logger) logger->info("DPVO::update: m_updateModel is not null, preparing model inputs");
         

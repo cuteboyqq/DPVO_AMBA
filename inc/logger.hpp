@@ -30,8 +30,9 @@
 
 // Include necessary WNC headers
 #include "dataStructures.h"
-#include "bounding_box.hpp"
-#include "object.hpp"
+// DEPRECATED: bounding_box.hpp, object.hpp removed
+// #include "bounding_box.hpp"
+// #include "object.hpp"
 
 // --- Base Logger --- //
 class BaseLogger
@@ -86,35 +87,39 @@ public:
     std::string              m_loggerName;
 };
 
+// DEPRECATED: Object Detection Logger removed (used BoundingBox)
 // --- Object Detection Logger --- //
-class ObjectDetectionLogger : public BaseLogger
-{
-public:
-    explicit ObjectDetectionLogger(const std::string& loggerName) : BaseLogger(loggerName)
-    {
-    }
-    void logObject(const BoundingBox& bbox);
-    void logObjects(const std::vector<BoundingBox>& bboxList);
-};
+// class ObjectDetectionLogger : public BaseLogger
+// {
+// public:
+//     explicit ObjectDetectionLogger(const std::string& loggerName) : BaseLogger(loggerName)
+//     {
+//     }
+//     void logObject(const BoundingBox& bbox);
+//     void logObjects(const std::vector<BoundingBox>& bboxList);
+// };
 
+// DEPRECATED: Object Tracking Logger removed (used Object)
 // --- Object Tracking Logger --- //
-class ObjectTrackingLogger : public BaseLogger
-{
-public:
-    explicit ObjectTrackingLogger(const std::string& loggerName) : BaseLogger(loggerName)
-    {
-    }
-    void logObject(const Object& obj);
-    void logObjects(const std::vector<Object>& objList);
-};
+// class ObjectTrackingLogger : public BaseLogger
+// {
+// public:
+//     explicit ObjectTrackingLogger(const std::string& loggerName) : BaseLogger(loggerName)
+//     {
+//     }
+//     void logObject(const Object& obj);
+//     void logObjects(const std::vector<Object>& objList);
+// };
 
 
+// DEPRECATED: Logger Manager updated (removed ObjectDetectionLogger and ObjectTrackingLogger)
 // --- Logger Manager --- //
 class LoggerManager
 {
 public:
     LoggerManager();
     ~LoggerManager();
-    ObjectDetectionLogger*         m_objectDetectionLogger;
-    ObjectTrackingLogger*          m_objectTrackingLogger;
+    // DEPRECATED: ObjectDetectionLogger and ObjectTrackingLogger removed
+    // ObjectDetectionLogger*         m_objectDetectionLogger;
+    // ObjectTrackingLogger*          m_objectTrackingLogger;
 };

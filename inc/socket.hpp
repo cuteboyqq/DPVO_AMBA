@@ -16,7 +16,8 @@
 
 #include <fstream>
 #include <vector>
-#include "bounding_box.hpp"
+// DEPRECATED: bounding_box.hpp removed
+// #include "bounding_box.hpp"
 #include "dataStructures.h"
 // #include "adas_config_reader.hpp"
 #include <arpa/inet.h>
@@ -31,8 +32,9 @@
 #include <netinet/in.h>
 #include <vector>
 // OpenCV
+#include <opencv2/core.hpp>        // Required for cv::Mat
+#include <opencv2/imgcodecs.hpp>   // Required for cv::imencode
 #ifdef SAV837
-#include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgproc.hpp>
 #endif

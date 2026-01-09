@@ -24,98 +24,103 @@ BaseLogger::~BaseLogger()
 }
 
 
+// DEPRECATED: Object Detection Logger removed (used BoundingBox)
 // --- Object Detection Logger --- //
-void ObjectDetectionLogger::logObject(const BoundingBox& box)
-{
-    std::ostringstream oss;
-    std::string        logStr   = "";
-    std::string        classStr = "";
-    std::string        boxStr   = "";
-    std::string        confStr  = "";
+// void ObjectDetectionLogger::logObject(const BoundingBox& box)
+// {
+//     std::ostringstream oss;
+//     std::string        logStr   = "";
+//     std::string        classStr = "";
+//     std::string        boxStr   = "";
+//     std::string        confStr  = "";
+//
+//     // Determine class string
+//     switch (box.label)
+//     {
+//     case 0:
+//         classStr = "Human";
+//         break;
+//     case 1:
+//         classStr = "Big Vehicle";
+//         break;
+//     case 2:
+//         classStr = "Road Sign";
+//         break;
+//     default:
+//         classStr = "Unknown";
+//         break;
+//     }
+//
+//     oss << "Cls: " << classStr << " Box: (" << box.x1 << ", " << box.y1 << ", " << box.x2 << ", " << box.y2
+//         << ") Conf: " << box.confidence;
+//
+//     log(oss.str());
+// }
+//
+// void ObjectDetectionLogger::logObjects(const std::vector<BoundingBox>& boxList)
+// {
+//     m_logs.clear();
+//     for (auto& obj : boxList)
+//         logObject(obj);
+// }
 
-    // Determine class string
-    switch (box.label)
-    {
-    case 0:
-        classStr = "Human";
-        break;
-    case 1:
-        classStr = "Big Vehicle";
-        break;
-    case 2:
-        classStr = "Road Sign";
-        break;
-    default:
-        classStr = "Unknown";
-        break;
-    }
-
-    oss << "Cls: " << classStr << " Box: (" << box.x1 << ", " << box.y1 << ", " << box.x2 << ", " << box.y2
-        << ") Conf: " << box.confidence;
-
-    log(oss.str());
-}
-
-void ObjectDetectionLogger::logObjects(const std::vector<BoundingBox>& boxList)
-{
-    m_logs.clear();
-    for (auto& obj : boxList)
-        logObject(obj);
-}
-
+// DEPRECATED: Object Tracking Logger removed (used Object and BoundingBox)
 // --- Object Tracking Logger --- //
-void ObjectTrackingLogger::logObject(const Object& obj)
-{
-    std::ostringstream oss;
-    std::string        classStr;
-    const BoundingBox& box = obj.bbox;
+// void ObjectTrackingLogger::logObject(const Object& obj)
+// {
+//     std::ostringstream oss;
+//     std::string        classStr;
+//     const BoundingBox& box = obj.bbox;
+//
+//     // Determine class string
+//     switch (box.label)
+//     {
+//     case 0:
+//         classStr = "Human";
+//         break;
+//     case 1:
+//         classStr = "Big Vehicle";
+//         break;
+//     case 2:
+//         classStr = "Road Sign";
+//         break;
+//     default:
+//         classStr = "Unknown";
+//         break;
+//     }
+//
+//     oss << "Cls: " << classStr << " Box: (" << box.x1 << ", " << box.y1 << ", " << box.x2 << ", " << box.y2
+//         << ") Conf: " << box.confidence << " Distance: " << obj.distanceToCamera << " TTC: " << obj.currTTC
+//         << " TTCCounter: " << obj.ttcCounter;
+//
+//     log(oss.str());
+// }
+//
+// void ObjectTrackingLogger::logObjects(const std::vector<Object>& objList)
+// {
+//     m_logs.clear();
+//     for (const auto& obj : objList)
+//     {
+//         if (obj.getStatus() == 1)
+//             logObject(obj);
+//     }
+// }
 
-    // Determine class string
-    switch (box.label)
-    {
-    case 0:
-        classStr = "Human";
-        break;
-    case 1:
-        classStr = "Big Vehicle";
-        break;
-    case 2:
-        classStr = "Road Sign";
-        break;
-    default:
-        classStr = "Unknown";
-        break;
-    }
-
-    oss << "Cls: " << classStr << " Box: (" << box.x1 << ", " << box.y1 << ", " << box.x2 << ", " << box.y2
-        << ") Conf: " << box.confidence << " Distance: " << obj.distanceToCamera << " TTC: " << obj.currTTC
-        << " TTCCounter: " << obj.ttcCounter;
-
-    log(oss.str());
-}
-
-void ObjectTrackingLogger::logObjects(const std::vector<Object>& objList)
-{
-    m_logs.clear();
-    for (const auto& obj : objList)
-    {
-        if (obj.getStatus() == 1)
-            logObject(obj);
-    }
-}
-
+// DEPRECATED: Logger Manager updated (removed ObjectDetectionLogger and ObjectTrackingLogger)
 // --- Logger Manager --- //
 LoggerManager::LoggerManager()
 {
-    m_objectDetectionLogger         = new ObjectDetectionLogger("ObjDetect");
-    m_objectTrackingLogger          = new ObjectTrackingLogger("ObjTrack ");
+    // DEPRECATED: ObjectDetectionLogger and ObjectTrackingLogger removed
+    // m_objectDetectionLogger         = new ObjectDetectionLogger("ObjDetect");
+    // m_objectTrackingLogger          = new ObjectTrackingLogger("ObjTrack ");
 }
 
 LoggerManager::~LoggerManager()
 {
-    delete m_objectDetectionLogger;
-    delete m_objectTrackingLogger;
-
-    m_objectDetectionLogger         = nullptr;
-    m_objectTrackingLogger          = nullptr;
+    // DEPRECATED: ObjectDetectionLogger and ObjectTrackingLogger removed
+    // delete m_objectDetectionLogger;
+    // delete m_objectTrackingLogger;
+    //
+    // m_objectDetectionLogger         = nullptr;
+    // m_objectTrackingLogger          = nullptr;
 }

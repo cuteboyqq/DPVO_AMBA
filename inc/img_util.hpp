@@ -20,7 +20,8 @@
 #include <iostream>
 #include <algorithm>
 #include <vector>
-#include "bounding_box.hpp"
+// DEPRECATED: bounding_box.hpp removed
+// #include "bounding_box.hpp"
 // #include <Eigen/Dense>     // For linear algebra computations
 
 // TODO: Andy add
@@ -39,9 +40,9 @@
 #endif
 
 
-// Forward declarations
-class Point;
-class BoundingBox;
+// DEPRECATED: Forward declarations removed
+// class Point;
+// class BoundingBox;
 class LaneLine;
 
 constexpr int COLLINEAR        = 0;
@@ -56,13 +57,15 @@ void calcLinearEquation(cv::Point &pA, cv::Point &pB, float &a, float &b,cv::Mat
 void calcLinearEquation(cv::Point& pA, cv::Point& pB, float& a, float& b,cv::Mat& image, cv::Scalar color);
 void calcNonLinearEquation(std::vector<cv::Point>& pList, float& a, float& b, float& c, 
                            int imgWidth, int imgHeight, cv::Mat& image); // Alister add 2025-01-24
-int checkPointOnWhichLineSide(Point &p, std::vector<float> &linearEquation);
+// DEPRECATED: Function using Point removed
+// int checkPointOnWhichLineSide(Point &p, std::vector<float> &linearEquation);
 int checkPointOnWhichLineSide(cv::Point &p, cv::Point &pA, cv::Point &pB);
 float findXGivenY(int y, float a, float b);
 cv::Point2f getLine(cv::Point &p1, cv::Point &p2);
 cv::Point getIntersectionPoint(cv::Point &pLeftBot, cv::Point &pLeftTop, cv::Point &pRightBot, cv::Point &pRightTop);
 cv::Point getIntersectionPoint(float m1, float c1, float m2, float c2);
-float calcEuclideanDistance(Point &pA, Point &pB);
+// DEPRECATED: Function using Point removed
+// float calcEuclideanDistance(Point &pA, Point &pB);
 float calcEuclideanDistance(cv::Point &pA, cv::Point &pB);
 float calcEuclideanDistance(cv::Point2f &pA, cv::Point2f &pB);
 double angleBetweenPoints(cv::Point &pA, cv::Point &pB);
@@ -75,22 +78,25 @@ void findClosestContour(cv::Mat &src, int y, cv::Mat &dst);
 void removeSmallContour(cv::Mat &src, cv::Mat &dst, int sizeThreshold);
 void dilate(cv::Mat &img, int kernelSize);
 void erode(cv::Mat &img, int kernelSize);
-float getBboxOverlapRatio(BoundingBox &bA, BoundingBox &bB);
+// DEPRECATED: Function using BoundingBox removed
+// float getBboxOverlapRatio(BoundingBox &bA, BoundingBox &bB);
 void roundedRectangle(cv::Mat &src, const cv::Point &topLeft, const cv::Point &bottomRight, const cv::Scalar &lineColor,
                       int thickness, int lineType, int cornerRadius, bool filled);
 void PoseKeyPoints(cv::Mat &src, std::vector<std::pair<int,int>> pose_kpts, const cv::Scalar &lineColor, int thickness); // Alister add 2025-01-21
-void drawSkeletonAction(cv::Mat& src, BoundingBox& box, const cv::Scalar& color); // Alsiter add 2025-08-28
+// void drawSkeletonAction(cv::Mat& src, BoundingBox& box, const cv::Scalar& color); // Alsiter add 2025-08-28
 cv::Scalar getPoseColor(const std::string& action);
 void efficientRectangle(cv::Mat &src, const cv::Point &topLeft, const cv::Point &bottomRight,
                         const cv::Scalar &lineColor, int thickness, int lineType, int cornerRadius, bool filled);
-void cropImages(cv::Mat &img, cv::Mat &imgCrop, BoundingBox &box);
-float calcDistanceToCamera(float focalLen, float camHeight, int yVanish, BoundingBox &rescaledBox);
+// DEPRECATED: Functions using BoundingBox removed
+// void cropImages(cv::Mat &img, cv::Mat &imgCrop, BoundingBox &box);
+// float calcDistanceToCamera(float focalLen, float camHeight, int yVanish, BoundingBox &rescaledBox);
 int orientation(const cv::Point &p, const cv::Point &q, const cv::Point &r);
 bool onSegment(const cv::Point &p, const cv::Point &q, const cv::Point &r);
 bool isLinesIntersected(const cv::Point &p1, const cv::Point &q1, const cv::Point &p2, const cv::Point &q2);
-int getIntersectArea(const BoundingBox &a, const BoundingBox &b);
-float getArea(const BoundingBox &box);
-float iou(const BoundingBox &a, const BoundingBox &b);
+// DEPRECATED: Functions using BoundingBox removed
+// int getIntersectArea(const BoundingBox &a, const BoundingBox &b);
+// float getArea(const BoundingBox &box);
+// float iou(const BoundingBox &a, const BoundingBox &b);
 
 // ----- After v0,8.0+ ----- //
 double robustCurvatureEstimation(const std::vector<cv::Point>& points);
@@ -276,14 +282,15 @@ void drawPoints(
     int imgWidth,
     int imgHeight,
     cv::Mat& image, cv::Scalar color);
-void drawLanePoints(
-    const BoundingBox& box,
-    int modelWidth,
-    int modelHeight,
-    int imgWidth,
-    int imgHeight,
-    cv::Mat& image,
-    cv::Scalar color);
+// DEPRECATED: Function using BoundingBox removed
+// void drawLanePoints(
+//     const BoundingBox& box,
+//     int modelWidth,
+//     int modelHeight,
+//     int imgWidth,
+//     int imgHeight,
+//     cv::Mat& image,
+//     cv::Scalar color);
 void drawLanePoints(
     const std::vector<cv::Point>& leftPoints,
     const std::vector<cv::Point>& rightPoints,

@@ -30,9 +30,10 @@
 #include "opencv2/core.hpp"
 #include "opencv2/imgproc.hpp"
 #include "opencv2/highgui.hpp"
-#include "point.hpp"
-#include "bounding_box.hpp"
-#include "object.hpp"
+// DEPRECATED: point.hpp, bounding_box.hpp, object.hpp removed
+// #include "point.hpp"
+// #include "bounding_box.hpp"
+// #include "object.hpp"
 #include "dataStructures.h"
 #include <spdlog/spdlog.h>
 
@@ -57,10 +58,11 @@ bool sortbysec_float(const pair<int, float> &a, const pair<int, float> &b);
 
 bool sortBySecAscend(const pair<int, int> &a, const pair<int, int> &b);
 
-bool sortByBBoxArea(BoundingBox &bboxA, BoundingBox &bboxB);
-bool sortByObjBBoxArea(Object &objA, Object &objB);
+// DEPRECATED: Functions using BoundingBox, Object, Point removed
+// bool sortByBBoxArea(BoundingBox &bboxA, BoundingBox &bboxB);
+// bool sortByObjBBoxArea(Object &objA, Object &objB);
 
-float calcVecDegree(Point &a, Point &b);
+// float calcVecDegree(Point &a, Point &b);
 float calcVecDegree(cv::Point &a, cv::Point &b);
 float calcVecDegree(cv::Point a, cv::Point b);
 
@@ -74,7 +76,8 @@ int findListIdx(int key, vector<int> &dict);
 int findListIdx(int key, vector<pair<int, vector<int>>> &dict);
 int findListIdx(int key, vector<pair<int, vector<pair<int, float>>>> &dict);
 int findListIdx(int key, vector<pair<int, pair<int, float>>> &dict);
-int findListIdx(int key, vector<pair<int, vector<Point>>> &dict);
+// DEPRECATED: Function using Point removed
+// int findListIdx(int key, vector<pair<int, vector<Point>>> &dict);
 
 //
 int findMedian(vector<int> a, int n);
@@ -103,17 +106,18 @@ void applyMovingAverage(vector<int> &list, vector<int> &listMA, int windowSize);
 //
 std::string to_string_with_precision(float value, const int n);
 
-//
-void rescaleBBox(BoundingBox &bbox, BoundingBox &rescaleBBox, int modelWidth, int modelHeight, int videoWidth,
-                 int videoHeight);
+// DEPRECATED: Function using BoundingBox removed
+// void rescaleBBox(BoundingBox &bbox, BoundingBox &rescaleBBox, int modelWidth, int modelHeight, int videoWidth,
+//                  int videoHeight);
 void rescaleROI(ROI &bbox, ROI &rescaleBBox, int modelWidth, int modelHeight, int videoWidth, int videoHeight);
 
 void rescalePoint(cv::Point &pSrc, cv::Point &pDst, float xRatio, float yRatio);
 
 void rescalePoint(cv::Point &pSrc, cv::Point &pDst, int modelWidth, int modelHeight, int videoWidth, int videoHeight);
 
-void smoothBBoxes(vector<BoundingBox> &bboxList, vector<BoundingBox> &procBBoxList, int windowSize,
-                  int maxFrameInterval);
+// DEPRECATED: Function using BoundingBox removed
+// void smoothBBoxes(vector<BoundingBox> &bboxList, vector<BoundingBox> &procBBoxList, int windowSize,
+//                   int maxFrameInterval);
 
 bool isZeroPoint(cv::Point &p);
 
@@ -126,7 +130,8 @@ bool checkFloatVectorDifference(const std::vector<float>& floatVector, float thr
 cv::Point calculateMeanPoint(const std::vector<cv::Point>& points);
 float calculateMeanFloat(const std::vector<float>& values);
 std::pair<std::string, float> extractDeviceInfoFromFilename(const std::string& filename);
-bool isLineIntersectingBox(const cv::Point& p1, const cv::Point& p2, const BoundingBox& box);
+// DEPRECATED: Function using BoundingBox removed
+// bool isLineIntersectingBox(const cv::Point& p1, const cv::Point& p2, const BoundingBox& box);
 bool doLinesIntersect(const cv::Point& p1, const cv::Point& p2, 
                       const cv::Point& p3, const cv::Point& p4); 
 int direction(const cv::Point& p1, const cv::Point& p2, const cv::Point& p3);

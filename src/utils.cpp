@@ -156,31 +156,33 @@ bool sortBySecAscend(const pair<int, int> &a, const pair<int, int> &b)
     return (a.second < b.second);
 }
 
-bool sortByBBoxArea(BoundingBox &bboxA, BoundingBox &bboxB)
-{
-    return bboxA.getArea() > bboxB.getArea();
-}
+// DEPRECATED: Function using BoundingBox removed
+// bool sortByBBoxArea(BoundingBox &bboxA, BoundingBox &bboxB)
+// {
+//     return bboxA.getArea() > bboxB.getArea();
+// }
 
 // bool sortByObjBBoxArea(Object &objA, Object &objB)
 // {
 //     return objA.m_lastDetectBoundingBox.getArea() > objB.m_lastDetectBoundingBox.getArea();
 // }
 
-float calcVecDegree(Point &a, Point &b)
-{
-    float dot;
-    float det;
-    float angle;
-    float degree;
-
-    dot   = a.x * b.x + a.y * b.y; // dot product between [x1, y1] and [x2, y2]
-    det   = a.x * b.y - a.y * b.x; // determinant
-    angle = atan2(det, dot);
-
-    degree = abs(angle * 180 / M_PI);
-
-    return degree;
-}
+// DEPRECATED: Function using Point removed
+// float calcVecDegree(Point &a, Point &b)
+// {
+//     float dot;
+//     float det;
+//     float angle;
+//     float degree;
+//
+//     dot   = a.x * b.x + a.y * b.y; // dot product between [x1, y1] and [x2, y2]
+//     det   = a.x * b.y - a.y * b.x; // determinant
+//     angle = atan2(det, dot);
+//
+//     degree = abs(angle * 180 / M_PI);
+//
+//     return degree;
+// }
 
 float calcVecDegree(cv::Point &a, cv::Point &b)
 {
@@ -307,19 +309,20 @@ int findListIdx(int key, vector<pair<int, pair<int, float>>> &dict)
     return idx;
 }
 
-int findListIdx(int key, vector<pair<int, vector<Point>>> &dict)
-{
-    int idx = 0;
-    for (int i = 0; i < dict.size(); i++)
-    {
-        if (key == dict[i].first)
-        {
-            idx = i;
-            break;
-        }
-    }
-    return idx;
-}
+// DEPRECATED: Function using Point removed
+// int findListIdx(int key, vector<pair<int, vector<Point>>> &dict)
+// {
+//     int idx = 0;
+//     for (int i = 0; i < dict.size(); i++)
+//     {
+//         if (key == dict[i].first)
+//         {
+//             idx = i;
+//             break;
+//         }
+//     }
+//     return idx;
+// }
 
 //
 //
@@ -566,43 +569,41 @@ std::string to_string_with_precision(float a_value, const int n = 6)
     return std::move(out).str();
 }
 
+// DEPRECATED: Function using BoundingBox removed
+// void rescaleBBox(BoundingBox &bbox, BoundingBox &rescaleBBox, int modelWidth, int modelHeight, int videoWidth,
+//                  int videoHeight)
+// {
+//     float w_ratio = static_cast<float>(modelWidth) / static_cast<float>(videoWidth);
+//     float h_ratio = static_cast<float>(modelHeight) / static_cast<float>(videoHeight);
+//
+//     rescaleBBox.x1 = static_cast<int>(static_cast<float>(bbox.x1) / w_ratio);
+//     rescaleBBox.y1 = static_cast<int>(static_cast<float>(bbox.y1) / h_ratio);
+//     rescaleBBox.x2 = static_cast<int>(static_cast<float>(bbox.x2) / w_ratio);
+//     rescaleBBox.y2 = static_cast<int>(static_cast<float>(bbox.y2) / h_ratio);
+//
+//     rescaleBBox.confidence = bbox.confidence;
+//     rescaleBBox.label      = bbox.label;
+//      // Rescale pose detection keypoints, Alister add 2025-01-12
+//     // cout<<"bbox.pose_kpts.size() = "<<bbox.pose_kpts.size()<<endl;
+//     for(int i=0; i<bbox.pose_kpts.size();i++)
+//     {
+//         int pose_kpt_x = (int)((float)bbox.pose_kpts[i].first/ w_ratio);
+//         int pose_kpt_y = (int)((float)bbox.pose_kpts[i].second/ h_ratio);
+//         rescaleBBox.pose_kpts.push_back({pose_kpt_x, pose_kpt_y});
+//     }
+//     rescaleBBox.skeletonAction = bbox.skeletonAction;
+//     // cout<<"Hi Alister !! rescaleBBox.pose_kpts.size() = "<<rescaleBBox.pose_kpts.size()<<endl;
 //
 //
-//
-void rescaleBBox(BoundingBox &bbox, BoundingBox &rescaleBBox, int modelWidth, int modelHeight, int videoWidth,
-                 int videoHeight)
-{
-    float w_ratio = static_cast<float>(modelWidth) / static_cast<float>(videoWidth);
-    float h_ratio = static_cast<float>(modelHeight) / static_cast<float>(videoHeight);
-
-    rescaleBBox.x1 = static_cast<int>(static_cast<float>(bbox.x1) / w_ratio);
-    rescaleBBox.y1 = static_cast<int>(static_cast<float>(bbox.y1) / h_ratio);
-    rescaleBBox.x2 = static_cast<int>(static_cast<float>(bbox.x2) / w_ratio);
-    rescaleBBox.y2 = static_cast<int>(static_cast<float>(bbox.y2) / h_ratio);
-
-    rescaleBBox.confidence = bbox.confidence;
-    rescaleBBox.label      = bbox.label;
-     // Rescale pose detection keypoints, Alister add 2025-01-12
-    // cout<<"bbox.pose_kpts.size() = "<<bbox.pose_kpts.size()<<endl;
-    for(int i=0; i<bbox.pose_kpts.size();i++)
-    {
-        int pose_kpt_x = (int)((float)bbox.pose_kpts[i].first/ w_ratio);
-        int pose_kpt_y = (int)((float)bbox.pose_kpts[i].second/ h_ratio);
-        rescaleBBox.pose_kpts.push_back({pose_kpt_x, pose_kpt_y});
-    }
-    rescaleBBox.skeletonAction = bbox.skeletonAction;
-    // cout<<"Hi Alister !! rescaleBBox.pose_kpts.size() = "<<rescaleBBox.pose_kpts.size()<<endl;
-
-
-    if (rescaleBBox.x1 < 0)
-        rescaleBBox.x1 = 0;
-    if (rescaleBBox.x2 > videoWidth - 1)
-        rescaleBBox.x2 = videoWidth - 1;
-    if (rescaleBBox.y1 < 0)
-        rescaleBBox.y1 = 0;
-    if (rescaleBBox.y2 > videoHeight - 1)
-        rescaleBBox.y2 = videoHeight - 1;
-}
+//     if (rescaleBBox.x1 < 0)
+//         rescaleBBox.x1 = 0;
+//     if (rescaleBBox.x2 > videoWidth - 1)
+//         rescaleBBox.x2 = videoWidth - 1;
+//     if (rescaleBBox.y1 < 0)
+//         rescaleBBox.y1 = 0;
+//     if (rescaleBBox.y2 > videoHeight - 1)
+//         rescaleBBox.y2 = videoHeight - 1;
+// }
 
 // =================================================================================================
 // DEPRECATED: YOLOv8 function - removed as YOLOv8 code has been removed
@@ -659,93 +660,94 @@ void rescalePoint(cv::Point &pSrc, cv::Point &pDst, int modelWidth, int modelHei
     pDst.y       = (int)((float)pSrc.y / yRatio);
 }
 
-void smoothBBoxes(vector<BoundingBox> &bboxList, vector<BoundingBox> &procBboxList, int windowSize,
-                  int maxFrameInterval)
-{
-    int numBbox        = bboxList.size();
-    int halfWindowSize = (int)(windowSize * 0.5);
-
-    for (int i = halfWindowSize; i < numBbox - halfWindowSize; i += 1)
-    {
-        int newX1 = 0;
-        int newY1 = 0;
-        int newX2 = 0;
-        int newY2 = 0;
-
-        vector<BoundingBox> tmpBboxList;
-        vector<int>         frameStampList;
-        for (int j = i - halfWindowSize; j <= i + halfWindowSize; j++)
-        {
-            tmpBboxList.push_back(bboxList[j]);
-            frameStampList.push_back(bboxList[j].frameStamp);
-        }
-
-        vector<int> frameIntervalList;
-        frameIntervalList.push_back(0); // 1st frame interval = 0
-        for (int i = 1; i < windowSize; i++)
-        {
-            int interval = frameStampList[i] - frameStampList[i - 1];
-            frameIntervalList.push_back(interval);
-        }
-
-        vector<vector<Point>> cornerPointList;
-        for (int i = 0; i < (int)tmpBboxList.size(); i++)
-        {
-            cornerPointList.push_back(tmpBboxList[i].getCornerPoints());
-        }
-
-        // 0:TL, 1:TR, 2:BL, 3:BR
-        vector<int> x1List;
-        vector<int> y1List;
-        vector<int> x2List;
-        vector<int> y2List;
-        for (int i = 0; i < (int)cornerPointList.size(); i++)
-        {
-            int frameInterval = frameIntervalList[i];
-            if (frameInterval > maxFrameInterval)
-            {
-                break; // ignore remain bounding boxes ...
-            }
-            x1List.push_back(cornerPointList[i][0].x);
-            y1List.push_back(cornerPointList[i][0].y);
-            x2List.push_back(cornerPointList[i][3].x);
-            y2List.push_back(cornerPointList[i][3].y);
-        }
-
-        vector<int>::iterator x1It_min;
-        vector<int>::iterator x1It_max;
-
-        vector<int>::iterator x2It_min;
-        vector<int>::iterator x2It_max;
-
-        vector<int>::iterator y1It;
-        vector<int>::iterator y2It;
-
-        x1It_min = std::min_element(x1List.begin(), x1List.end());
-        x1It_max = std::max_element(x1List.begin(), x1List.end());
-
-        x2It_min = std::min_element(x2List.begin(), x2List.end());
-        x2It_max = std::max_element(x2List.begin(), x2List.end());
-
-        y1It = std::min_element(y1List.begin(), y1List.end());
-        y2It = std::min_element(y2List.begin(), y2List.end());
-
-        // newX1 = int(((*x1It_min) + (*x1It_max)) * 0.5);
-        // newX2 = int(((*x2It_min) + (*x2It_max)) * 0.5);
-        // // newX2 = (*x2It_min);
-
-        // newY1 = (*y1It);
-        // // newX2 = (*x2It);
-        // // newY2 = (*y2It);
-        newX1 = utils::findMedian(x1List, x1List.size());
-        newX2 = utils::findMedian(x2List, x2List.size());
-        newY1 = utils::findMedian(y1List, y1List.size());
-        newY2 = utils::findMedian(y2List, y2List.size());
-
-        BoundingBox bbox = BoundingBox(newX1, newY1, newX2, newY2, bboxList[0].label);
-        procBboxList.push_back(bbox);
-    }
-}
+// DEPRECATED: Function using BoundingBox and Point removed
+// void smoothBBoxes(vector<BoundingBox> &bboxList, vector<BoundingBox> &procBboxList, int windowSize,
+//                   int maxFrameInterval)
+// {
+//     int numBbox        = bboxList.size();
+//     int halfWindowSize = (int)(windowSize * 0.5);
+//
+//     for (int i = halfWindowSize; i < numBbox - halfWindowSize; i += 1)
+//     {
+//         int newX1 = 0;
+//         int newY1 = 0;
+//         int newX2 = 0;
+//         int newY2 = 0;
+//
+//         vector<BoundingBox> tmpBboxList;
+//         vector<int>         frameStampList;
+//         for (int j = i - halfWindowSize; j <= i + halfWindowSize; j++)
+//         {
+//             tmpBboxList.push_back(bboxList[j]);
+//             frameStampList.push_back(bboxList[j].frameStamp);
+//         }
+//
+//         vector<int> frameIntervalList;
+//         frameIntervalList.push_back(0); // 1st frame interval = 0
+//         for (int i = 1; i < windowSize; i++)
+//         {
+//             int interval = frameStampList[i] - frameStampList[i - 1];
+//             frameIntervalList.push_back(interval);
+//         }
+//
+//         vector<vector<Point>> cornerPointList;
+//         for (int i = 0; i < (int)tmpBboxList.size(); i++)
+//         {
+//             cornerPointList.push_back(tmpBboxList[i].getCornerPoints());
+//         }
+//
+//         // 0:TL, 1:TR, 2:BL, 3:BR
+//         vector<int> x1List;
+//         vector<int> y1List;
+//         vector<int> x2List;
+//         vector<int> y2List;
+//         for (int i = 0; i < (int)cornerPointList.size(); i++)
+//         {
+//             int frameInterval = frameIntervalList[i];
+//             if (frameInterval > maxFrameInterval)
+//             {
+//                 break; // ignore remain bounding boxes ...
+//             }
+//             x1List.push_back(cornerPointList[i][0].x);
+//             y1List.push_back(cornerPointList[i][0].y);
+//             x2List.push_back(cornerPointList[i][3].x);
+//             y2List.push_back(cornerPointList[i][3].y);
+//         }
+//
+//         vector<int>::iterator x1It_min;
+//         vector<int>::iterator x1It_max;
+//
+//         vector<int>::iterator x2It_min;
+//         vector<int>::iterator x2It_max;
+//
+//         vector<int>::iterator y1It;
+//         vector<int>::iterator y2It;
+//
+//         x1It_min = std::min_element(x1List.begin(), x1List.end());
+//         x1It_max = std::max_element(x1List.begin(), x1List.end());
+//
+//         x2It_min = std::min_element(x2List.begin(), x2List.end());
+//         x2It_max = std::max_element(x2List.begin(), x2List.end());
+//
+//         y1It = std::min_element(y1List.begin(), y1List.end());
+//         y2It = std::min_element(y2List.begin(), y2List.end());
+//
+//         // newX1 = int(((*x1It_min) + (*x1It_max)) * 0.5);
+//         // newX2 = int(((*x2It_min) + (*x2It_max)) * 0.5);
+//         // // newX2 = (*x2It_min);
+//
+//         // newY1 = (*y1It);
+//         // // newX2 = (*x2It);
+//         // // newY2 = (*y2It);
+//         newX1 = utils::findMedian(x1List, x1List.size());
+//         newX2 = utils::findMedian(x2List, x2List.size());
+//         newY1 = utils::findMedian(y1List, y1List.size());
+//         newY2 = utils::findMedian(y2List, y2List.size());
+//
+//         BoundingBox bbox = BoundingBox(newX1, newY1, newX2, newY2, bboxList[0].label);
+//         procBboxList.push_back(bbox);
+//     }
+// }
 
 //
 //
@@ -930,19 +932,20 @@ std::pair<std::string, float> extractDeviceInfoFromFilename(const std::string &f
     return {"", 0.0f};
 }
 
-bool isLineIntersectingBox(const cv::Point& p1, const cv::Point& p2, const BoundingBox& box) {
-    // Convert box to line segments
-    cv::Point topLeft(box.x1, box.y1);
-    cv::Point topRight(box.x2, box.y1);
-    cv::Point bottomLeft(box.x1, box.y2);
-    cv::Point bottomRight(box.x2, box.y2);
-
-    // Check intersection with all 4 sides of the box
-    return (utils::doLinesIntersect(p1, p2, topLeft, topRight) ||     // Top
-            utils::doLinesIntersect(p1, p2, topRight, bottomRight) || // Right
-            utils::doLinesIntersect(p1, p2, bottomLeft, bottomRight) ||// Bottom
-            utils::doLinesIntersect(p1, p2, topLeft, bottomLeft));     // Left
-}
+// DEPRECATED: Function using BoundingBox removed
+// bool isLineIntersectingBox(const cv::Point& p1, const cv::Point& p2, const BoundingBox& box) {
+//     // Convert box to line segments
+//     cv::Point topLeft(box.x1, box.y1);
+//     cv::Point topRight(box.x2, box.y1);
+//     cv::Point bottomLeft(box.x1, box.y2);
+//     cv::Point bottomRight(box.x2, box.y2);
+//
+//     // Check intersection with all 4 sides of the box
+//     return (utils::doLinesIntersect(p1, p2, topLeft, topRight) ||     // Top
+//             utils::doLinesIntersect(p1, p2, topRight, bottomRight) || // Right
+//             utils::doLinesIntersect(p1, p2, bottomLeft, bottomRight) ||// Bottom
+//             utils::doLinesIntersect(p1, p2, topLeft, bottomLeft));     // Left
+// }
 
 bool doLinesIntersect(const cv::Point& p1, const cv::Point& p2, 
                         const cv::Point& p3, const cv::Point& p4) {

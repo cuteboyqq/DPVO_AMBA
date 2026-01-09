@@ -189,23 +189,24 @@ void calcNonLinearEquation(std::vector<cv::Point>& pList, float& a, float& b, fl
 }
 
 
-int checkPointOnWhichLineSide(Point& p, std::vector<float>& linearEquation)
-{
-    // Slope (m)
-    float m = linearEquation[0];
-
-    // Intercept (b)
-    float b = linearEquation[1];
-
-    float res = p.x * m + b;
-
-    if (res > 0)
-        return 0; // left side
-    else if (res == 0)
-        return -1; // on the line
-    else
-        return 1; // right side
-}
+// DEPRECATED: Function using Point removed
+// int checkPointOnWhichLineSide(Point& p, std::vector<float>& linearEquation)
+// {
+//     // Slope (m)
+//     float m = linearEquation[0];
+//
+//     // Intercept (b)
+//     float b = linearEquation[1];
+//
+//     float res = p.x * m + b;
+//
+//     if (res > 0)
+//         return 0; // left side
+//     else if (res == 0)
+//         return -1; // on the line
+//     else
+//         return 1; // right side
+// }
 
 int checkPointOnWhichLineSide(cv::Point& p, cv::Point& pA, cv::Point& pB)
 {
@@ -257,16 +258,17 @@ cv::Point getIntersectionPoint(float m1, float c1, float m2, float c2)
     return cv::Point(std::max(0.0f, x), std::max(0.0f, y));
 }
 
-float calcEuclideanDistance(Point& pA, Point& pB)
-{
-    if (pB.x == -1 && pB.y == -1)
-        return -1.0f; // Invalid point
-
-    int dx = pA.x - pB.x;
-    int dy = pA.y - pB.y;
-
-    return std::sqrt(static_cast<float>(dx * dx + dy * dy));
-}
+// DEPRECATED: Function using Point removed
+// float calcEuclideanDistance(Point& pA, Point& pB)
+// {
+//     if (pB.x == -1 && pB.y == -1)
+//         return -1.0f; // Invalid point
+//
+//     int dx = pA.x - pB.x;
+//     int dy = pA.y - pB.y;
+//
+//     return std::sqrt(static_cast<float>(dx * dx + dy * dy));
+// }
 
 float calcEuclideanDistance(cv::Point& pA, cv::Point& pB)
 {
@@ -448,22 +450,23 @@ void removeSmallContour(cv::Mat& src, cv::Mat& dst, int sizeThreshold)
         cv::drawContours(dst, std::vector<std::vector<cv::Point>>{contour}, 0, cv::Scalar(255), -1, cv::LINE_8);
 }
 
-float getBboxOverlapRatio(BoundingBox& boxA, BoundingBox& boxB)
-{
-    int iouX = std::max(boxA.x1, boxB.x1);
-    int iouY = std::max(boxA.y1, boxB.y1);
-    int iouW = std::min(boxA.x2, boxB.x2) - iouX;
-    int iouH = std::min(boxA.y2, boxB.y2) - iouY;
-    iouW     = std::max(iouW, 0);
-    iouH     = std::max(iouH, 0);
-
-    if (boxA.getArea() == 0)
-        return 0.0f;
-
-    float iouArea  = static_cast<float>(iouW * iouH);
-    float boxAArea = static_cast<float>(boxA.getArea());
-    return iouArea / boxAArea;
-}
+// DEPRECATED: Function using BoundingBox removed
+// float getBboxOverlapRatio(BoundingBox& boxA, BoundingBox& boxB)
+// {
+//     int iouX = std::max(boxA.x1, boxB.x1);
+//     int iouY = std::max(boxA.y1, boxB.y1);
+//     int iouW = std::min(boxA.x2, boxB.x2) - iouX;
+//     int iouH = std::min(boxA.y2, boxB.y2) - iouY;
+//     iouW     = std::max(iouW, 0);
+//     iouH     = std::max(iouH, 0);
+//
+//     if (boxA.getArea() == 0)
+//         return 0.0f;
+//
+//     float iouArea  = static_cast<float>(iouW * iouH);
+//     float boxAArea = static_cast<float>(boxA.getArea());
+//     return iouArea / boxAArea;
+// }
 
 void roundedRectangle(cv::Mat& src, const cv::Point& topLeft, const cv::Point& bottomRight, const cv::Scalar& lineColor,
                       int thickness, int lineType, int cornerRadius, bool filled)
@@ -612,60 +615,60 @@ cv::Scalar getPoseColor(const std::string& action)
     return {255,255,255}; // default white
 }
 
-void drawSkeletonAction(cv::Mat& src, BoundingBox& box, const cv::Scalar& color)
-{
-    if (box.skeletonAction.empty())
-    {   
-        // std::cout<<"No skeletonAction!!"<<std::endl;
-        return; // nothing to draw
-    } 
+// void drawSkeletonAction(cv::Mat& src, BoundingBox& box, const cv::Scalar& color)
+// {
+//     if (box.skeletonAction.empty())
+//     {   
+//         // std::cout<<"No skeletonAction!!"<<std::endl;
+//         return; // nothing to draw
+//     } 
 
-    // Choose a position slightly above the top-left corner of the box
-    cv::Point textOrg(box.x1 + 20, box.y1 - 20); // 5 pixels above the box
+//     // Choose a position slightly above the top-left corner of the box
+//     cv::Point textOrg(box.x1 + 20, box.y1 - 20); // 5 pixels above the box
 
-    cv::Scalar _color = getPoseColor(box.skeletonAction);
+//     cv::Scalar _color = getPoseColor(box.skeletonAction);
 
-    // Draw the text on m_displayImg
-    cv::putText(
-        src,               // Image
-        box.skeletonAction,         // Text to draw
-        textOrg,                    // Bottom-left corner of text
-        cv::FONT_HERSHEY_SIMPLEX,   // Font
-        0.7,                        // Font scale
-        _color,                      // Color
-        2,                          // Thickness
-        cv::LINE_AA                 // Line type
-    );
-    // === Fall Down Warning Overlay ===
-    bool draw_warning = false;
-    bool draw_red_rect = false;
-    if ( (box.skeletonAction == "fall_down" || box.skeletonAction == "falling") && draw_red_rect)
-    {
-        // Draw a red rectangle around the entire frame
-        cv::rectangle(src, cv::Point(50, 50), 
-                           cv::Point(src.cols - 50, src.rows - 50), 
-                           cv::Scalar(0, 0, 255), 50); // Thick red border
+//     // Draw the text on m_displayImg
+//     cv::putText(
+//         src,               // Image
+//         box.skeletonAction,         // Text to draw
+//         textOrg,                    // Bottom-left corner of text
+//         cv::FONT_HERSHEY_SIMPLEX,   // Font
+//         0.7,                        // Font scale
+//         _color,                      // Color
+//         2,                          // Thickness
+//         cv::LINE_AA                 // Line type
+//     );
+//     // === Fall Down Warning Overlay ===
+//     bool draw_warning = false;
+//     bool draw_red_rect = false;
+//     if ( (box.skeletonAction == "fall_down" || box.skeletonAction == "falling") && draw_red_rect)
+//     {
+//         // Draw a red rectangle around the entire frame
+//         cv::rectangle(src, cv::Point(50, 50), 
+//                            cv::Point(src.cols - 50, src.rows - 50), 
+//                            cv::Scalar(0, 0, 255), 50); // Thick red border
 
-        // Big warning text in center of frame
-        std::string warning = "!!! FALL DOWN WARNING !!!";
-        int fontFace = cv::FONT_HERSHEY_DUPLEX;
-        double fontScale = 4.0;
-        int thickness = 6;
-        int baseline = 0;
+//         // Big warning text in center of frame
+//         std::string warning = "!!! FALL DOWN WARNING !!!";
+//         int fontFace = cv::FONT_HERSHEY_DUPLEX;
+//         double fontScale = 4.0;
+//         int thickness = 6;
+//         int baseline = 0;
 
-        cv::Size textSize = cv::getTextSize(warning, fontFace, fontScale, thickness, &baseline);
-        cv::Point textOrg(
-            (src.cols - textSize.width) / 2,
-            (src.rows + textSize.height) / 2
-        );
-        if(draw_warning)
-        {
-             cv::putText(src, warning, textOrg, fontFace, fontScale,
-                    cv::Scalar(0, 0, 255), thickness, cv::LINE_AA);
-        }
+//         cv::Size textSize = cv::getTextSize(warning, fontFace, fontScale, thickness, &baseline);
+//         cv::Point textOrg(
+//             (src.cols - textSize.width) / 2,
+//             (src.rows + textSize.height) / 2
+//         );
+//         if(draw_warning)
+//         {
+//              cv::putText(src, warning, textOrg, fontFace, fontScale,
+//                     cv::Scalar(0, 0, 255), thickness, cv::LINE_AA);
+//         }
        
-    }
-}
+//     }
+// }
 
 
 void efficientRectangle(cv::Mat& src, const cv::Point& topLeft, const cv::Point& bottomRight,
@@ -748,30 +751,32 @@ void erode(cv::Mat& img, int kernelSize)
     cv::erode(img, img, kernel);
 }
 
-void cropImages(cv::Mat& img, cv::Mat& imgCrop, BoundingBox& box)
-{
-    int x1 = std::max(box.x1, 0);
-    int y1 = std::max(box.y1, 0);
-    int x2 = std::min(box.x2, img.cols);
-    int y2 = std::min(box.y2, img.rows);
+// DEPRECATED: Function using BoundingBox removed
+// void cropImages(cv::Mat& img, cv::Mat& imgCrop, BoundingBox& box)
+// {
+//     int x1 = std::max(box.x1, 0);
+//     int y1 = std::max(box.y1, 0);
+//     int x2 = std::min(box.x2, img.cols);
+//     int y2 = std::min(box.y2, img.rows);
+//
+//     int w = x2 - x1;
+//     int h = y2 - y1;
+//
+//     cv::Rect roi(x1, y1, w, h);
+//     img(roi).copyTo(imgCrop);
+// }
 
-    int w = x2 - x1;
-    int h = y2 - y1;
-
-    cv::Rect roi(x1, y1, w, h);
-    img(roi).copyTo(imgCrop);
-}
-
-float calcDistanceToCamera(float focalLen, float camHeight, int yVanish, BoundingBox& rescaledBox)
-{
-    cv::Point pAnchor;
-    pAnchor.x = rescaledBox.getCenterPoint().x;
-    pAnchor.y = rescaledBox.getCenterPoint().y + static_cast<int>(rescaledBox.getHeight() / 2);
-    int yDiff = std::max(pAnchor.y - yVanish, 1);
-
-    // Geometric Based Formula
-    return (focalLen * camHeight) / static_cast<float>(yDiff);
-}
+// DEPRECATED: Function using BoundingBox removed
+// float calcDistanceToCamera(float focalLen, float camHeight, int yVanish, BoundingBox& rescaledBox)
+// {
+//     cv::Point pAnchor;
+//     pAnchor.x = rescaledBox.getCenterPoint().x;
+//     pAnchor.y = rescaledBox.getCenterPoint().y + static_cast<int>(rescaledBox.getHeight() / 2);
+//     int yDiff = std::max(pAnchor.y - yVanish, 1);
+//
+//     // Geometric Based Formula
+//     return (focalLen * camHeight) / static_cast<float>(yDiff);
+// }
 
 // Utility function to find orientation of ordered triplet (p, q, r).
 // The function returns:
@@ -831,61 +836,62 @@ bool isLinesIntersected(const cv::Point& p1, const cv::Point& q1, const cv::Poin
     return false;
 }
 
-int getIntersectArea(const BoundingBox& a, const BoundingBox& b)
-{
-    /*
-        calculate intersection area as the product of intersection_w and intersection_h
-
-        if intersection_w or intersection_h is 0, the intersection area and iou will always be 0.
-        speed up by returning area as 0 instantly
-    */
-
-    // don't change the ordering
-    // auto logger         = spdlog::get(m_loggerStr);
-    int intersection_w = std::min(a.x2, b.x2) - std::max(a.x1, b.x1);
-    if (intersection_w <= 0)
-    {
-        // intersection_w is 0 so area will be 0
-        return 0;
-    }
-
-    // don't change the ordering
-    int intersection_h = std::min(a.y2, b.y2) - std::max(a.y1, b.y1);
-    if (intersection_h <= 0)
-    {
-        // intersection_w is 0 so area will be 0
-        return 0;
-    }
-
-    // both intersection_w and intersection_h > 0, so intersection_area will be > 0
-    return intersection_w * intersection_h;
-}
-
-float getArea(const BoundingBox& box)
-{
-    return (box.x2 - box.x1) * (box.y2 - box.y1);
-}
-
-float iou(const BoundingBox& a, const BoundingBox& b)
-{
-    /***
-    *  iou: return the intersection over union ratio between rectangle a and b
-    ***/
-    // auto logger            = spdlog::get(m_loggerStr);
-    int intersection_area = getIntersectArea(a, b);
-    if (intersection_area == 0)
-    {
-        // when intersection_area is 0. speed up by returning iou 0.0 instantly
-        return 0.0;
-    }
-
-    // area is now a member of v8xyxy. no need to repeat area calculation
-    // float iou = (float)intersection_area / (float)(a.area + b.area - intersection_area);
-    float iou = (float)intersection_area / (float)(getArea(a) + getArea(b) - intersection_area);
-    // avoid division by zero
-    // float iou               = (float) intersection_area / (float) (a.area + b.area - intersection_area + 1 );
-    return iou;
-}
+// DEPRECATED: Functions using BoundingBox removed
+// int getIntersectArea(const BoundingBox& a, const BoundingBox& b)
+// {
+//     /*
+//         calculate intersection area as the product of intersection_w and intersection_h
+//
+//         if intersection_w or intersection_h is 0, the intersection area and iou will always be 0.
+//         speed up by returning area as 0 instantly
+//     */
+//
+//     // don't change the ordering
+//     // auto logger         = spdlog::get(m_loggerStr);
+//     int intersection_w = std::min(a.x2, b.x2) - std::max(a.x1, b.x1);
+//     if (intersection_w <= 0)
+//     {
+//         // intersection_w is 0 so area will be 0
+//         return 0;
+//     }
+//
+//     // don't change the ordering
+//     int intersection_h = std::min(a.y2, b.y2) - std::max(a.y1, b.y1);
+//     if (intersection_h <= 0)
+//     {
+//         // intersection_w is 0 so area will be 0
+//         return 0;
+//     }
+//
+//     // both intersection_w and intersection_h > 0, so intersection_area will be > 0
+//     return intersection_w * intersection_h;
+// }
+//
+// float getArea(const BoundingBox& box)
+// {
+//     return (box.x2 - box.x1) * (box.y2 - box.y1);
+// }
+//
+// float iou(const BoundingBox& a, const BoundingBox& b)
+// {
+//     /***
+//     *  iou: return the intersection over union ratio between rectangle a and b
+//     ***/
+//     // auto logger            = spdlog::get(m_loggerStr);
+//     int intersection_area = getIntersectArea(a, b);
+//     if (intersection_area == 0)
+//     {
+//         // when intersection_area is 0. speed up by returning iou 0.0 instantly
+//         return 0.0;
+//     }
+//
+//     // area is now a member of v8xyxy. no need to repeat area calculation
+//     // float iou = (float)intersection_area / (float)(a.area + b.area - intersection_area);
+//     float iou = (float)intersection_area / (float)(getArea(a) + getArea(b) - intersection_area);
+//     // avoid division by zero
+//     // float iou               = (float) intersection_area / (float) (a.area + b.area - intersection_area + 1 );
+//     return iou;
+// }
 
 
 /**
@@ -3357,31 +3363,32 @@ void drawPoints(
     imgUtil::PoseKeyPoints(image, keypoints, color, 5);    
 }
 
-void drawLanePoints(
-    const BoundingBox& box,
-    int modelWidth,
-    int modelHeight,
-    int imgWidth,
-    int imgHeight,
-    cv::Mat& image,
-    cv::Scalar color)
-{
-    // Calculate scaling factors
-    float scaleX = static_cast<float>(imgWidth) / modelWidth;
-    float scaleY = static_cast<float>(imgHeight) / modelHeight;
-    
-    // Scale and convert points
-    std::vector<std::pair<int, int>> scaledPoints;
-    
-    for (const auto& point : box.pose_kpts)
-    {
-        int scaledX = static_cast<int>(point.first * scaleX);
-        int scaledY = static_cast<int>(point.second * scaleY);
-        scaledPoints.emplace_back(scaledX, scaledY);
-    }
-    
-    imgUtil::PoseKeyPoints(image, scaledPoints, color, 3);
-}
+// DEPRECATED: Function using BoundingBox removed
+// void drawLanePoints(
+//     const BoundingBox& box,
+//     int modelWidth,
+//     int modelHeight,
+//     int imgWidth,
+//     int imgHeight,
+//     cv::Mat& image,
+//     cv::Scalar color)
+// {
+//     // Calculate scaling factors
+//     float scaleX = static_cast<float>(imgWidth) / modelWidth;
+//     float scaleY = static_cast<float>(imgHeight) / modelHeight;
+//     
+//     // Scale and convert points
+//     std::vector<std::pair<int, int>> scaledPoints;
+//     
+//     for (const auto& point : box.pose_kpts)
+//     {
+//         int scaledX = static_cast<int>(point.first * scaleX);
+//         int scaledY = static_cast<int>(point.second * scaleY);
+//         scaledPoints.emplace_back(scaledX, scaledY);
+//     }
+//     
+//     imgUtil::PoseKeyPoints(image, scaledPoints, color, 3);
+// }
 
 void drawLanePoints(
     const std::vector<cv::Point>& leftPoints,

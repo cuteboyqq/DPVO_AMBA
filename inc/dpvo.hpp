@@ -150,7 +150,7 @@ private:
     int m_fmap1_H, m_fmap1_W;
     int m_fmap2_H, m_fmap2_W;
     int m_maxEdge;   // Maximum edge count for model input (default: 384, can be changed)
-    
+
     float* m_imap; // (self.pmem, self.M, DIM, **kwargs)
     float* m_gmap; // (self.pmem, self.M, 128, self.P, self.P, **kwargs)
     float* m_fmap1; // (1, self.mem, 128, ht // 1, wd // 1, **kwargs)

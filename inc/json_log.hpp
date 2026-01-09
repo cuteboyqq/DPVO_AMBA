@@ -18,7 +18,8 @@
 #include <fstream>
 #include <vector>
 #include "nlohmann/json.hpp"  // Make sure this path is correct
-#include "bounding_box.hpp"
+// DEPRECATED: bounding_box.hpp removed
+// #include "bounding_box.hpp"
 #include "dataStructures.h"
 #include "config_reader.hpp"
 constexpr int NUM_POINTS = 3;
@@ -32,13 +33,14 @@ public:
     JSON_LOG(std::string file, Config_S* m_config);
     ~JSON_LOG();
 
-    std::string logInfo(WNC_APP_Results appResult, 
-                                std::vector<BoundingBox> humanBBoxList,
-                                std::vector<BoundingBox> vehicleBBoxList, 
-                                std::vector<Object> trackedObjList,
-                                int frameIdx, 
-                                DebugProfile debugProfile,
-                                char* version);
+    // DEPRECATED: Function using BoundingBox and Object removed
+    // std::string logInfo(WNC_APP_Results appResult, 
+    //                             std::vector<BoundingBox> humanBBoxList,
+    //                             std::vector<BoundingBox> vehicleBBoxList, 
+    //                             std::vector<Object> trackedObjList,
+    //                             int frameIdx, 
+    //                             DebugProfile debugProfile,
+    //                             char* version);
     
     bool m_bSaveDetObjLog  = false;
 
