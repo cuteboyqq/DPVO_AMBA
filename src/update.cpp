@@ -16,7 +16,7 @@
 // =================================================================================================
 
 DPVOUpdate::DPVOUpdate(Config_S *config, WakeCallback wakeFunc)
-    : m_maxEdge(768),  // Initialize max edge count (change this value to modify model input size)
+    : m_maxEdge(360),  // Initialize max edge count (matches MAX_EDGES = 360)
       m_netBufferSize(1 * 384 * m_maxEdge * 1),
       m_inpBufferSize(1 * 384 * m_maxEdge * 1),
       m_corrBufferSize(1 * 882 * m_maxEdge * 1),
@@ -60,9 +60,9 @@ DPVOUpdate::DPVOUpdate(Config_S *config, WakeCallback wakeFunc)
     m_netBuff = new float[m_netBufferSize];
     m_inpBuff = new float[m_inpBufferSize];
     m_corrBuff = new float[m_corrBufferSize];
-    m_iiBuff = new int32_t[m_iiBufferSize];
-    m_jjBuff = new int32_t[m_jjBufferSize];
-    m_kkBuff = new int32_t[m_kkBufferSize];
+    m_iiBuff = new float[m_iiBufferSize];
+    m_jjBuff = new float[m_jjBufferSize];
+    m_kkBuff = new float[m_kkBufferSize];
 
     // Allocate working buffers for output data
     m_netOutBuff = new float[m_netOutBufferSize];
@@ -349,7 +349,7 @@ bool DPVOUpdate::_releaseTensorBuffers()
 // Synchronous Inference (Public API)
 // =================================================================================================
 bool DPVOUpdate::runInference(float *netData, float *inpData, float *corrData,
-                              int32_t *iiData, int32_t *jjData, int32_t *kkData,
+                              float *iiData, float *jjData, float *kkData,
                               int frameIdx, DPVOUpdate_Prediction &pred)
 {
     // Reset prediction structure
@@ -379,7 +379,7 @@ bool DPVOUpdate::runInference(float *netData, float *inpData, float *corrData,
 // Inference Entrypoint (Internal)
 // =================================================================================================
 bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
-                      int32_t *iiData, int32_t *jjData, int32_t *kkData, int frameIdx)
+                      float *iiData, float *jjData, float *kkData, int frameIdx)
 {
     auto logger = spdlog::get("dpvo_update");
     if (!logger) {
@@ -504,6 +504,51 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
             return false;
         }
 
+        // Diagnostic: Check tensor shapes and raw data before copying
+        if (logger) {
+            const size_t* shape0 = ea_tensor_shape(m_outputTensors[0]);
+            const size_t* shape1 = ea_tensor_shape(m_outputTensors[1]);
+            const size_t* shape2 = ea_tensor_shape(m_outputTensors[2]);
+            
+            logger->info("\033[35mDPVOUpdate::_run: Output tensor shapes - tensor0=[{}x{}x{}x{}], tensor1=[{}x{}x{}x{}], tensor2=[{}x{}x{}x{}]\033[0m",
+                         shape0[EA_N], shape0[EA_C], shape0[EA_H], shape0[EA_W],
+                         shape1[EA_N], shape1[EA_C], shape1[EA_H], shape1[EA_W],
+                         shape2[EA_N], shape2[EA_C], shape2[EA_H], shape2[EA_W]);
+            
+            // Check raw weight tensor data (tensor2) before copying
+            float* raw_wOut = (float*)tensor2_data;
+            float raw_w_min = std::numeric_limits<float>::max();
+            float raw_w_max = std::numeric_limits<float>::lowest();
+            size_t raw_w_zero_count = 0;
+            size_t raw_w_nonzero_count = 0;
+            for (size_t i = 0; i < m_wOutBufferSize; i++) {
+                float val = raw_wOut[i];
+                if (val < raw_w_min) raw_w_min = val;
+                if (val > raw_w_max) raw_w_max = val;
+                if (val == 0.0f) raw_w_zero_count++;
+                else raw_w_nonzero_count++;
+            }
+            logger->info("\033[35mDPVOUpdate::_run: Raw weight tensor (tensor2) BEFORE copy - size={}, range=[{}, {}], zero_count={}, nonzero_count={}\033[0m",
+                         m_wOutBufferSize, raw_w_min, raw_w_max, raw_w_zero_count, raw_w_nonzero_count);
+            logger->info("\033[35mDPVOUpdate::_run: Raw weight tensor first 10 values: [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]\033[0m",
+                         (m_wOutBufferSize > 0 ? raw_wOut[0] : 0.0f),
+                         (m_wOutBufferSize > 1 ? raw_wOut[1] : 0.0f),
+                         (m_wOutBufferSize > 2 ? raw_wOut[2] : 0.0f),
+                         (m_wOutBufferSize > 3 ? raw_wOut[3] : 0.0f),
+                         (m_wOutBufferSize > 4 ? raw_wOut[4] : 0.0f),
+                         (m_wOutBufferSize > 5 ? raw_wOut[5] : 0.0f),
+                         (m_wOutBufferSize > 6 ? raw_wOut[6] : 0.0f),
+                         (m_wOutBufferSize > 7 ? raw_wOut[7] : 0.0f),
+                         (m_wOutBufferSize > 8 ? raw_wOut[8] : 0.0f),
+                         (m_wOutBufferSize > 9 ? raw_wOut[9] : 0.0f));
+            
+            // WARNING: Model is outputting all zeros for weights
+            if (raw_w_nonzero_count == 0) {
+                logger->warn("\033[33mDPVOUpdate::_run: WARNING - Model is outputting all zeros for weights (tensor2). This is a MODEL issue, not a code issue.\033[0m");
+                logger->warn("\033[33mDPVOUpdate::_run: Possible causes: 1) Model weights not trained properly, 2) ONNX/AMBA conversion issue, 3) Model architecture issue\033[0m");
+            }
+        }
+
         // Copy output tensors to prediction buffers
         std::memcpy(m_pred.netOutBuff, (float *)tensor0_data, m_netOutBufferSize * sizeof(float));
         std::memcpy(m_pred.dOutBuff, (float *)tensor1_data, m_dOutBufferSize * sizeof(float));
@@ -564,7 +609,7 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
                 size_t w_idx0 = e;  // First weight value for edge e
                 size_t w_idx1 = m_maxEdge + e;  // Second weight value for edge e
                 
-                logger->info("\033[34m  Edge[{}]: delta=[{}, {}], weight=[{}, {}]\033[0m",
+                logger->info("\033[34m  Edge[{}]: delta=[{:.6f}, {:.6f}], weight=[{:.6f}, {:.6f}]\033[0m",
                              e, 
                              (d_idx0 < m_dOutBufferSize ? dOut[d_idx0] : 0.0f),
                              (d_idx1 < m_dOutBufferSize ? dOut[d_idx1] : 0.0f),
@@ -598,7 +643,7 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
 // Load Inputs
 // =================================================================================================
 bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
-                            int32_t *iiData, int32_t *jjData, int32_t *kkData)
+                            float *iiData, float *jjData, float *kkData)
 {
     auto logger = spdlog::get("dpvo_update");
     if (!logger) {
@@ -620,9 +665,9 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     std::memcpy(m_netBuff, netData, m_netBufferSize * sizeof(float));
     std::memcpy(m_inpBuff, inpData, m_inpBufferSize * sizeof(float));
     std::memcpy(m_corrBuff, corrData, m_corrBufferSize * sizeof(float));
-    std::memcpy(m_iiBuff, iiData, m_iiBufferSize * sizeof(int32_t));
-    std::memcpy(m_jjBuff, jjData, m_jjBufferSize * sizeof(int32_t));
-    std::memcpy(m_kkBuff, kkData, m_kkBufferSize * sizeof(int32_t));
+    std::memcpy(m_iiBuff, iiData, m_iiBufferSize * sizeof(float));
+    std::memcpy(m_jjBuff, jjData, m_jjBufferSize * sizeof(float));
+    std::memcpy(m_kkBuff, kkData, m_kkBufferSize * sizeof(float));
 
     // Log input data statistics and first 10 values
     if (logger) {
@@ -724,15 +769,13 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     }
     
 
-    // Copy float tensors
+    // Copy float tensors (all inputs are now float)
     std::memcpy(net_data, m_netBuff, m_netBufferSize * sizeof(float));
     std::memcpy(inp_data, m_inpBuff, m_inpBufferSize * sizeof(float));
     std::memcpy(corr_data, m_corrBuff, m_corrBufferSize * sizeof(float));
-
-    // Copy int32 tensors
-    std::memcpy(ii_data, m_iiBuff, m_iiBufferSize * sizeof(int32_t));
-    std::memcpy(jj_data, m_jjBuff, m_jjBufferSize * sizeof(int32_t));
-    std::memcpy(kk_data, m_kkBuff, m_kkBufferSize * sizeof(int32_t));
+    std::memcpy(ii_data, m_iiBuff, m_iiBufferSize * sizeof(float));
+    std::memcpy(jj_data, m_jjBuff, m_jjBufferSize * sizeof(float));
+    std::memcpy(kk_data, m_kkBuff, m_kkBufferSize * sizeof(float));
     
     // Sync input tensors from CPU to VP (required when using ea_tensor_data instead of ea_tensor_data_for_write)
 #if defined(CV28)
@@ -762,7 +805,7 @@ void DPVOUpdate::updateTensorPath(const std::string &path)
 void DPVOUpdate::runThread() {}
 void DPVOUpdate::stopThread() {}
 void DPVOUpdate::updateInputData(float* netData, float* inpData, float* corrData, 
-                                 int32_t* iiData, int32_t* jjData, int32_t* kkData, int frameIdx) {}
+                                 float* iiData, float* jjData, float* kkData, int frameIdx) {}
 void DPVOUpdate::notifyProcessingComplete() {}
 bool DPVOUpdate::getLastestPrediction(DPVOUpdate_Prediction& pred, int& frameIdx) { return false; }
 bool DPVOUpdate::isInputBufferEmpty() const { return true; }
@@ -789,12 +832,12 @@ int DPVOUpdate::reshapeInput(
     int D,
     int P,
     // Output buffers (pre-allocated, reused)
-    std::vector<float>& net_input,
-    std::vector<float>& inp_input,
-    std::vector<float>& corr_input,
-    std::vector<int32_t>& ii_input,
-    std::vector<int32_t>& jj_input,
-    std::vector<int32_t>& kk_input,
+        std::vector<float>& net_input,
+        std::vector<float>& inp_input,
+        std::vector<float>& corr_input,
+        std::vector<float>& ii_input,
+        std::vector<float>& jj_input,
+        std::vector<float>& kk_input,
     const int MODEL_EDGE_COUNT,
     const int CORR_DIM)
 {
@@ -805,17 +848,17 @@ int DPVOUpdate::reshapeInput(
     net_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
     inp_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
     corr_input.resize(1 * CORR_DIM * MODEL_EDGE_COUNT * 1, 0.0f);
-    ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
-    jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
-    kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0);
+    ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
+    jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
+    kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
     
     // Zero-fill buffers (faster than resize with value)
     std::fill(net_input.begin(), net_input.end(), 0.0f);
     std::fill(inp_input.begin(), inp_input.end(), 0.0f);
     std::fill(corr_input.begin(), corr_input.end(), 0.0f);
-    std::fill(ii_input.begin(), ii_input.end(), 0);
-    std::fill(jj_input.begin(), jj_input.end(), 0);
-    std::fill(kk_input.begin(), kk_input.end(), 0);
+    std::fill(ii_input.begin(), ii_input.end(), 0.0f);
+    std::fill(jj_input.begin(), jj_input.end(), 0.0f);
+    std::fill(kk_input.begin(), kk_input.end(), 0.0f);
     
     // Check net state before copying
     int net_zero_count = 0;
@@ -845,14 +888,14 @@ int DPVOUpdate::reshapeInput(
         }
     }
     
-    // Reshape net and inp data: [num_active, 384] -> [1, 384, 384, 1]
+    // Reshape net and inp data: [num_active, 384] -> [1, 384, 360, 1] (384=NET_DIM, 360=MAX_EDGES)
     for (int e = 0; e < num_edges_to_process; e++) {
         // Validate edge index
         if (e < 0 || e >= num_active) {
             continue;
         }
         for (int d = 0; d < 384; d++) {
-            // YAML layout: [N, C, H, W] = [1, 384, 384, 1]
+            // YAML layout: [N, C, H, W] = [1, 384, 360, 1] (384=NET_DIM channels, 360=MAX_EDGES)
             // Index calculation: n * C * H * W + c * H * W + h * W + w
             // For net/inp: n=0, c=d (channel), h=e (edge index), w=0
             int idx = 0 * 384 * MODEL_EDGE_COUNT * 1 + d * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
@@ -869,7 +912,7 @@ int DPVOUpdate::reshapeInput(
     float corr_input_min = *std::min_element(corr_input.begin(), corr_input.end());
     float corr_input_max = *std::max_element(corr_input.begin(), corr_input.end());
     
-    // Reshape correlation: [num_active, D, D, P, P, 2] -> [1, 882, 384, 1]
+    // Reshape correlation: [num_active, D, D, P, P, 2] -> [1, 882, 360, 1]
     const int target_corr_dim = CORR_DIM; // 882
     const int D_target = 7;  // Target window size for model (7×7 instead of 8×8)
     const int offset = (D - D_target) / 2;  // Center offset: (8-7)/2 = 0 (integer division)
@@ -913,8 +956,8 @@ int DPVOUpdate::reshapeInput(
                                 continue;
                             }
                             
-                            // YAML layout: [N, C, H, W] = [1, 882, 384, 1]
-                            // Model expects: [1, 882, 384, 1] where 882 = 2 * 7 * 7 * 3 * 3
+                            // YAML layout: [N, C, H, W] = [1, 882, 360, 1]
+                            // Model expects: [1, 882, 360, 1] where 882 = 2 * 7 * 7 * 3 * 3, 360 = MAX_EDGES
                             // Index calculation: n * C * H * W + c * H * W + h * W + w
                             // Where: n=0, c=dst_corr_idx (feature index), h=e (edge index), w=0
                             int dst_corr_idx = c * D_target * D_target * P * P +
@@ -923,7 +966,7 @@ int DPVOUpdate::reshapeInput(
                                               pi * P + pj;
                             
                             if (dst_corr_idx < target_corr_dim) {
-                                // [N, C, H, W] = [1, 882, 384, 1]
+                                // [N, C, H, W] = [1, 882, 360, 1]
                                 int idx = 0 * CORR_DIM * MODEL_EDGE_COUNT * 1 + 
                                          dst_corr_idx * MODEL_EDGE_COUNT * 1 + 
                                          e * 1 + 
@@ -947,8 +990,8 @@ int DPVOUpdate::reshapeInput(
         // Rest of CORR_DIM is zero-padded (already initialized to 0)
     }
     
-    // Copy indices: [num_active] -> [1, 1, 384, 1] (YAML now specifies 4D shape)
-    // AMBA tensor shape: [N, C, H, W] = [1, 1, 384, 1]
+    // Copy indices: [num_active] -> [1, 1, 360, 1] (YAML now specifies 4D shape)
+    // AMBA tensor shape: [N, C, H, W] = [1, 1, 360, 1]
     // CRITICAL: For zero-padded edges, we need to set valid indices to prevent
     // neighbors_tensor from producing invalid gather indices that cause AMBA CV28 to fail.
     // Strategy: Duplicate the last valid edge's indices for all zero-padded edges.
@@ -956,7 +999,7 @@ int DPVOUpdate::reshapeInput(
     // Get last valid indices for padding (if we have valid edges)
     // CRITICAL: Ensure all indices are non-negative, especially kk which can become negative
     // after keyframe removal (m_kk[e] -= PatchGraph::M)
-    int32_t last_ii = 0, last_jj = 0, last_kk = 0;
+    float last_ii = 0.0f, last_jj = 0.0f, last_kk = 0.0f;
     if (num_edges_to_process > 0 && num_active > 0) {
         // Find the last valid edge with non-negative kk
         int last_valid_e = -1;
@@ -968,69 +1011,69 @@ int DPVOUpdate::reshapeInput(
         }
         
         if (last_valid_e >= 0) {
-            int32_t raw_ii = static_cast<int32_t>(m_ii[last_valid_e]);
-            int32_t raw_jj = static_cast<int32_t>(m_jj[last_valid_e]);
-            int32_t raw_kk = static_cast<int32_t>(m_kk[last_valid_e]);
+            float raw_ii = static_cast<float>(m_ii[last_valid_e]);
+            float raw_jj = static_cast<float>(m_jj[last_valid_e]);
+            float raw_kk = static_cast<float>(m_kk[last_valid_e]);
             
             // Clamp to valid ranges before using as padding values
-            const int M = 8;  // PATCHES_PER_FRAME
+            const int M = 4;  // PATCHES_PER_FRAME
             const int MAX_FRAMES = 36;  // BUFFER_SIZE
-            last_ii = (raw_ii < 0) ? 0 : ((raw_ii >= M) ? M - 1 : raw_ii);
-            last_jj = (raw_jj < 0) ? 0 : ((raw_jj >= MAX_FRAMES) ? MAX_FRAMES - 1 : raw_jj);
-            last_kk = (raw_kk < 0) ? 0 : raw_kk;
+            last_ii = (raw_ii < 0.0f) ? 0.0f : ((raw_ii >= M) ? static_cast<float>(M - 1) : raw_ii);
+            last_jj = (raw_jj < 0.0f) ? 0.0f : ((raw_jj >= MAX_FRAMES) ? static_cast<float>(MAX_FRAMES - 1) : raw_jj);
+            last_kk = (raw_kk < 0.0f) ? 0.0f : raw_kk;
         } else {
             // Fallback: use first edge if all have negative kk (shouldn't happen, but be safe)
             if (num_active > 0) {
-                const int M = 8;
+                const int M = 4;
                 const int MAX_FRAMES = 36;
-                int32_t raw_ii = static_cast<int32_t>(m_ii[0]);
-                int32_t raw_jj = static_cast<int32_t>(m_jj[0]);
-                last_ii = (raw_ii < 0) ? 0 : ((raw_ii >= M) ? M - 1 : raw_ii);
-                last_jj = (raw_jj < 0) ? 0 : ((raw_jj >= MAX_FRAMES) ? MAX_FRAMES - 1 : raw_jj);
-                last_kk = 0;  // Force to 0 if all kk are negative
+                float raw_ii = static_cast<float>(m_ii[0]);
+                float raw_jj = static_cast<float>(m_jj[0]);
+                last_ii = (raw_ii < 0.0f) ? 0.0f : ((raw_ii >= M) ? static_cast<float>(M - 1) : raw_ii);
+                last_jj = (raw_jj < 0.0f) ? 0.0f : ((raw_jj >= MAX_FRAMES) ? static_cast<float>(MAX_FRAMES - 1) : raw_jj);
+                last_kk = 0.0f;  // Force to 0 if all kk are negative
             }
         }
     }
     
     for (int e = 0; e < MODEL_EDGE_COUNT; e++) {
-        // AMBA 4D tensor layout: [N, C, H, W] = [1, 1, 384, 1]
+        // AMBA 4D tensor layout: [N, C, H, W] = [1, 1, 360, 1]
         // Index formula: idx = n * C * H * W + c * H * W + h * W + w
         // Where: n=0, c=0, h=e (edge index), w=0
-        // idx = 0 * 1 * 384 * 1 + 0 * 384 * 1 + e * 1 + 0 = e
+        // idx = 0 * 1 * 360 * 1 + 0 * 360 * 1 + e * 1 + 0 = e
         int idx = 0 * 1 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
         
         if (e < num_edges_to_process && e < num_active) {
             // Valid edge: copy actual indices, but clamp to valid ranges
             // CRITICAL: AMBA CV28 requires valid indices for gather operations
-            // ii should be patch index in [0, M-1] where M=8 (patches per frame)
+            // ii should be patch index in [0, M-1] where M=4 (patches per frame)
             // jj should be frame index in [0, n-1] where n is number of frames
             // kk can become negative after keyframe removal (m_kk[e] -= PatchGraph::M)
-            const int M = 8;  // PATCHES_PER_FRAME
+            const int M = 4;  // PATCHES_PER_FRAME
             const int MAX_FRAMES = 36;  // BUFFER_SIZE, but we use actual n from context
             
-            int32_t ii_val = static_cast<int32_t>(m_ii[e]);
-            int32_t jj_val = static_cast<int32_t>(m_jj[e]);
-            int32_t kk_val = static_cast<int32_t>(m_kk[e]);
+            float ii_val = static_cast<float>(m_ii[e]);
+            float jj_val = static_cast<float>(m_jj[e]);
+            float kk_val = static_cast<float>(m_kk[e]);
             
-            // Clamp ii to valid patch index range [0, M-1] = [0, 7]
+            // Clamp ii to valid patch index range [0, M-1] = [0, 3]
             // CRITICAL: ii values > M-1 will cause neighbors_tensor to compute invalid Gather indices
-            if (ii_val < 0) {
-                ii_val = 0;
+            if (ii_val < 0.0f) {
+                ii_val = 0.0f;
             } else if (ii_val >= M) {
-                ii_val = M - 1;  // Clamp to max valid patch index
+                ii_val = static_cast<float>(M - 1);  // Clamp to max valid patch index
             }
             
             // Clamp jj to valid frame index range [0, MAX_FRAMES-1]
             // Note: We use MAX_FRAMES as upper bound, actual n might be smaller
-            if (jj_val < 0) {
-                jj_val = 0;
+            if (jj_val < 0.0f) {
+                jj_val = 0.0f;
             } else if (jj_val >= MAX_FRAMES) {
-                jj_val = MAX_FRAMES - 1;
+                jj_val = static_cast<float>(MAX_FRAMES - 1);
             }
             
             // Clamp kk to non-negative (AMBA CV28 Gather requirement)
-            if (kk_val < 0) {
-                kk_val = 0;  // Clamp to 0 to prevent AMBA CV28 gather failures
+            if (kk_val < 0.0f) {
+                kk_val = 0.0f;  // Clamp to 0 to prevent AMBA CV28 gather failures
             }
             
             ii_input[idx] = ii_val;

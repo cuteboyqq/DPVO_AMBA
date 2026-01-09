@@ -28,12 +28,12 @@ struct DPVOConfig {
     int REMOVAL_WINDOW;
 
     DPVOConfig()
-        : PATCHES_PER_FRAME(8),
+        : PATCHES_PER_FRAME(4),
           BUFFER_SIZE(4096),
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
-          MAX_EDGE_AGE(384),
+          MAX_EDGE_AGE(360),
           KEYFRAME_INDEX(2),
           KEYFRAME_THRESH(10),
           PATCH_LIFETIME(6),
@@ -174,9 +174,9 @@ private:
     std::vector<float> m_reshape_net_input;
     std::vector<float> m_reshape_inp_input;
     std::vector<float> m_reshape_corr_input;
-    std::vector<int32_t> m_reshape_ii_input;
-    std::vector<int32_t> m_reshape_jj_input;
-    std::vector<int32_t> m_reshape_kk_input;
+    std::vector<float> m_reshape_ii_input;
+    std::vector<float> m_reshape_jj_input;
+    std::vector<float> m_reshape_kk_input;
     
     // ---- Threading infrastructure (similar to wnc_app) ----
     struct InputFrame {

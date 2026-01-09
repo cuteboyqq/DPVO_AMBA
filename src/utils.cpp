@@ -604,6 +604,10 @@ void rescaleBBox(BoundingBox &bbox, BoundingBox &rescaleBBox, int modelWidth, in
         rescaleBBox.y2 = videoHeight - 1;
 }
 
+// =================================================================================================
+// DEPRECATED: YOLOv8 function - removed as YOLOv8 code has been removed
+// =================================================================================================
+/*
 void rescalev8xyxy(v8xyxy &bbox, BoundingBox &rescaleBBox, int modelWidth, int modelHeight, int videoWidth,
                    int videoHeight)
 {
@@ -626,6 +630,7 @@ void rescalev8xyxy(v8xyxy &bbox, BoundingBox &rescaleBBox, int modelWidth, int m
     if (rescaleBBox.y2 > videoHeight - 1)
         rescaleBBox.y2 = videoHeight - 1;
 }
+*/
 
 void rescaleROI(ROI &srcROI, ROI &dstROI, int modelWidth, int modelHeight, int videoWidth, int videoHeight)
 {

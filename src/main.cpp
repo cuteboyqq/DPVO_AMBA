@@ -438,8 +438,12 @@ static void env_deinit(global_param_t *G_param)
 // 	return rval;
 // }
 
+// =================================================================================================
+// DEPRECATED: YOLOv8/WNC_APP functions - commented out as YOLOv8 code has been removed
+// =================================================================================================
 // Cooper code
-std::unordered_map<int, std::pair<int, int>> idToX1X2; // Map to store obj.id and its x1, x2 values
+// std::unordered_map<int, std::pair<int, int>> idToX1X2; // Map to store obj.id and its x1, x2 values
+/*
 static int draw_result_test(global_param_t *G_param, WNC_APP* wncApp)
 {
 	int rval = 0, previousX1, previousX2;
@@ -620,7 +624,9 @@ static int draw_result_test(global_param_t *G_param, WNC_APP* wncApp)
 							text = "Alarm" + text;
 							ea_display_obj_params(G_param->display)->text_color = EA_16_COLORS_RED;
 							ea_display_obj_params(G_param->display)->box_color = EA_16_COLORS_RED;
-						} else /*if (obj.bbox.x1 < wncApp->m_config->LineCrossX1 && obj.bbox.x2 < wncApp->m_config->LineCrossX2)*/{
+						} 
+						else //if (obj.bbox.x1 < wncApp->m_config->LineCrossX1 && obj.bbox.x2 < wncApp->m_config->LineCrossX2)
+						{
 							ea_display_obj_params(G_param->display)->box_color = EA_16_COLORS_LIME;
 						}
                				}else {
@@ -635,7 +641,9 @@ static int draw_result_test(global_param_t *G_param, WNC_APP* wncApp)
 							text = "Alarm" + text;
 							ea_display_obj_params(G_param->display)->text_color = EA_16_COLORS_RED;
 							ea_display_obj_params(G_param->display)->box_color = EA_16_COLORS_RED;
-						} else /*if (obj.bbox.x1 > wncApp->m_config->LineCrossX1 && obj.bbox.x2 > wncApp->m_config->LineCrossX2)*/{
+						} 
+						else //if (obj.bbox.x1 > wncApp->m_config->LineCrossX1 && obj.bbox.x2 > wncApp->m_config->LineCrossX2)
+						{
 							ea_display_obj_params(G_param->display)->box_color = EA_16_COLORS_LIME;
 						}	
 					}else {
@@ -678,7 +686,8 @@ static int draw_result_test(global_param_t *G_param, WNC_APP* wncApp)
 
 	return rval;
 }
-
+*/
+// =================================================================================================
 
 /**
  * @brief Start the main run loop for hand detection
@@ -760,12 +769,12 @@ static int start_run(global_param_t *G_param)
 /**
  * @brief Thread function for processing frames from the queue
  * 
- * This function continuously checks the frame queue for new frames.
- * If a frame is available, it is added to the WNC_APP instance.
- * If no frame is available, it sleeps for a short duration to reduce CPU usage.
+ * DEPRECATED: This function is for YOLOv8/WNC_APP which has been removed.
+ * Use appDPVOthreadFunction instead for DPVO processing.
  * 
  * @param wncApp Reference to the WNC_APP instance
  */
+/*
 void appThreadFunction(WNC_APP& wncApp)
 {
 	try 
@@ -811,6 +820,8 @@ void appThreadFunction(WNC_APP& wncApp)
 		std::cerr << "Caught unknown exception in APP thread" << std::endl;
 	}
 }
+*/
+// =================================================================================================
 
 /**
  * @brief Thread function for processing frames from the queue for DPVO
@@ -873,8 +884,8 @@ void appDPVOthreadFunction(DPVO& dpvo)
 /**
  * @brief Process the input data
  * 
- * This function processes the input data based on the input type.
- * It handles video files and image directories differently.
+ * DEPRECATED: This function is for YOLOv8/WNC_APP which has been removed.
+ * Use processDPVOInput instead for DPVO processing.
  * 
  * @param inputPath Path to the input data
  * @param inputType Type of input data
@@ -886,6 +897,7 @@ void appDPVOthreadFunction(DPVO& dpvo)
  * @param G_param Global parameters
  * @param wncApp WNC_APP instance
  */
+/*
 void processInput(
 	const std::string& inputPath,
 	const InputType& inputType,
@@ -1028,12 +1040,14 @@ void processInput(
 		frameProcessed = false;
 	}
 }
+*/
+// =================================================================================================
 
 /**
  * @brief Process the application
  * 
- * This function processes the application based on the input type.
- * It handles video files and image directories differently.
+ * DEPRECATED: This function is for YOLOv8/WNC_APP which has been removed.
+ * Use processDPVOApp instead for DPVO processing.
  * 
  * @param inputPath Path to the input data
  * @param inputType Type of input data
@@ -1042,6 +1056,7 @@ void processInput(
  * @param G_param Global parameters
  * @param logger Logger for logging
  */
+/*
 void processApp(
 	const std::string& inputPath,
 	const InputType& inputType,
@@ -1114,6 +1129,8 @@ void processApp(
 
 	return;
 }
+*/
+// =================================================================================================
 
 /**
  * @brief Process the input data for DPVO
@@ -1462,7 +1479,7 @@ static void sigstop(int signal_number)
 {
 	run_flag = 0;
 	(void)signal_number;
-	printf("sigstop msg, exit WNC_APP\n");
+	printf("sigstop msg, exit application\n");
 	exit(0);
 
 	return;

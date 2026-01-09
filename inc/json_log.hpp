@@ -20,7 +20,6 @@
 #include "nlohmann/json.hpp"  // Make sure this path is correct
 #include "bounding_box.hpp"
 #include "dataStructures.h"
-#include "yolov8.hpp"
 #include "config_reader.hpp"
 constexpr int NUM_POINTS = 3;
 using namespace std;

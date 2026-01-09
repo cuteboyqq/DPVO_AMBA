@@ -34,7 +34,7 @@
 #include "bounding_box.hpp"
 #include "object.hpp"
 #include "dataStructures.h"
-#include "yolov8_decoder.hpp"
+#include <spdlog/spdlog.h>
 
 using namespace std;
 
@@ -106,8 +106,6 @@ std::string to_string_with_precision(float value, const int n);
 //
 void rescaleBBox(BoundingBox &bbox, BoundingBox &rescaleBBox, int modelWidth, int modelHeight, int videoWidth,
                  int videoHeight);
-void rescalev8xyxy(v8xyxy &bbox, BoundingBox &rescaleBBox,int modelWidth, int modelHeight, int videoWidth, int videoHeight);
-
 void rescaleROI(ROI &bbox, ROI &rescaleBBox, int modelWidth, int modelHeight, int videoWidth, int videoHeight);
 
 void rescalePoint(cv::Point &pSrc, cv::Point &pDst, float xRatio, float yRatio);

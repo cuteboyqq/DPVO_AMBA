@@ -79,8 +79,10 @@ std::string JSON_LOG::logInfo(
     jsonDataCurrentFrame["version"].push_back(version);
 
 
-// int FRAME_WIDTH = 1920;
-// int FRAME_HEIGHT = 1080;
+int FRAME_WIDTH = 1920;
+int FRAME_HEIGHT = 1080;
+int MODEL_WIDTH = 512;
+int MODEL_HEIGHT = 288;
 
     if (m_bSaveTrackObj)
     {

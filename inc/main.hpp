@@ -31,7 +31,6 @@
 #include <queue>
 #include <mutex>
 #include "config_reader.hpp"
-#include "wnc_app.hpp"
 #include "dpvo.hpp"
 #include "fnet.hpp"  // FNetInference
 #include "inet.hpp"  // INetInference
@@ -139,24 +138,7 @@ std::atomic<bool> terminateThreads(false);
 
 
 //
-void appThreadFunction(WNC_APP& wncApp);
 void appDPVOthreadFunction(DPVO& dpvo);
-void processInput(
-	const std::string& inputPath, 
-	std::shared_ptr<spdlog::logger> logger, 
-	unsigned int& count, 
-	std::mutex& frameProcessedMutex,
-	std::condition_variable& frameProcessedCV, 
-	bool& frameProcessed,
-	global_param_t* G_param,
-	WNC_APP* wncApp);
-void processApp(
-	const std::string& inputPath,
-	const InputType& inputType,
-	const std::string& configPath,
-	const std::string& logFile, 
-	global_param_t* G_param,
-	std::shared_ptr<spdlog::logger> logger);
 void processDPVOInput(
 	const std::string& inputPath,
 	const InputType& inputType,

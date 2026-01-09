@@ -19,9 +19,9 @@ struct DPVOUpdate_Prediction
 {
     bool    isProcessed = false;
 
-    float*  netOutBuff;  // [1, 384, 384, 1]
-    float*  dOutBuff;    // [1, 2, 384, 1]
-    float*  wOutBuff;    // [1, 2, 384, 1]
+    float*  netOutBuff;  // [1, 384, 360, 1] (384=NET_DIM, 360=MAX_EDGES)
+    float*  dOutBuff;    // [1, 2, 360, 1] (360=MAX_EDGES)
+    float*  wOutBuff;    // [1, 2, 360, 1] (360=MAX_EDGES)
 
     DPVOUpdate_Prediction()
         : isProcessed(false),
@@ -42,14 +42,14 @@ public:
 
     // Synchronous inference (main method for sequential execution)
     bool runInference(float* netData, float* inpData, float* corrData, 
-                      int32_t* iiData, int32_t* jjData, int32_t* kkData, 
+                      float* iiData, float* jjData, float* kkData, 
                       int frameIdx, DPVOUpdate_Prediction& pred);
     
     // Multi-threading (optional, for async execution)
     void runThread();
     void stopThread();
     void updateInputData(float* netData, float* inpData, float* corrData, 
-                         int32_t* iiData, int32_t* jjData, int32_t* kkData, int frameIdx);
+                         float* iiData, float* jjData, float* kkData, int frameIdx);
     void notifyProcessingComplete();
     
     // Prediction (for async mode)
@@ -82,10 +82,10 @@ public:
         std::vector<float>& net_input,
         std::vector<float>& inp_input,
         std::vector<float>& corr_input,
-        std::vector<int32_t>& ii_input,
-        std::vector<int32_t>& jj_input,
-        std::vector<int32_t>& kk_input,
-        const int MODEL_EDGE_COUNT = 384,
+        std::vector<float>& ii_input,
+        std::vector<float>& jj_input,
+        std::vector<float>& kk_input,
+        const int MODEL_EDGE_COUNT = 360,
         const int CORR_DIM = 882
     );
 
@@ -104,9 +104,9 @@ private:
 #if defined(CV28) || defined(CV28_SIMULATOR)
     bool _checkSavedTensor(int frameIdx);
     bool _loadInput(float* netData, float* inpData, float* corrData, 
-                    int32_t* iiData, int32_t* jjData, int32_t* kkData);
+                    float* iiData, float* jjData, float* kkData);
     bool _run(float* netData, float* inpData, float* corrData, 
-              int32_t* iiData, int32_t* jjData, int32_t* kkData, int frameIdx);
+              float* iiData, float* jjData, float* kkData, int frameIdx);
     bool _runInferenceFunc();
     void _initModelIO();
     bool _releaseModel();
@@ -126,8 +126,8 @@ private:
     std::condition_variable m_condition;
     WakeCallback            m_wakeFunc;
 
-    // Maximum edge count for model input (default: 384, can be changed)
-    int m_maxEdge = 384;
+    // Maximum edge count for model input (default: 360, matches MAX_EDGES in patch_graph.hpp)
+    int m_maxEdge = 360;
     
     // Input buffer sizes (used in constructor, must be outside conditional)
     size_t m_netBufferSize   = 0;  // 1 * 384 * m_maxEdge * 1
@@ -162,9 +162,9 @@ private:
     float* m_netBuff;
     float* m_inpBuff;
     float* m_corrBuff;
-    int32_t* m_iiBuff;
-    int32_t* m_jjBuff;
-    int32_t* m_kkBuff;
+    float* m_iiBuff;
+    float* m_jjBuff;
+    float* m_kkBuff;
     
     // Working buffers for output data
     float* m_netOutBuff;
@@ -190,9 +190,9 @@ private:
         float*   netData;
         float*   inpData;
         float*   corrData;
-        int32_t* iiData;
-        int32_t* jjData;
-        int32_t* kkData;
+        float*   iiData;
+        float*   jjData;
+        float*   kkData;
     };
 
     // Prediction Buffer

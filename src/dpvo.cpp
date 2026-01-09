@@ -105,18 +105,19 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     }
     
     // Initialize max edge count for model input
-    // To change this value, simply modify the number below (e.g., 256, 384, 512, 768)
+    // To change this value, simply modify the number below (e.g., 256, 360, 384, 512, 768)
     // Note: You must also update your ONNX model and AMBA conversion YAML to match this value
-    m_maxEdge = 768;
+    // This should match MAX_EDGES in patch_graph.hpp
+    m_maxEdge = 360;
     
     // Pre-allocate buffers for reshapeInput to avoid memory allocation overhead
     const int CORR_DIM = 882;
     m_reshape_net_input.resize(1 * 384 * m_maxEdge * 1, 0.0f);
     m_reshape_inp_input.resize(1 * 384 * m_maxEdge * 1, 0.0f);
     m_reshape_corr_input.resize(1 * CORR_DIM * m_maxEdge * 1, 0.0f);
-    m_reshape_ii_input.resize(1 * 1 * m_maxEdge * 1, 0);
-    m_reshape_jj_input.resize(1 * 1 * m_maxEdge * 1, 0);
-    m_reshape_kk_input.resize(1 * 1 * m_maxEdge * 1, 0);
+    m_reshape_ii_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
+    m_reshape_jj_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
+    m_reshape_kk_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
 }
 
 void DPVO::_startThreads()
