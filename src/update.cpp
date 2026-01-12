@@ -593,10 +593,23 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
             float w_mean = (m_wOutBufferSize > 0) ? w_sum / m_wOutBufferSize : 0.0f;
             
             // Log with blue text (\033[34m for blue, \033[0m to reset)
-            logger->info("\033[34mDPVOUpdate::_run: Delta output (dOut) - size={}, range=[{}, {}], mean={}, zero_count={}, nonzero_count={}\033[0m",
+            logger->info("\033[34mDPVOUpdate::_run: Delta output (dOut) - size={}, range=[{}, {}], mean={:.6f}, zero_count={}, nonzero_count={}\033[0m",
                          m_dOutBufferSize, d_min, d_max, d_mean, d_zero_count, d_nonzero_count);
-            logger->info("\033[34mDPVOUpdate::_run: Weight output (wOut) - size={}, range=[{}, {}], mean={}, zero_count={}, nonzero_count={}\033[0m",
+            logger->info("\033[34mDPVOUpdate::_run: Weight output (wOut) - size={}, range=[{}, {}], mean={:.6f}, zero_count={}, nonzero_count={}\033[0m",
                          m_wOutBufferSize, w_min, w_max, w_mean, w_zero_count, w_nonzero_count);
+            
+            // Additional debugging: Check if weights are in a different channel or need processing
+            // Check first few values from both channels
+            if (m_wOutBufferSize >= 20) {
+                logger->info("\033[34mDPVOUpdate::_run: Weight tensor sample - channel0[0-4]: [{:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}], "
+                            "channel1[0-4]: [{:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}]\033[0m",
+                            wOut[0], wOut[1], wOut[2], wOut[3], wOut[4],
+                            (m_wOutBufferSize > m_maxEdge ? wOut[m_maxEdge] : 0.0f),
+                            (m_wOutBufferSize > m_maxEdge + 1 ? wOut[m_maxEdge + 1] : 0.0f),
+                            (m_wOutBufferSize > m_maxEdge + 2 ? wOut[m_maxEdge + 2] : 0.0f),
+                            (m_wOutBufferSize > m_maxEdge + 3 ? wOut[m_maxEdge + 3] : 0.0f),
+                            (m_wOutBufferSize > m_maxEdge + 4 ? wOut[m_maxEdge + 4] : 0.0f));
+            }
             
             // Show sample values for first few edges (each edge has 2 delta values and 2 weight values)
             const int num_sample_edges = std::min(5, static_cast<int>(m_maxEdge));

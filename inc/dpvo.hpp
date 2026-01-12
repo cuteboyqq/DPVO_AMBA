@@ -32,7 +32,7 @@ struct DPVOConfig {
 
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
-          BUFFER_SIZE(4096),
+          BUFFER_SIZE(36),
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
@@ -51,7 +51,8 @@ public:
     ~DPVO();
 
     // Main processing function (called from thread)
-    void run(int64_t timestamp, const uint8_t* image, const float intrinsics[4], int H, int W);
+    // intrinsics_in: [fx, fy, cx, cy] - if nullptr, uses stored m_intrinsics
+    void run(int64_t timestamp, const uint8_t* image, const float* intrinsics_in = nullptr, int H = 0, int W = 0);
     
     // Threading interface (similar to wnc_app)
     void startProcessingThread();

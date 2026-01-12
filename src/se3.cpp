@@ -10,6 +10,7 @@ SE3::SE3() {
 
 SE3::SE3(const Eigen::Matrix3f& R, const Eigen::Vector3f& trans) {
     q = Eigen::Quaternionf(R);
+    q.normalize();  // Ensure quaternion is normalized (R might not be perfectly orthogonal due to numerical errors)
     t = trans;
 }
 
@@ -58,10 +59,14 @@ SE3 SE3::retr(const Eigen::Matrix<float,6,1>& dx) const {
     Eigen::Vector3f dt = dx.tail<3>();
 
     // Small-angle approx: R_new ≈ R * (I + [dR]_x)
+    // Note: This might not be perfectly orthogonal, so we normalize the quaternion in the constructor
     Eigen::Matrix3f R_new = R() * (Eigen::Matrix3f::Identity() + skew(dR));
     Eigen::Vector3f t_new = t + dt;
 
-    return SE3(R_new, t_new);
+    SE3 result(R_new, t_new);
+    // Double-check normalization (should already be done in constructor, but be safe)
+    result.q.normalize();
+    return result;
 }
 
 // -----------------------------

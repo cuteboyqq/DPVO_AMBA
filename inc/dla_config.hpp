@@ -38,8 +38,11 @@ typedef struct
 typedef struct
 {
     float height;
-    float focalLength;  // Camera effective focal length in pixel unit
-    float centrlOffset; // Horizontal offset distance to car center in meter unit
+    float intrinsic_fx;   // Camera intrinsic fx (focal length X) in pixels - highest priority
+    float intrinsic_fy;   // Camera intrinsic fy (focal length Y) in pixels - highest priority
+    float intrinsic_cx;   // Camera intrinsic cx (principal point X) in pixels - highest priority
+    float intrinsic_cy;   // Camera intrinsic cy (principal point Y) in pixels - highest priority
+    float centrlOffset;    // Horizontal offset distance to car center in meter unit
 } CAMERA_Config_S;
 
 

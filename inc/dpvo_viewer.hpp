@@ -112,12 +112,19 @@ private:
     int m_imageHeight;
     std::vector<uint8_t> m_imageBuffer;
     std::atomic<bool> m_imageUpdated{false};
+    std::atomic<bool> m_textureSizeChanged{false};
     
     // Pose data
     int m_maxFrames;
     int m_numFrames{0};
     std::vector<SE3> m_poses;
     std::vector<float> m_poseMatrices;  // 4x4 matrices for OpenGL
+    
+    // Saved fake poses for testing (persist across draw calls)
+    std::vector<Eigen::Vector3f> m_saved_cam_positions;
+    std::vector<Eigen::Vector3f> m_saved_forwards;
+    std::vector<Eigen::Vector3f> m_saved_rights;
+    std::vector<Eigen::Vector3f> m_saved_ups;
     
     // Point cloud data
     int m_maxPoints;

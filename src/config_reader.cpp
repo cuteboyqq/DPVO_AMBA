@@ -82,7 +82,11 @@ void AppConfigReader::read(std::string configPath)
 
         // Camera Information
         string cameraHeight      = "";
-        string cameraFocalLength = "";
+        // string cameraFocalLength = "";
+        string intrinsic_fx      = "";
+        string intrinsic_fy      = "";
+        string intrinsic_cx      = "";
+        string intrinsic_cy      = "";
         int    frameWidth        = 320;
         int    frameHeight       = 320;
 
@@ -166,7 +170,11 @@ void AppConfigReader::read(std::string configPath)
         
         // Camera Information
         configReader->getValue("CameraHeight", cameraHeight);
-        configReader->getValue("CameraFocalLength", cameraFocalLength);
+        // configReader->getValue("CameraFocalLength", cameraFocalLength);
+        configReader->getValue("Intrinsic_fx", intrinsic_fx);
+        configReader->getValue("Intrinsic_fy", intrinsic_fy);
+        configReader->getValue("Intrinsic_cx", intrinsic_cx);
+        configReader->getValue("Intrinsic_cy", intrinsic_cy);
         configReader->getValue("FrameWidth", frameWidth);
         configReader->getValue("FrameHeight", frameHeight);
 
@@ -247,7 +255,11 @@ void AppConfigReader::read(std::string configPath)
             logger->info("[Camera Information]");
             logger->info("-------------------------------------------------");
             logger->info("CameraHeight \t= {}",     cameraHeight);
-            logger->info("CameraFocalLength \t= {}",cameraFocalLength);
+            // logger->info("CameraFocalLength \t= {}",cameraFocalLength);
+            logger->info("Intrinsic_fx \t= {}",      intrinsic_fx);
+            logger->info("Intrinsic_fy \t= {}",     intrinsic_fy);
+            logger->info("Intrinsic_cx \t= {}",     intrinsic_cx);
+            logger->info("Intrinsic_cy \t= {}",     intrinsic_cy);
             logger->info("FrameWidth \t\t= {}",     frameWidth);
             logger->info("FrameHeight \t\t= {}",    frameHeight);
 
@@ -348,7 +360,26 @@ void AppConfigReader::read(std::string configPath)
             logger->warn("stCameraConfig.height change to user setting value = {}", installHeight);
         }
         m_config->stCameraConfig.centrlOffset = installOffset;
-        m_config->stCameraConfig.focalLength  = std::stof(cameraFocalLength);
+        // if (cameraFocalLength.size() > 0)
+        // {
+        //     m_config->stCameraConfig.focalLength = std::stof(cameraFocalLength);
+        // }
+        if (intrinsic_fx.size() > 0)
+        {
+            m_config->stCameraConfig.intrinsic_fx = std::stof(intrinsic_fx);
+        }
+        if (intrinsic_fy.size() > 0)
+        {
+            m_config->stCameraConfig.intrinsic_fy = std::stof(intrinsic_fy);
+        }
+        if (intrinsic_cx.size() > 0)
+        {
+            m_config->stCameraConfig.intrinsic_cx = std::stof(intrinsic_cx);
+        }
+        if (intrinsic_cy.size() > 0)
+        {
+            m_config->stCameraConfig.intrinsic_cy = std::stof(intrinsic_cy);
+        }
         m_config->frameWidth                  = frameWidth;
         m_config->frameHeight                 = frameHeight;
 

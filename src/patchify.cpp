@@ -177,16 +177,24 @@ void Patchifier::forward(
     fflush(stdout);
     
     // ------------------------------------------------
-    // 3. Image → float grid (for patches) - full resolution
-    // Image is already normalized float [-0.5, 1.5], use directly
+    // 3. Create coordinate grid (like Python's coords_grid_with_index)
+    // Python: grid, _ = coords_grid_with_index(disps, device=fmap.device)
+    //         coords = torch.stack([x, y, d], dim=2)  # [b, n, 3, h, w]
+    //         where x = [0..w-1], y = [0..h-1], d = depth (from disps)
+    // Grid channels: [x_coord, y_coord, depth]
     // ------------------------------------------------
     std::vector<float> grid(3 * H * W);
     printf("[Patchifier] Grid created, size=%zu\n", grid.size());
     fflush(stdout);
-    // Image is already normalized, so use it directly (no need to divide by 255.0)
-    for (int c = 0; c < 3; c++)
-        for (int i = 0; i < H * W; i++)
-            grid[c * H * W + i] = image[c * H * W + i];
+    // Create coordinate grid: channel 0 = x, channel 1 = y, channel 2 = depth (default 1.0)
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int idx = y * W + x;
+            grid[0 * H * W + idx] = static_cast<float>(x);  // x coordinate [0, W-1]
+            grid[1 * H * W + idx] = static_cast<float>(y);  // y coordinate [0, H-1]
+            grid[2 * H * W + idx] = 1.0f;  // depth (default, will be updated later in dpvo.cpp)
+        }
+    }
 
     printf("[Patchifier] About to create coords, M=%d\n", M);
     fflush(stdout);
@@ -194,12 +202,13 @@ void Patchifier::forward(
     // ------------------------------------------------
     // 4. Generate RANDOM coords (Python RANDOM mode) - full resolution
     // ------------------------------------------------
-    std::vector<float> coords(M * 2);
+    m_last_coords.resize(M * 2);
     for (int m = 0; m < M; m++)
     {
-        coords[m * 2 + 0] = 1 + rand() % (W - 2); // Full resolution coordinates
-        coords[m * 2 + 1] = 1 + rand() % (H - 2); // Full resolution coordinates
+        m_last_coords[m * 2 + 0] = 1 + rand() % (W - 2); // Full resolution coordinates
+        m_last_coords[m * 2 + 1] = 1 + rand() % (H - 2); // Full resolution coordinates
     }
+    const float* coords = m_last_coords.data();
     printf("[Patchifier] Coords created\n");
     fflush(stdout);
 
@@ -210,7 +219,7 @@ void Patchifier::forward(
     // 5. Patchify grid → patches (RGB) - full resolution
     // ------------------------------------------------
     patchify_cpu_safe(
-        grid.data(), coords.data(),
+        grid.data(), coords,  // coords is already a pointer (const float*)
         M, 3, H, W,
         m_patch_size / 2,
         patches);
@@ -309,14 +318,23 @@ void Patchifier::forward(
     fflush(stdout);
     // ------------------------------------------------
     // 8. Color for visualization - full resolution
+    // Python: clr = altcorr.patchify(images[0], 4*(coords + 0.5), 0).view(b, -1, 3)
+    // Note: Python uses 4*(coords + 0.5) which suggests sampling at a different location
+    // For now, we'll use coords directly (matching the patch extraction)
     // Convert normalized float image back to uint8 for color extraction
     // ------------------------------------------------
     for (int m = 0; m < M; m++)
     {
+        // Python uses 4*(coords + 0.5), but since we're at full resolution, use coords directly
+        // The 4* factor in Python is because images are at 1/4 resolution in that context
         int x = static_cast<int>(coords[m * 2 + 0]);
         int y = static_cast<int>(coords[m * 2 + 1]);
+        // Clamp to valid image bounds
+        x = std::max(0, std::min(x, W - 1));
+        y = std::max(0, std::min(y, H - 1));
         for (int c = 0; c < 3; c++) {
             // Image is normalized float [-0.5, 1.5], convert back to uint8 [0, 255]
+            // Python: images = 2 * (images / 255.0) - 0.5, so reverse: (val + 0.5) / 2.0 * 255.0
             float normalized_val = image[c * H * W + y * W + x];
             float mapped_val = (normalized_val + 0.5f) / 2.0f * 255.0f;
             clr[m * 3 + c] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, mapped_val)));

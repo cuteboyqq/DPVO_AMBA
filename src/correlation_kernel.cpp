@@ -191,6 +191,25 @@ void computeCorrelation(
     int feature_dim,
     float* corr_out)
 {
+    // Add entry logging
+    printf("[computeCorrelation] ENTERING: num_active=%d, M=%d, P=%d, num_frames=%d, num_gmap_frames=%d\n",
+           num_active, M, P, num_frames, num_gmap_frames);
+    fflush(stdout);
+    
+    // Validate inputs
+    if (gmap == nullptr || pyramid0 == nullptr || pyramid1 == nullptr || 
+        coords == nullptr || ii == nullptr || jj == nullptr || kk == nullptr || corr_out == nullptr) {
+        printf("[computeCorrelation] ERROR: Null pointer in inputs\n");
+        fflush(stdout);
+        return;
+    }
+    
+    if (num_active <= 0 || M <= 0 || P <= 0 || num_frames <= 0 || num_gmap_frames <= 0) {
+        printf("[computeCorrelation] ERROR: Invalid dimensions\n");
+        fflush(stdout);
+        return;
+    }
+    
     // Correlation radius R (typically 3 in DPVO)
     // D = 2*R + 2 is the correlation window diameter
     const int R = 3;  // Correlation radius
@@ -211,22 +230,81 @@ void computeCorrelation(
     for (int e = 0; e < num_active; e++) {
         // Validate input indices
         if (e < 0 || e >= num_active) continue;
-        if (ii == nullptr || jj == nullptr || kk == nullptr) continue;
+        if (ii == nullptr || jj == nullptr || kk == nullptr) {
+            // Early return if null pointers
+            printf("[computeCorrelation] ERROR: Null pointer detected at edge %d\n", e);
+            fflush(stdout);
+            return;
+        }
         
-        // us[m] in Python = which patch from gmap to use (linear index)
-        // vs[m] in Python = which frame from pyramid to use (frame index)
-        // In C++: 
-        //   kk[e] = frame * M + patch (linear patch index, encodes source frame for gmap)
-        //   ii[e] = patch index within frame (0 to M-1)
-        //   jj[e] = target frame index in pyramid (0 to num_frames-1)
-        int patch_idx = ii[e] % M;       // patch index within frame (0 to M-1)
-        int gmap_frame = (kk[e] / M) % num_gmap_frames; // source frame index in gmap ring buffer
-        int pyramid_frame = jj[e] % num_frames; // target frame index in pyramid (0 to num_frames-1)
+        // Validate kk[e] and jj[e] are within reasonable bounds
+        if (kk[e] < 0 || kk[e] > 1000000) {
+            printf("[computeCorrelation] WARNING: Invalid kk[%d]=%d, skipping edge\n", e, kk[e]);
+            fflush(stdout);
+            continue;
+        }
+        if (jj[e] < 0 || jj[e] > 1000) {
+            printf("[computeCorrelation] WARNING: Invalid jj[%d]=%d, skipping edge\n", e, jj[e]);
+            fflush(stdout);
+            continue;
+        }
+        
+        // Python logic (dpvo.py lines 334, 337-338):
+        //   ii = self.pg.kk[:num_active]  # kk values become ii
+        //   ii1 = ii % (self.M * self.pmem)  # Linear patch index across all frames in gmap ring buffer
+        //   jj1 = jj % (self.mem)  # Frame index in pyramid ring buffer
+        // 
+        // CUDA kernel receives:
+        //   us[m] = ii1 (linear patch index in gmap)
+        //   vs[m] = jj1 (frame index in pyramid)
+        //
+        // C++ mapping to match Python:
+        //   kk[e] is the linear patch index (frame * M + patch) that needs modulo (M * num_gmap_frames)
+        //   jj[e] is the target frame index that needs modulo num_frames
+        // CRITICAL: Check for division by zero
+        int mod_value = M * num_gmap_frames;
+        if (mod_value == 0) {
+            printf("[computeCorrelation] ERROR: Division by zero! M=%d, num_gmap_frames=%d\n", M, num_gmap_frames);
+            fflush(stdout);
+            return;
+        }
+        int ii1 = kk[e] % mod_value;  // Linear patch index in gmap ring buffer (matches Python: ii1 = ii % (M * pmem))
+        int gmap_frame = ii1 / M;                  // Extract frame from linear index
+        int patch_idx = ii1 % M;                   // Extract patch from linear index
+        int pyramid_frame = jj[e] % num_frames;   // Frame index in pyramid ring buffer (matches Python: jj1 = jj % mem)
         
         // Validate indices
-        if (patch_idx < 0 || patch_idx >= M) continue;
-        if (gmap_frame < 0 || gmap_frame >= num_gmap_frames) continue;
-        if (pyramid_frame < 0 || pyramid_frame >= num_frames) continue;
+        if (patch_idx < 0 || patch_idx >= M) {
+            if (e < 5) {
+                printf("[computeCorrelation] WARNING: Invalid patch_idx=%d for edge %d (M=%d, ii1=%d)\n", 
+                       patch_idx, e, M, ii1);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (gmap_frame < 0 || gmap_frame >= num_gmap_frames) {
+            if (e < 5) {
+                printf("[computeCorrelation] WARNING: Invalid gmap_frame=%d for edge %d (num_gmap_frames=%d, ii1=%d)\n", 
+                       gmap_frame, e, num_gmap_frames, ii1);
+                fflush(stdout);
+            }
+            continue;
+        }
+        if (pyramid_frame < 0 || pyramid_frame >= num_frames) {
+            if (e < 5) {
+                printf("[computeCorrelation] WARNING: Invalid pyramid_frame=%d for edge %d (num_frames=%d)\n", 
+                       pyramid_frame, e, num_frames);
+                fflush(stdout);
+            }
+            continue;
+        }
+
+        // Progress logging for first few edges
+        if (e < 3 || e % 20 == 0) {
+            printf("[computeCorrelation] Processing edge %d/%d: kk[%d]=%d, jj[%d]=%d, gmap_frame=%d, patch_idx=%d, pyramid_frame=%d\n",
+                   e, num_active, e, kk[e], e, jj[e], gmap_frame, patch_idx, pyramid_frame);
+            fflush(stdout);
+        }
 
         for (int c = 0; c < 2; c++) { // two correlation channels: pyramid0, pyramid1
             const float* fmap = (c == 0) ? pyramid0 : pyramid1;
@@ -258,10 +336,10 @@ void computeCorrelation(
                             // Python: i1 = floor(y) + (ii - R), j1 = floor(x) + (jj - R)
                             int i1 = static_cast<int>(std::floor(y)) + (corr_ii - R);
                             int j1 = static_cast<int>(std::floor(x)) + (corr_jj - R);
-                            
+
                             // Compute correlation: sum over feature channels
                             // Python: sum over C of fmap1[n][ix][c][i0][j0] * fmap2[n][jx][c][i1][j1]
-                            float sum = 0.0f;
+                    float sum = 0.0f;
                             if (within_bounds(i1, j1, fmap_H, fmap_W)) {
                                 // Access gmap: gmap[patch_idx][f][gmap_i][gmap_j]
                                 // gmap is [M][feature_dim][D_gmap][D_gmap] for a single frame
@@ -269,7 +347,7 @@ void computeCorrelation(
                                 int gmap_i = i0 + gmap_center_offset;
                                 int gmap_j = j0 + gmap_center_offset;
                                 
-                                for (int f = 0; f < feature_dim; f++) {
+                        for (int f = 0; f < feature_dim; f++) {
                                     // gmap layout: [num_gmap_frames][M][feature_dim][D_gmap][D_gmap]
                                     size_t gmap_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
                                                       static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
@@ -288,9 +366,9 @@ void computeCorrelation(
                                     // Validate fmap index using channel-specific size
                                     if (fmap_idx >= fmap_total_size) continue;
                                     
-                                    sum += gmap[gmap_idx] * fmap[fmap_idx];
-                                }
-                            }
+                            sum += gmap[gmap_idx] * fmap[fmap_idx];
+                        }
+                    }
                             
                             // Store correlation: corr[n][m][ii][jj][i0][j0]
                             // Python CUDA kernel outputs: [B, M, D, D, H, W] per channel
@@ -306,12 +384,15 @@ void computeCorrelation(
                             
                             // Validate output index
                             if (out_idx < corr_total_size) {
-                                corr_out[out_idx] = sum;
-                            }
-                        }
-                    }
+                    corr_out[out_idx] = sum;
                 }
             }
         }
     }
+            }
+        }
+    }
+    
+    printf("[computeCorrelation] COMPLETED: processed %d edges\n", num_active);
+    fflush(stdout);
 }

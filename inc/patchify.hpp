@@ -23,6 +23,10 @@ public:
                  float* fmap, float* imap, float* gmap,
                  float* patches, uint8_t* clr,
                  int patches_per_image = 8);
+    
+    // Get the coordinates used in the last forward() call
+    // Returns coordinates at full resolution [patches_per_image * 2] (x, y pairs)
+    const std::vector<float>& getLastCoords() const { return m_last_coords; }
 
 private:
     int m_patch_size;
@@ -35,5 +39,8 @@ private:
     // Temporary buffers for model outputs
     std::vector<float> m_fmap_buffer;
     std::vector<float> m_imap_buffer;
+    
+    // Store last coordinates used (for patch coordinate storage)
+    std::vector<float> m_last_coords;
 };
 

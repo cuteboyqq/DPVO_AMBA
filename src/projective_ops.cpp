@@ -66,9 +66,13 @@ void transform(
 {
     for (int e = 0; e < num_edges; e++) {
 
-        int i = ii[e]; // source frame
-        int j = jj[e]; // target frame
-        int k = kk[e]; // patch index
+        int patch_i = ii[e]; // patch index within source frame
+        int j = jj[e]; // target frame index
+        int k = kk[e]; // global patch index (frame * M + patch)
+        
+        // Extract source frame and patch from global patch index k
+        int i = k / M;  // source frame index
+        int patch_k = k % M;  // patch index within frame (should match patch_i)
 
         const SE3& Ti = poses[i];
         const SE3& Tj = poses[j];
@@ -84,10 +88,11 @@ void transform(
 
                 int idx = y * P + x;
 
-                // Compute flat index for patches: ((i*M + k)*3 + c)*P*P + y*P + x
-                float px = patches_flat[((i * M + k) * 3 + 0) * P * P + idx];
-                float py = patches_flat[((i * M + k) * 3 + 1) * P * P + idx];
-                float pd = patches_flat[((i * M + k) * 3 + 2) * P * P + idx];
+                // Compute flat index for patches: ((i*M + patch_k)*3 + c)*P*P + y*P + x
+                // Use frame i and patch patch_k (from k) to index patches
+                float px = patches_flat[((i * M + patch_k) * 3 + 0) * P * P + idx];
+                float py = patches_flat[((i * M + patch_k) * 3 + 1) * P * P + idx];
+                float pd = patches_flat[((i * M + patch_k) * 3 + 2) * P * P + idx];
 
                 // Inverse projection: X0 = [X, Y, Z, W] in homogeneous coordinates
                 float X0 = (px - intr_i[2]) / intr_i[0];
@@ -137,9 +142,17 @@ void transformWithJacobians(
     float* valid_out)   // [num_edges, P, P] flattened
 {
     for (int e = 0; e < num_edges; e++) {
-        int i = ii[e]; // source frame
-        int j = jj[e]; // target frame
-        int k = kk[e]; // patch index
+        int patch_i = ii[e]; // patch index (could be global or within frame - use kk to be safe)
+        int j = jj[e]; // target frame index
+        int k = kk[e]; // global patch index (frame * M + patch)
+        
+        // Extract source frame and patch from global patch index k
+        // Use k (kk[e]) as the authoritative source since it's explicitly the global patch index
+        int i = k / M;  // source frame index
+        int patch_k = k % M;  // patch index within frame
+        
+        // Use patch_k from k (kk[e]) as it's the authoritative source
+        // Note: ii[e] might also be global, but kk[e] is guaranteed to be correct
 
         const SE3& Ti = poses[i];
         const SE3& Tj = poses[j];
@@ -154,10 +167,57 @@ void transformWithJacobians(
         float cy_j = intr_j[3];
 
         // Get patch center coordinates
+        // Use frame i and patch patch_k (from k) to index patches
         int center_idx = (P / 2) * P + (P / 2);
-        float px = patches_flat[((i * M + k) * 3 + 0) * P * P + center_idx];
-        float py = patches_flat[((i * M + k) * 3 + 1) * P * P + center_idx];
-        float pd = patches_flat[((i * M + k) * 3 + 2) * P * P + center_idx];
+        int patch_base_idx = ((i * M + patch_k) * 3 + 0) * P * P + center_idx;
+        
+        // Validate patch index bounds (safety check - reasonable bounds)
+        if (i < 0 || i >= 100 || patch_k < 0 || patch_k >= M) {
+            // Invalid frame or patch index - set coordinates to NaN to mark as invalid
+            for (int y = 0; y < P; y++) {
+                for (int x = 0; x < P; x++) {
+                    int idx = y * P + x;
+                    int base = e * 2 * P * P;
+                    coords_out[base + 0 * P * P + idx] = std::numeric_limits<float>::quiet_NaN();
+                    coords_out[base + 1 * P * P + idx] = std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+            if (valid_out) {
+                for (int y = 0; y < P; y++) {
+                    for (int x = 0; x < P; x++) {
+                        int idx = y * P + x;
+                        valid_out[e * P * P + idx] = 0.0f;
+                    }
+                }
+            }
+            continue;  // Skip this edge
+        }
+        
+        float px = patches_flat[patch_base_idx];
+        float py = patches_flat[patch_base_idx + P * P];  // Channel 1 offset
+        float pd = patches_flat[patch_base_idx + 2 * P * P];  // Channel 2 offset
+        
+        // Validate patch data (check for NaN/Inf and reasonable depth)
+        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pd) || pd <= 0.0f || pd > 100.0f) {
+            // Invalid patch data - mark as invalid
+            for (int y = 0; y < P; y++) {
+                for (int x = 0; x < P; x++) {
+                    int idx = y * P + x;
+                    int base = e * 2 * P * P;
+                    coords_out[base + 0 * P * P + idx] = std::numeric_limits<float>::quiet_NaN();
+                    coords_out[base + 1 * P * P + idx] = std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+            if (valid_out) {
+                for (int y = 0; y < P; y++) {
+                    for (int x = 0; x < P; x++) {
+                        int idx = y * P + x;
+                        valid_out[e * P * P + idx] = 0.0f;
+                    }
+                }
+            }
+            continue;  // Skip this edge
+        }
 
         // Inverse projection at center
         float X0 = (px - intr_i[2]) / intr_i[0];
@@ -189,9 +249,10 @@ void transformWithJacobians(
                 int idx = y * P + x;
                 
                 // Get patch pixel coordinates
-                float px_pix = patches_flat[((i * M + k) * 3 + 0) * P * P + idx];
-                float py_pix = patches_flat[((i * M + k) * 3 + 1) * P * P + idx];
-                float pd_pix = patches_flat[((i * M + k) * 3 + 2) * P * P + idx];
+                // Use frame i and patch patch_k (from k) to index patches
+                float px_pix = patches_flat[((i * M + patch_k) * 3 + 0) * P * P + idx];
+                float py_pix = patches_flat[((i * M + patch_k) * 3 + 1) * P * P + idx];
+                float pd_pix = patches_flat[((i * M + patch_k) * 3 + 2) * P * P + idx];
 
                 // Inverse projection
                 float X0_pix = (px_pix - intr_i[2]) / intr_i[0];

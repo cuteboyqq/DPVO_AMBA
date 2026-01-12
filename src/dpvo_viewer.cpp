@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <random>
 /*
 Visual flow
 ---------------------------------------------------------------------------
@@ -73,27 +74,81 @@ void DPVOViewer::updateImage(const uint8_t* image_data, int width, int height)
 {
     std::lock_guard<std::mutex> lock(m_dataMutex);
     
-    if (width != m_imageWidth || height != m_imageHeight) {
+    if (width <= 0 || height <= 0 || image_data == nullptr) {
+        return;  // Invalid input
+    }
+    
+    bool size_changed = (width != m_imageWidth || height != m_imageHeight);
+    
+    if (size_changed) {
         m_imageWidth = width;
         m_imageHeight = height;
         m_imageBuffer.resize(width * height * 3);
+        m_textureSizeChanged = true;  // Flag to recreate texture
     }
     
     // Copy image data (assuming RGB format)
-    std::memcpy(m_imageBuffer.data(), image_data, width * height * 3);
-    m_imageUpdated = true;
+    size_t image_size = static_cast<size_t>(width) * height * 3;
+    if (m_imageBuffer.size() >= image_size) {
+        std::memcpy(m_imageBuffer.data(), image_data, image_size);
+        m_imageUpdated = true;
+    }
 }
 
 void DPVOViewer::updatePoses(const SE3* poses, int num_frames)
 {
     std::lock_guard<std::mutex> lock(m_dataMutex);
     
-    num_frames = std::min(num_frames, m_maxFrames);
-    m_numFrames = num_frames;
+    int original_num_frames = num_frames;
     
-    // Copy poses
+    // FOR TESTING: Force m_numFrames to increment each time for visualization testing
+    // This allows us to see all frames accumulate, not just the sliding window
+    static bool force_increment = true;  // Set to false to disable
+    if (force_increment) {
+        // Increment m_numFrames each time updatePoses is called
+        // This simulates frames accumulating for visualization testing
+        if (num_frames >= m_numFrames) {
+            // Only increment if the incoming num_frames is >= current m_numFrames
+            // This prevents going backwards
+            m_numFrames = m_numFrames + 1;
+            num_frames = m_numFrames;  // Use the incremented value
+        } else {
+            // If incoming num_frames is less, still increment for visualization testing
+            m_numFrames = m_numFrames + 1; // Alsiter add 2026-01-12
+        }
+    }
+    
+    // CRITICAL: Dynamically resize buffers if num_frames exceeds current size
+    // This allows the viewer to handle more frames than initially allocated
+    // if (num_frames > static_cast<int>(m_poses.size())) {
+    {
+        // Resize all pose-related buffers
+        m_poses.resize(m_numFrames);
+        m_poseMatrices.resize(m_numFrames * 16);  // 4x4 matrices
+        
+        // Also resize saved pose vectors
+        m_saved_cam_positions.resize(m_numFrames);
+        m_saved_forwards.resize(m_numFrames);
+        m_saved_rights.resize(m_numFrames);
+        m_saved_ups.resize(m_numFrames);
+    }
+    // m_numFrames = num_frames; // Alsiter noted 2026-01-12
+    
+    // Log only warnings
+    if (original_num_frames > static_cast<int>(m_poses.size())) {
+        printf("[DPVOViewer] updatePoses: WARNING - Limiting frames from %d to %zu (m_poses buffer size)\n",
+               original_num_frames, m_poses.size());
+        fflush(stdout);
+    }
+    
+    // Copy poses and normalize quaternions to prevent corruption
     for (int i = 0; i < num_frames; i++) {
         m_poses[i] = poses[i];
+        // Normalize quaternion to prevent corruption (should be ~1.0)
+        float q_norm = m_poses[i].q.norm();
+        if (std::abs(q_norm - 1.0f) > 0.01f) {
+            m_poses[i].q.normalize();
+        }
     }
     
     // Convert to matrices for OpenGL
@@ -105,36 +160,163 @@ void DPVOViewer::updatePoints(const Vec3* points, const uint8_t* colors, int num
     std::lock_guard<std::mutex> lock(m_dataMutex);
     
     num_points = std::min(num_points, m_maxPoints);
-    m_numPoints = num_points;
     
-    // Copy points
+    // Filter out invalid points (zero coordinates or NaN/Inf)
+    int valid_count = 0;
     for (int i = 0; i < num_points; i++) {
-        m_points[i] = points[i];
+        const Vec3& p = points[i];
+        // Check if point is valid (not all zeros, not NaN/Inf)
+        bool is_valid = (p.x != 0.0f || p.y != 0.0f || p.z != 0.0f) &&
+                       std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
+                       std::abs(p.x) < 1000.0f && std::abs(p.y) < 1000.0f && std::abs(p.z) < 1000.0f;
+        
+        if (is_valid) {
+            m_points[valid_count] = p;
+            if (colors) {
+                m_colors[valid_count * 3 + 0] = colors[i * 3 + 0];
+                m_colors[valid_count * 3 + 1] = colors[i * 3 + 1];
+                m_colors[valid_count * 3 + 2] = colors[i * 3 + 2];
+            } else {
+                m_colors[valid_count * 3 + 0] = 255;
+                m_colors[valid_count * 3 + 1] = 255;
+                m_colors[valid_count * 3 + 2] = 255;
+            }
+            valid_count++;
+        }
     }
     
-    // Copy colors
-    if (colors) {
-        std::memcpy(m_colors.data(), colors, num_points * 3);
-    } else {
-        // Default white color if no colors provided
-        std::fill(m_colors.begin(), m_colors.begin() + num_points * 3, 255);
-    }
+    m_numPoints = valid_count;
 }
 
 void DPVOViewer::convertPosesToMatrices()
 {
 #ifdef ENABLE_PANGOLIN_VIEWER
     // Convert SE3 poses to 4x4 OpenGL matrices (column-major)
+    // SE3 poses are world-to-camera (T_wc), we need camera-to-world (T_cw) for visualization
+    static int convert_count = 0;
     for (int i = 0; i < m_numFrames; i++) {
-        Eigen::Matrix4f T = m_poses[i].inverse().matrix();  // Inverse for camera-to-world
+        // Get camera-to-world transformation: T_cw = T_wc^-1
+        SE3 T_wc = m_poses[i];
         
-        // Store in column-major order for OpenGL
+        // Validate input pose first
+        Eigen::Vector3f t_wc = T_wc.t;
+        Eigen::Quaternionf q_wc = T_wc.q;
+        
+        // Check if quaternion is normalized (should be ~1.0)
+        float q_norm = q_wc.norm();
+        
+        // Check if translation is reasonable
+        bool t_valid = (std::isfinite(t_wc.x()) && std::isfinite(t_wc.y()) && std::isfinite(t_wc.z()) &&
+                       std::abs(t_wc.x()) < 1000.0f && std::abs(t_wc.y()) < 1000.0f && std::abs(t_wc.z()) < 1000.0f);
+        
+        // Always try to normalize quaternion if it's not already normalized
+        // Even if the norm is huge (like 466 or 23801), normalizing should give a valid quaternion
+        bool q_valid = false;
+        if (q_norm > 1e-6f && q_norm < 1e6f) {  // Reasonable range for normalization
+            if (std::abs(q_norm - 1.0f) > 0.01f) {
+                q_wc.normalize();
+                T_wc.q = q_wc;
+                m_poses[i] = T_wc;  // Update stored pose
+            }
+            q_valid = true;  // Quaternion is now valid after normalization
+        } else {
+            // Quaternion is completely corrupted (zero or infinite), use identity rotation but keep translation
+            if (t_valid) {
+                // Keep translation but use identity rotation
+                T_wc.q = Eigen::Quaternionf::Identity();
+                T_wc.t = t_wc;
+                m_poses[i] = T_wc;
+                q_valid = true;  // Mark as valid after fixing
+            }
+        }
+        
+        // If both are invalid, use identity as fallback
+        if (!q_valid || !t_valid) {
+            // Use identity as fallback
+            Eigen::Matrix4f T_cw = Eigen::Matrix4f::Identity();
+            float* mat = &m_poseMatrices[i * 16];
+            mat[0]  = T_cw(0,0); mat[4]  = T_cw(1,0); mat[8]  = T_cw(2,0); mat[12] = T_cw(3,0);
+            mat[1]  = T_cw(0,1); mat[5]  = T_cw(1,1); mat[9]  = T_cw(2,1); mat[13] = T_cw(3,1);
+            mat[2]  = T_cw(0,2); mat[6]  = T_cw(1,2); mat[10] = T_cw(2,2); mat[14] = T_cw(3,2);
+            mat[3]  = T_cw(0,3); mat[7]  = T_cw(1,3); mat[11] = T_cw(2,3); mat[15] = T_cw(3,3);
+            continue;
+        }
+        
+        // Normalize quaternion if needed (should be ~1.0, but allow small deviation)
+        if (std::abs(q_norm - 1.0f) > 0.01f) {
+            q_wc.normalize();
+            T_wc.q = q_wc;
+            // Update the stored pose to prevent corruption from propagating
+            m_poses[i] = T_wc;
+        }
+        
+        // Compute inverse using the same method as DPViewer's invSE3
+        // T_cw = T_wc^-1
+        // Formula matches DPViewer's invSE3:
+        //   q_cw = conjugate(q_wc)
+        //   t_cw = -R_cw * t_wc, where R_cw is rotation matrix from q_cw
+        SE3 T_cw_se3 = T_wc.inverse();
+        Eigen::Vector3f t_cw = T_cw_se3.t;
+        Eigen::Quaternionf q_cw = T_cw_se3.q;
+        
+        // Build rotation matrix from quaternion components (matching DPViewer's pose_to_matrix_kernel)
+        // This matches the exact formula used in viewer_cuda.cu lines 244-257
+        float qx = q_cw.x();
+        float qy = q_cw.y();
+        float qz = q_cw.z();
+        float qw = q_cw.w();
+        
+        Eigen::Matrix3f R_cw;
+        R_cw(0,0) = 1 - 2*qy*qy - 2*qz*qz;
+        R_cw(0,1) = 2*qx*qy - 2*qw*qz;
+        R_cw(0,2) = 2*qx*qz + 2*qw*qy;
+        R_cw(1,0) = 2*qx*qy + 2*qw*qz;
+        R_cw(1,1) = 1 - 2*qx*qx - 2*qz*qz;
+        R_cw(1,2) = 2*qy*qz - 2*qw*qx;
+        R_cw(2,0) = 2*qx*qz - 2*qw*qy;
+        R_cw(2,1) = 2*qy*qz + 2*qw*qx;
+        R_cw(2,2) = 1 - 2*qx*qx - 2*qy*qy;
+        
+        // Build T_cw matrix (matches DPViewer's pose_to_matrix_kernel output format)
+        Eigen::Matrix4f T_cw = Eigen::Matrix4f::Identity();
+        T_cw.block<3,3>(0,0) = R_cw;
+        T_cw.block<3,1>(0,3) = t_cw;
+        
+        // Validate transformation matrix and translation
+        bool is_valid = true;
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                if (!std::isfinite(T_cw(r, c))) {
+                    is_valid = false;
+                    break;
+                }
+            }
+            if (!is_valid) break;
+        }
+        
+        // Also validate translation - check for reasonable values
+        if (!std::isfinite(t_cw.x()) || !std::isfinite(t_cw.y()) || !std::isfinite(t_cw.z()) ||
+            std::abs(t_cw.x()) > 1000.0f || std::abs(t_cw.y()) > 1000.0f || std::abs(t_cw.z()) > 1000.0f) {
+            is_valid = false;
+        }
+        
+        if (!is_valid) {
+            // Use identity matrix as fallback for invalid poses
+            T_cw = Eigen::Matrix4f::Identity();
+            t_cw = Eigen::Vector3f::Zero();
+        }
+        
+        // Store in column-major order for OpenGL (glMultMatrixf expects column-major)
+        // Column-major: mat[col*4 + row] = T_cw(row, col)
         float* mat = &m_poseMatrices[i * 16];
-        mat[0]  = T(0,0); mat[4]  = T(1,0); mat[8]  = T(2,0); mat[12] = T(3,0);
-        mat[1]  = T(0,1); mat[5]  = T(1,1); mat[9]  = T(2,1); mat[13] = T(3,1);
-        mat[2]  = T(0,2); mat[6]  = T(1,2); mat[10] = T(2,2); mat[14] = T(3,2);
-        mat[3]  = T(0,3); mat[7]  = T(1,3); mat[11] = T(2,3); mat[15] = T(3,3);
+        mat[0]  = T_cw(0,0); mat[4]  = T_cw(1,0); mat[8]  = T_cw(2,0); mat[12] = T_cw(3,0);
+        mat[1]  = T_cw(0,1); mat[5]  = T_cw(1,1); mat[9]  = T_cw(2,1); mat[13] = T_cw(3,1);
+        mat[2]  = T_cw(0,2); mat[6]  = T_cw(1,2); mat[10] = T_cw(2,2); mat[14] = T_cw(3,2);
+        mat[3]  = T_cw(0,3); mat[7]  = T_cw(1,3); mat[11] = T_cw(2,3); mat[15] = T_cw(3,3);
+        
+        // Verify: mat[3], mat[7], mat[11] should equal t_cw.x(), t_cw.y(), t_cw.z()
     }
+    convert_count++;
 #endif
 }
 
@@ -166,8 +348,11 @@ void DPVOViewer::drawPoints()
     glVertexPointer(3, GL_FLOAT, 0, 0);
     glEnableClientState(GL_VERTEX_ARRAY);
     
-    glPointSize(2.0f);
+    // Increase point size and enable point smoothing for better visibility
+    glEnable(GL_POINT_SMOOTH);
+    glPointSize(4.0f);  // Increased from 2.0f to 4.0f for better visibility
     glDrawArrays(GL_POINTS, 0, m_numPoints);
+    glDisable(GL_POINT_SMOOTH);
     
     glDisableClientState(GL_VERTEX_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);
@@ -184,49 +369,445 @@ void DPVOViewer::drawPoses()
     
     std::lock_guard<std::mutex> lock(m_dataMutex);
     
-    const int NUM_POINTS = 8;
-    const int NUM_LINES = 10;
+    // Ensure matrices are up to date (in case poses changed)
+    convertPosesToMatrices();
     
-    const float CAM_POINTS[NUM_POINTS][3] = {
-        { 0,   0,   0},
-        {-1,  -1, 1.5},
-        { 1,  -1, 1.5},
-        { 1,   1, 1.5},
-        {-1,   1, 1.5},
-        {-0.5, 1, 1.5},
-        { 0.5, 1, 1.5},
-        { 0, 1.2, 1.5}
-    };
+    // Debug counter (reduced logging frequency)
+    static int draw_count = 0;
+    draw_count++;
     
-    const int CAM_LINES[NUM_LINES][2] = {
-        {1,2}, {2,3}, {3,4}, {4,1}, {1,0}, {0,2}, {3,0}, {0,4}, {5,7}, {7,6}
-    };
+    // Draw camera poses as square pyramids (frustums) to show position and orientation
+    // No need for point smoothing when drawing lines
     
-    const float SZ = 0.05f;
+    // Store valid poses as we process them (for fake pose generation)
+    // Use member variables to persist across draw calls - this ensures previous frames keep their saved positions
     
-    glColor3f(0.0f, 0.5f, 1.0f);
-    glLineWidth(1.5f);
+    // Resize if number of frames increased (new frames added)
+    if (m_numFrames > static_cast<int>(m_saved_cam_positions.size())) {
+        m_saved_cam_positions.resize(m_numFrames);
+        m_saved_forwards.resize(m_numFrames);
+        m_saved_rights.resize(m_numFrames);
+        m_saved_ups.resize(m_numFrames);
+    }
     
-    for (int i = 0; i < m_numFrames; i++) {
-        // Current frame in red
+    // Use saved poses for reference - start with saved poses, then build up as we process
+    std::vector<Eigen::Vector3f> valid_cam_positions;
+    std::vector<Eigen::Vector3f> valid_forwards;
+    std::vector<Eigen::Vector3f> valid_rights;
+    std::vector<Eigen::Vector3f> valid_ups;
+    
+    // Initialize with saved poses (if any)
+    valid_cam_positions = m_saved_cam_positions;
+    valid_forwards = m_saved_forwards;
+    valid_rights = m_saved_rights;
+    valid_ups = m_saved_ups;
+    
+    int valid_poses_drawn = 0;
+    int skipped_invalid_matrix = 0;
+    int skipped_out_of_bounds = 0;
+    
+    // Reduced logging frequency
+    
+    // CRITICAL: Ensure we process ALL frames up to m_numFrames
+    // The loop should iterate from 0 to m_numFrames-1 (inclusive)
+    // m_numFrames=9 means frames 0-8 (9 frames), m_numFrames=10 means frames 0-9 (10 frames)
+    // Don't limit to m_maxFrames - process all frames that were passed in
+    int frames_to_process = m_numFrames;
+    
+    // Only limit if it would exceed the pose buffer size (safety check)
+        if (frames_to_process > static_cast<int>(m_poses.size())) {
+        frames_to_process = static_cast<int>(m_poses.size());
+        if (draw_count % 300 == 0) {  // Reduced frequency
+            printf("[DPVOViewer] drawPoses: WARNING - m_numFrames=%d > m_poses.size()=%zu, limiting to %d\n",
+                   m_numFrames, m_poses.size(), frames_to_process);
+            fflush(stdout);
+        }
+    }
+    
+        // Ensure saved vectors are large enough for all frames we'll process
+        if (frames_to_process > static_cast<int>(m_saved_cam_positions.size())) {
+            m_saved_cam_positions.resize(frames_to_process);
+            m_saved_forwards.resize(frames_to_process);
+            m_saved_rights.resize(frames_to_process);
+            m_saved_ups.resize(frames_to_process);
+        }
+    
+    for (int i = 0; i < frames_to_process; i++) {
+        // Validate matrix before using it
+        float* mat = &m_poseMatrices[i * 16];
+        bool matrix_valid = true;
+        int invalid_element = -1;
+        for (int j = 0; j < 16; j++) {
+            if (!std::isfinite(mat[j])) {
+                matrix_valid = false;
+                invalid_element = j;
+                break;
+            }
+        }
+        
+        // Extract camera position and orientation
+        float cam_x = mat[3];
+        float cam_y = mat[7];
+        float cam_z = mat[11];
+        
+        // Extract rotation vectors
+        Eigen::Vector3f forward = Eigen::Vector3f(-mat[8], -mat[9], -mat[10]);  // -Z direction in camera frame
+        Eigen::Vector3f right = Eigen::Vector3f(mat[0], mat[1], mat[2]);         // X direction
+        Eigen::Vector3f up = Eigen::Vector3f(mat[4], mat[5], mat[6]);            // Y direction
+        
+        // FAKE VALUES FOR TESTING: Always use values close to previous frame to create smooth trajectory
+        // This ensures consecutive frames are close together, forming a line/snake pattern
+        bool use_fake = false;
+        
+        // Check if current frame is invalid OR if we want to force fake values for testing
+        bool is_invalid = (!matrix_valid || 
+            !std::isfinite(cam_x) || !std::isfinite(cam_y) || !std::isfinite(cam_z) ||
+            std::abs(cam_x) > 1000.0f || std::abs(cam_y) > 1000.0f || std::abs(cam_z) > 1000.0f ||
+            !std::isfinite(forward.x()) || !std::isfinite(forward.y()) || !std::isfinite(forward.z()) ||
+            forward.norm() < 0.1f || right.norm() < 0.1f || up.norm() < 0.1f);
+        
+        // FOR TESTING: Always use fake values (close to previous frame) to create smooth trajectory
+        // Set to false to use real poses when they're valid
+        // FORCE ALL FRAMES TO USE FAKE VALUES FOR VISUALIZATION TESTING
+        const bool FORCE_FAKE_FOR_TESTING = true;
+        
+        // Check if this frame already has a saved position (previous frame)
+        // Note: After resize, new elements are zero, so we check if norm > 0
+        bool has_saved_position = (i < static_cast<int>(m_saved_cam_positions.size()) && 
+                                   m_saved_cam_positions[i].norm() > 0.0f);
+        
+        
+        // FORCE ALL FRAMES TO USE FAKE VALUES FOR TESTING
+        if (FORCE_FAKE_FOR_TESTING) {
+            // Always use fake values - previous frames use saved fake positions, current frame gets new random
+            use_fake = true;
+            
+            // If we have a saved position and it's not the newest frame, use it (it was fake before)
+            if (has_saved_position && i < m_numFrames - 1) {
+                // Previous frame - use saved fake position (no new random)
+                cam_x = m_saved_cam_positions[i].x();
+                cam_y = m_saved_cam_positions[i].y();
+                cam_z = m_saved_cam_positions[i].z();
+                forward = m_saved_forwards[i];
+                right = m_saved_rights[i];
+                up = m_saved_ups[i];
+                use_fake = false;  // Using saved fake value, not generating new
+                
+            } else {
+                // Current frame (newest) or frame without saved position - generate new fake random
+                use_fake = true;
+                
+                // Use the immediate previous frame's pose (i-1) if available
+                if (i > 0) {
+                    // Get previous frame's pose (prefer saved, fallback to current valid list, or use frame 0)
+                    Eigen::Vector3f prev_pos, prev_fwd, prev_rgt, prev_up_vec;
+                    bool found_prev = false;
+                    
+                    // First try: use saved previous frame (frame i-1)
+                    if (i-1 < static_cast<int>(m_saved_cam_positions.size()) && m_saved_cam_positions[i-1].norm() > 0.0f) {
+                        prev_pos = m_saved_cam_positions[i-1];
+                        prev_fwd = m_saved_forwards[i-1];
+                        prev_rgt = m_saved_rights[i-1];
+                        prev_up_vec = m_saved_ups[i-1];
+                        found_prev = true;
+                    } 
+                    // Second try: use from current valid list (should have frame i-1 if we processed it)
+                    else if (valid_cam_positions.size() > 0) {
+                        // Try to find frame i-1 in valid list
+                        if (i-1 < static_cast<int>(valid_cam_positions.size())) {
+                            prev_pos = valid_cam_positions[i-1];
+                            prev_fwd = valid_forwards[i-1];
+                            prev_rgt = valid_rights[i-1];
+                            prev_up_vec = valid_ups[i-1];
+                            found_prev = true;
+                        } else {
+                            // Use last valid frame as fallback
+                            size_t prev_idx = valid_cam_positions.size() - 1;
+                            prev_pos = valid_cam_positions[prev_idx];
+                            prev_fwd = valid_forwards[prev_idx];
+                            prev_rgt = valid_rights[prev_idx];
+                            prev_up_vec = valid_ups[prev_idx];
+                            found_prev = true;
+                        }
+                    }
+                    // Third try: use frame 0 as fallback
+                    else if (m_saved_cam_positions.size() > 0 && m_saved_cam_positions[0].norm() > 0.0f) {
+                        prev_pos = m_saved_cam_positions[0];
+                        prev_fwd = m_saved_forwards[0];
+                        prev_rgt = m_saved_rights[0];
+                        prev_up_vec = m_saved_ups[0];
+                        found_prev = true;
+                    }
+                    // Last resort: use origin
+                    if (!found_prev) {
+                        prev_pos = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+                        prev_fwd = Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+                        prev_rgt = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+                        prev_up_vec = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+                    }
+                    
+                    // Use previous frame's pose with random small movement in all directions
+                    // This creates a more natural trajectory while keeping poses close together
+                    // Random number generator for small variations
+                    thread_local std::mt19937 gen(std::chrono::steady_clock::now().time_since_epoch().count());
+                    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                    
+                    // REDUCED movement speed to keep poses close together
+                    const float base_move_speed = 0.01f;  // Small base movement speed
+                    
+                    // Random offsets for more natural movement (very small variations)
+                    float forward_offset = dis(gen) * base_move_speed * 0.3f;  // Random forward/backward (small)
+                    float right_offset = dis(gen) * base_move_speed * 0.2f;     // Random left/right (small)
+                    float up_offset = dis(gen) * base_move_speed * 0.1f;        // Random up/down (small)
+                    
+                    // Generate new position: previous position + small forward movement + small random offsets
+                    // This ensures consecutive frames are close together (within ~0.01-0.02 units)
+                    cam_x = prev_pos.x() + prev_fwd.x() * (base_move_speed + forward_offset) 
+                             + prev_rgt.x() * right_offset + prev_up_vec.x() * up_offset;
+                    cam_y = prev_pos.y() + prev_fwd.y() * (base_move_speed + forward_offset) 
+                             + prev_rgt.y() * right_offset + prev_up_vec.y() * up_offset;
+                    cam_z = prev_pos.z() + prev_fwd.z() * (base_move_speed + forward_offset) 
+                             + prev_rgt.z() * right_offset + prev_up_vec.z() * up_offset;
+                    
+                    // Keep same orientation as previous frame
+                    forward = prev_fwd;
+                    right = prev_rgt;
+                    up = prev_up_vec;
+                } else {
+                    // Frame 0: start at origin
+                    cam_x = 0.0f;
+                    cam_y = 0.0f;
+                    cam_z = 0.0f;
+                    forward = Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+                    right = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+                    up = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+                }
+            }
+        } else if (has_saved_position) {
+            // Normal mode: Previous frame - use saved position
+            cam_x = m_saved_cam_positions[i].x();
+            cam_y = m_saved_cam_positions[i].y();
+            cam_z = m_saved_cam_positions[i].z();
+            forward = m_saved_forwards[i];
+            right = m_saved_rights[i];
+            up = m_saved_ups[i];
+            use_fake = false;  // Using saved, not generating new
+        } else if (is_invalid) {
+            // Current frame (newest) or invalid - generate new random movement
+            use_fake = true;
+            
+            // Use the immediate previous frame's pose (i-1) if available
+            if (i > 0) {
+                // Get previous frame's pose (prefer saved, fallback to current valid list, or use frame 0)
+                Eigen::Vector3f prev_pos, prev_fwd, prev_rgt, prev_up_vec;
+                bool found_prev = false;
+                
+                // First try: use saved previous frame (frame i-1)
+                if (i-1 < static_cast<int>(m_saved_cam_positions.size()) && m_saved_cam_positions[i-1].norm() > 0.0f) {
+                    prev_pos = m_saved_cam_positions[i-1];
+                    prev_fwd = m_saved_forwards[i-1];
+                    prev_rgt = m_saved_rights[i-1];
+                    prev_up_vec = m_saved_ups[i-1];
+                    found_prev = true;
+                } 
+                // Second try: use from current valid list (should have frame i-1 if we processed it)
+                else if (valid_cam_positions.size() > 0) {
+                    // Try to find frame i-1 in valid list
+                    if (i-1 < static_cast<int>(valid_cam_positions.size())) {
+                        prev_pos = valid_cam_positions[i-1];
+                        prev_fwd = valid_forwards[i-1];
+                        prev_rgt = valid_rights[i-1];
+                        prev_up_vec = valid_ups[i-1];
+                        found_prev = true;
+                    } else {
+                        // Use last valid frame as fallback
+                        size_t prev_idx = valid_cam_positions.size() - 1;
+                        prev_pos = valid_cam_positions[prev_idx];
+                        prev_fwd = valid_forwards[prev_idx];
+                        prev_rgt = valid_rights[prev_idx];
+                        prev_up_vec = valid_ups[prev_idx];
+                        found_prev = true;
+                    }
+                }
+                // Third try: use frame 0 as fallback
+                else if (m_saved_cam_positions.size() > 0 && m_saved_cam_positions[0].norm() > 0.0f) {
+                    prev_pos = m_saved_cam_positions[0];
+                    prev_fwd = m_saved_forwards[0];
+                    prev_rgt = m_saved_rights[0];
+                    prev_up_vec = m_saved_ups[0];
+                    found_prev = true;
+                }
+                // Last resort: use origin
+                if (!found_prev) {
+                    prev_pos = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
+                    prev_fwd = Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+                    prev_rgt = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+                    prev_up_vec = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+                }
+                
+                
+                // Use previous frame's pose with random small movement in all directions
+                // This creates a more natural trajectory while keeping poses close together
+                const float base_move_speed = 0.01f;  // SMALL movement speed to keep poses close together
+                
+                // Generate random small offsets in all directions
+                static std::random_device rd;
+                static std::mt19937 gen(rd());
+                static std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                
+                // Small random movement in forward, right, and up directions
+                float forward_offset = dis(gen) * base_move_speed * 0.3f;  // Small random forward/backward
+                float right_offset = dis(gen) * base_move_speed * 0.2f;     // Small random left/right
+                float up_offset = dis(gen) * base_move_speed * 0.1f;        // Small random up/down
+                
+                // Move in forward direction (main movement) plus random offsets
+                cam_x = prev_pos.x() + prev_fwd.x() * (base_move_speed + forward_offset) 
+                                       + prev_rgt.x() * right_offset 
+                                       + prev_up_vec.x() * up_offset;
+                cam_y = prev_pos.y() + prev_fwd.y() * (base_move_speed + forward_offset) 
+                                       + prev_rgt.y() * right_offset 
+                                       + prev_up_vec.y() * up_offset;
+                cam_z = prev_pos.z() + prev_fwd.z() * (base_move_speed + forward_offset) 
+                                       + prev_rgt.z() * right_offset 
+                                       + prev_up_vec.z() * up_offset;
+                
+                // Use previous orientation (keep same orientation)
+                forward = prev_fwd;
+                right = prev_rgt;
+                up = prev_up_vec;
+                
+            } else {
+                // First frame or no previous valid frame - use default/identity
+                if (i == 0) {
+                    // First frame should be at origin with identity orientation
+                    cam_x = 0.0f;
+                    cam_y = 0.0f;
+                    cam_z = 0.0f;
+                    forward = Eigen::Vector3f(0.0f, 0.0f, -1.0f);
+                    right = Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+                    up = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
+                    
+                } else {
+                    skipped_invalid_matrix++;
+                    continue;
+                }
+            }
+        }
+        
+        if (!use_fake) {
+            // Validate position - check for reasonable values
+            bool out_of_bounds = (std::abs(cam_x) > 1000.0f || std::abs(cam_y) > 1000.0f || std::abs(cam_z) > 1000.0f);
+            if (out_of_bounds) {
+                skipped_out_of_bounds++;
+                continue;
+            }
+        }
+        
+        // Store this valid pose for future reference
+        // Use index-based storage to ensure indices match frame numbers
+        if (i >= static_cast<int>(valid_cam_positions.size())) {
+            valid_cam_positions.resize(i + 1);
+            valid_forwards.resize(i + 1);
+            valid_rights.resize(i + 1);
+            valid_ups.resize(i + 1);
+        }
+        valid_cam_positions[i] = Eigen::Vector3f(cam_x, cam_y, cam_z);
+        valid_forwards[i] = forward;
+        valid_rights[i] = right;
+        valid_ups[i] = up;
+        
+        // Always save the pose to ensure all frames are stored
+        // Ensure vector is large enough before saving
+        if (i >= static_cast<int>(m_saved_cam_positions.size())) {
+            // Resize to accommodate frame i (need size i+1 for index i)
+            size_t new_size = i + 1;
+            m_saved_cam_positions.resize(new_size);
+            m_saved_forwards.resize(new_size);
+            m_saved_rights.resize(new_size);
+            m_saved_ups.resize(new_size);
+            
+        }
+        
+        // Save the pose (always update, even if already saved, to ensure it's current)
+        m_saved_cam_positions[i] = Eigen::Vector3f(cam_x, cam_y, cam_z);
+        m_saved_forwards[i] = forward;
+        m_saved_rights[i] = right;
+        m_saved_ups[i] = up;
+        
+        // Current frame in red, others in blue
         if (i + 1 == m_numFrames) {
-            glColor3f(1.0f, 0.0f, 0.0f);
+            glColor3f(1.0f, 0.0f, 0.0f);  // Red for current frame
         } else {
-            glColor3f(0.0f, 0.5f, 1.0f);
+            glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
         }
         
-        glPushMatrix();
-        glMultMatrixf(&m_poseMatrices[i * 16]);
+        // Draw camera as a square pyramid (frustum) to show position and orientation
+        // Pyramid: tip at camera position, base square in front of camera
+        // Camera looks in -Z direction in camera frame, so base is at -Z in camera frame
         
+        // Normalize direction vectors (only if not using fake values, fake values are already normalized)
+        if (!use_fake) {
+            forward.normalize();
+            right.normalize();
+            up.normalize();
+        }
+        
+        // Pyramid parameters
+        const float pyramid_base_size = 0.05f;  // Size of pyramid base (adjust for visibility)
+        const float pyramid_height = 0.1f;      // Distance from tip to base
+        
+        // Camera position (tip of pyramid)
+        Eigen::Vector3f tip(cam_x, cam_y, cam_z);
+        
+        // Base center is in front of camera (forward direction)
+        Eigen::Vector3f base_center = tip + forward * pyramid_height;
+        
+        // Base square corners
+        Eigen::Vector3f base_corner1 = base_center + right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner2 = base_center - right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner3 = base_center - right * pyramid_base_size - up * pyramid_base_size;
+        Eigen::Vector3f base_corner4 = base_center + right * pyramid_base_size - up * pyramid_base_size;
+        
+        // Draw pyramid using lines
+        glLineWidth(2.0f);
         glBegin(GL_LINES);
-        for (int j = 0; j < NUM_LINES; j++) {
-            const int u = CAM_LINES[j][0], v = CAM_LINES[j][1];
-            glVertex3f(SZ * CAM_POINTS[u][0], SZ * CAM_POINTS[u][1], SZ * CAM_POINTS[u][2]);
-            glVertex3f(SZ * CAM_POINTS[v][0], SZ * CAM_POINTS[v][1], SZ * CAM_POINTS[v][2]);
-        }
+        
+        // Lines from tip to base corners
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
+        
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
+        
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
+        
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        
+        // Base square edges
+        glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
+        glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
+        
+        glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
+        glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
+        
+        glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
+        
         glEnd();
         
-        glPopMatrix();
+        valid_poses_drawn++;
+    }
+    
+    // Log warnings only if there are issues
+    if (valid_poses_drawn != m_numFrames && draw_count % 300 == 0) {
+        printf("[DPVOViewer] drawPoses: WARNING - Only drew %d/%d valid poses (skipped_invalid=%d, skipped_out_of_bounds=%d)\n", 
+               valid_poses_drawn, m_numFrames, skipped_invalid_matrix, skipped_out_of_bounds);
+        fflush(stdout);
     }
 #endif
 }
@@ -234,8 +815,14 @@ void DPVOViewer::drawPoses()
 void DPVOViewer::run()
 {
 #ifdef ENABLE_PANGOLIN_VIEWER
+    printf("[DPVOViewer] run() thread started\n");
+    fflush(stdout);
+    
     // Initialize Pangolin window
     pangolin::CreateWindowAndBind("DPVO Viewer", 2 * 640, 2 * 480);
+    
+    printf("[DPVOViewer] run() Pangolin window created\n");
+    fflush(stdout);
     
 #ifdef __linux__
     // Position window on the right side of the screen
@@ -318,19 +905,43 @@ void DPVOViewer::run()
         .AddDisplay(*m_videoDisplay);
     
     // Main rendering loop
+    static int loop_count = 0;
+    printf("[DPVOViewer] run() entering main loop, m_running=%d\n", m_running ? 1 : 0);
+    fflush(stdout);
+    
     while (!pangolin::ShouldQuit() && m_running) {
+    // while (true) {
+        loop_count++;
+        
+        // Reduced logging frequency
+        
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
         
         // Draw 3D scene
         m_3dDisplay->Activate(*m_camera);
+        
         drawPoints();
         drawPoses();
         
         // Update and draw image
+        if (m_textureSizeChanged) {
+            std::lock_guard<std::mutex> lock(m_dataMutex);
+            // Recreate texture with new size
+            if (m_texture) {
+                delete m_texture;
+            }
+            m_texture = new pangolin::GlTexture(m_imageWidth, m_imageHeight, 
+                                                GL_RGB, false, 0, GL_RGB, GL_UNSIGNED_BYTE);
+            m_videoDisplay->SetAspect(static_cast<float>(m_imageWidth) / m_imageHeight);
+            m_textureSizeChanged = false;
+        }
+        
         if (m_imageUpdated) {
             std::lock_guard<std::mutex> lock(m_dataMutex);
-            m_texture->Upload(m_imageBuffer.data(), GL_RGB, GL_UNSIGNED_BYTE);
+            if (m_texture && m_imageBuffer.size() >= static_cast<size_t>(m_imageWidth) * m_imageHeight * 3) {
+                m_texture->Upload(m_imageBuffer.data(), GL_RGB, GL_UNSIGNED_BYTE);
+            }
             m_imageUpdated = false;
         }
         

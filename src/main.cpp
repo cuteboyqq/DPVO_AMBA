@@ -1413,6 +1413,15 @@ void processDPVOApp(
 		// This ensures fmap/imap buffers match what fnet/inet models output
 		std::unique_ptr<DPVO> dpvo(new DPVO(dpvoCfg, ht, wd, config));
 
+		// Set camera intrinsics: fx, fy, cx, cy (at full resolution)
+		// These will be automatically scaled by RES=4 when stored in PatchGraph
+		// User-provided intrinsics: fx=1660.0, fy=1660.0, cx=960.0, cy=540.0
+		// Resolution: 1920x1080
+		float camera_intrinsics[4] = {1660.0f, 1660.0f, 960.0f, 540.0f};
+		dpvo->setIntrinsics(camera_intrinsics);
+		logger->info("Set camera intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
+		             camera_intrinsics[0], camera_intrinsics[1], camera_intrinsics[2], camera_intrinsics[3]);
+
 		// Set fnet and inet models for Patchifier (will create new model instances)
 		// This will also start the processing thread (via _startThreads)
 		dpvo->setPatchifierModels(config, config);

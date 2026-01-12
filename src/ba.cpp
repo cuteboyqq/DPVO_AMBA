@@ -4,6 +4,7 @@
 #include "eigen_common.h"
 #include "eigen/Eigen/Dense"
 #include "eigen/Eigen/Cholesky"
+#include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -58,21 +59,89 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     std::vector<float> r(num_active * 2); // [num_active, 2]
     std::vector<float> v(num_active, 1.0f); // validity mask
 
+    auto logger = spdlog::get("dpvo");
+    float residual_sum = 0.0f;
+    int valid_residuals = 0;
+
+    int nan_residual_count = 0;
     for (int e = 0; e < num_active; e++) {
         // Extract coordinates at patch center
         float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
         float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
         
+        // Validate inputs before computing residual
+        float target_x = m_pg.m_target[e * 2 + 0];
+        float target_y = m_pg.m_target[e * 2 + 1];
+        
+        if (!std::isfinite(cx) || !std::isfinite(cy) || 
+            !std::isfinite(target_x) || !std::isfinite(target_y)) {
+            // Invalid input - set residual to zero and invalidate edge
+            r[e * 2 + 0] = 0.0f;
+            r[e * 2 + 1] = 0.0f;
+            v[e] = 0.0f;
+            nan_residual_count++;
+            if (logger && nan_residual_count <= 5) {
+                logger->warn("BA: Invalid residual[{}]: target=({}, {}), coords=({}, {})", 
+                            e, target_x, target_y, cx, cy);
+            }
+            continue;
+        }
+        
         // Reprojection residual
-        r[e * 2 + 0] = m_pg.m_target[e * 2 + 0] - cx;
-        r[e * 2 + 1] = m_pg.m_target[e * 2 + 1] - cy;
+        r[e * 2 + 0] = target_x - cx;
+        r[e * 2 + 1] = target_y - cy;
+        
+        // Check if residual itself is NaN/Inf
+        if (!std::isfinite(r[e * 2 + 0]) || !std::isfinite(r[e * 2 + 1])) {
+            r[e * 2 + 0] = 0.0f;
+            r[e * 2 + 1] = 0.0f;
+            v[e] = 0.0f;
+            nan_residual_count++;
+            if (logger && nan_residual_count <= 5) {
+                logger->warn("BA: NaN residual[{}]: target=({}, {}), coords=({}, {}), residual=({}, {})", 
+                            e, target_x, target_y, cx, cy, r[e * 2 + 0], r[e * 2 + 1]);
+            }
+            continue;
+        }
 
         // Reject large residuals
         float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
-        if (r_norm >= 250.0f) {
+        if (r_norm >= 250.0f || !std::isfinite(r_norm)) {
             v[e] = 0.0f;
+        } else {
+            residual_sum += r_norm;
+            valid_residuals++;
         }
-
+    }
+    
+    if (logger && nan_residual_count > 0) {
+        logger->warn("BA: {} out of {} edges have NaN/Inf residuals", nan_residual_count, num_active);
+    }
+    
+    if (logger) {
+        logger->info("BA: Residual stats - valid={}/{}, mean_residual={:.4f}", 
+                     valid_residuals, num_active, 
+                     valid_residuals > 0 ? residual_sum / valid_residuals : 0.0f);
+        if (valid_residuals > 0 && valid_residuals < 5) {
+            // Log first few residuals for debugging
+            for (int e = 0; e < std::min(3, num_active); e++) {
+                float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
+                logger->info("BA: Residual[{}]: target=({:.2f}, {:.2f}), coords=({:.2f}, {:.2f}), "
+                             "residual=({:.4f}, {:.4f}), norm={:.4f}, valid={}",
+                             e, m_pg.m_target[e * 2 + 0], m_pg.m_target[e * 2 + 1],
+                             coords[e * 2 * P * P + 0 * P * P + center_idx],
+                             coords[e * 2 * P * P + 1 * P * P + center_idx],
+                             r[e * 2 + 0], r[e * 2 + 1], r_norm, v[e]);
+            }
+        }
+    }
+    
+    // Continue with remaining validity checks (this was outside the loop, moved here)
+    for (int e = 0; e < num_active; e++) {
+        // Extract coordinates at patch center for bounds check
+        float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
+        float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
+        
         // Reject projections outside image bounds
         // bounds = (xmin, ymin, xmax, ymax) = (0, 0, m_wd, m_ht)
         if (cx < 0.0f || cy < 0.0f || cx >= m_wd || cy >= m_ht) {
@@ -223,6 +292,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     int n_adjusted = n - fixedp; // number of pose variables after fixing
+    
+    if (logger) {
+        logger->info("BA: num_active={}, n={}, fixedp={}, n_adjusted={}", 
+                     num_active, n, fixedp, n_adjusted);
+    }
 
     // ---------------------------------------------------------
     // Step 6: Reindex structure variables
@@ -328,14 +402,77 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         int j = jj_new[e];
         int k = kk_new[e];
         
-        if (i >= 0 && i < n_adjusted) {
+        // Check for NaN/Inf in gradients before adding
+        bool vi_valid = true, vj_valid = true, w_valid = true;
+        for (int idx = 0; idx < 6; idx++) {
+            if (!std::isfinite(vi[e](idx, 0))) vi_valid = false;
+            if (!std::isfinite(vj[e](idx, 0))) vj_valid = false;
+        }
+        if (!std::isfinite(w_vec[e])) w_valid = false;
+        
+        if (vi_valid && i >= 0 && i < n_adjusted) {
             v_grad.segment<6>(6 * i) += vi[e];
         }
-        if (j >= 0 && j < n_adjusted) {
+        if (vj_valid && j >= 0 && j < n_adjusted) {
             v_grad.segment<6>(6 * j) += vj[e];
         }
-        if (k >= 0 && k < m) {
+        if (w_valid && k >= 0 && k < m) {
             w_grad[k] += w_vec[e];
+        }
+    }
+    
+    if (logger) {
+        // Check for NaN/Inf in assembled gradients
+        bool has_nan = false;
+        for (int i = 0; i < v_grad.size(); i++) {
+            if (!std::isfinite(v_grad[i])) {
+                has_nan = true;
+                break;
+            }
+        }
+        for (int i = 0; i < w_grad.size(); i++) {
+            if (!std::isfinite(w_grad[i])) {
+                has_nan = true;
+                break;
+            }
+        }
+        
+        if (has_nan) {
+            logger->warn("BA: Gradient contains NaN/Inf values! Checking individual components...");
+            // Log first few problematic gradients
+            for (int e = 0; e < std::min(5, num_active); e++) {
+                bool vi_has_nan = false, vj_has_nan = false;
+                for (int idx = 0; idx < 6; idx++) {
+                    if (!std::isfinite(vi[e](idx, 0))) vi_has_nan = true;
+                    if (!std::isfinite(vj[e](idx, 0))) vj_has_nan = true;
+                }
+                if (vi_has_nan || vj_has_nan || !std::isfinite(w_vec[e])) {
+                    logger->warn("BA: Edge[{}]: vi_has_nan={}, vj_has_nan={}, w_valid={}, "
+                                "r=({:.4f}, {:.4f}), weight={:.4f}",
+                                e, vi_has_nan, vj_has_nan, std::isfinite(w_vec[e]),
+                                r[e * 2 + 0], r[e * 2 + 1], m_pg.m_weight[e]);
+                }
+            }
+        }
+        
+        float v_grad_norm = v_grad.norm();
+        float v_grad_max = v_grad.cwiseAbs().maxCoeff();
+        float w_grad_norm = w_grad.norm();
+        float w_grad_max = w_grad.cwiseAbs().maxCoeff();
+        logger->info("BA: Gradient stats - v_grad_norm={:.6f}, v_grad_max={:.6f}, w_grad_norm={:.6f}, w_grad_max={:.6f}", 
+                     v_grad_norm, v_grad_max, w_grad_norm, w_grad_max);
+        
+        // Check if gradients are zero
+        if (v_grad_norm < 1e-6f && w_grad_norm < 1e-6f) {
+            logger->warn("BA: WARNING - Both v_grad and w_grad are near zero! This means BA won't update poses.");
+            logger->warn("BA: Possible causes: 1) Residuals are zero (poses optimal), 2) Weights are zero, 3) Jacobians are zero");
+            // Log sample residuals and weights to diagnose
+            int sample_count = std::min(5, num_active);
+            for (int e = 0; e < sample_count; e++) {
+                float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
+                logger->warn("BA: Sample edge[{}]: residual_norm={:.6f}, weight={:.6f}, valid={}", 
+                            e, r_norm, m_pg.m_weight[e], v[e] > 0.5f ? 1 : 0);
+            }
         }
     }
     
@@ -349,6 +486,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // RHS: y = v - E * C^-1 * w
     Eigen::VectorXf y = v_grad - EQ * w_grad;
+    
+    if (logger) {
+        float y_norm = y.norm();
+        float EQ_w_norm = (EQ * w_grad).norm();
+        logger->info("BA: RHS vector y stats - y.norm()={:.6f}, v_grad.norm()={:.6f}, (EQ*w_grad).norm()={:.6f}", 
+                     y_norm, v_grad.norm(), EQ_w_norm);
+        if (y_norm < 1e-6f) {
+            logger->warn("BA: y vector is near zero - BA will not update poses! Check residuals and weights.");
+        }
+    }
     
     // Solve for pose increments: S * dX = y
     Eigen::VectorXf dX;
@@ -376,10 +523,18 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         Eigen::LDLT<Eigen::MatrixXf> solver(S_damped);
         if (solver.info() != Eigen::Success) {
             // Python: if cholesky fails, return zeros
+            if (logger) {
+                logger->warn("BA: LDLT solver failed with info={}", static_cast<int>(solver.info()));
+            }
             dX = Eigen::VectorXf::Zero(6 * n_adjusted);
             dZ = Q.asDiagonal() * w_grad; // Still update structure even if pose solve fails
         } else {
             dX = solver.solve(y);
+            if (logger) {
+                float y_norm = y.norm();
+                float dX_norm_before_check = dX.norm();
+                logger->info("BA: Solver success - y.norm()={:.6f}, dX.norm()={:.6f}", y_norm, dX_norm_before_check);
+            }
             // Back-substitute structure increments: dZ = C^-1 * (w - E^T * dX)
             // Python: dZ = Q * (w - block_matmul(E.permute(0, 2, 1, 4, 3), dX).squeeze(dim=-1))
             dZ = Q.asDiagonal() * (w_grad - E.transpose() * dX);
@@ -391,12 +546,41 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     // Update poses: poses = pose_retr(poses, dX, indices)
     if (!structure_only && n_adjusted > 0) {
+        if (logger) {
+            float dX_norm = dX.norm();
+            float dX_max = dX.cwiseAbs().maxCoeff();
+            logger->info("BA: dX stats - norm={:.6f}, max={:.6f}, size={}", 
+                         dX_norm, dX_max, dX.size());
+        }
+        
         for (int idx = 0; idx < n_adjusted; idx++) {
             int pose_idx = fixedp + idx;
             if (pose_idx >= 0 && pose_idx < n) {
                 Eigen::Matrix<float, 6, 1> dx_vec = dX.segment<6>(6 * idx);
+                Eigen::Vector3f t_before = m_pg.m_poses[pose_idx].t;
                 m_pg.m_poses[pose_idx] = m_pg.m_poses[pose_idx].retr(dx_vec);
+                Eigen::Vector3f t_after = m_pg.m_poses[pose_idx].t;
+                
+                // Log pose updates for debugging
+                if (logger) {
+                    float dx_norm = dx_vec.norm();
+                    float t_change = (t_after - t_before).norm();
+                    if (idx < 5 || dx_norm > 1e-6f || t_change > 1e-6f) {
+                        logger->info("BA: Updated pose[{}]: dx_norm={:.6f}, t_change={:.6f}, "
+                                     "t_before=({:.6f}, {:.6f}, {:.6f}), t_after=({:.6f}, {:.6f}, {:.6f}), "
+                                     "dx_vec=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})",
+                                     pose_idx, dx_norm, t_change,
+                                     t_before.x(), t_before.y(), t_before.z(),
+                                     t_after.x(), t_after.y(), t_after.z(),
+                                     dx_vec(0), dx_vec(1), dx_vec(2), dx_vec(3), dx_vec(4), dx_vec(5));
+                    }
+                }
             }
+        }
+    } else {
+        if (logger) {
+            logger->warn("BA: Skipping pose updates - structure_only={}, n_adjusted={}", 
+                         structure_only, n_adjusted);
         }
     }
     
