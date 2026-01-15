@@ -18,8 +18,9 @@ public:
     void setModels(Config_S* fnetConfig, Config_S* inetConfig);
 
     // forward function
-    // image: normalized float image [C, H, W] with values in range [-0.5, 1.5] (Python: 2 * (image / 255.0) - 0.5)
-    void forward(const float* image, int H, int W,
+    // image: original uint8 image [C, H, W] with values in range [0, 255]
+    // AMBA CV28 models (fnet/inet) will handle normalization internally
+    void forward(const uint8_t* image, int H, int W,
                  float* fmap, float* imap, float* gmap,
                  float* patches, uint8_t* clr,
                  int patches_per_image = 8);

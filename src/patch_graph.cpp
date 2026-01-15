@@ -2,6 +2,7 @@
 #include "patch_graph.hpp"
 #include <cstring>
 #include <cmath>
+#include <random>
 
 // ------------------------------------------------------------
 // Constructor
@@ -50,7 +51,17 @@ void PatchGraph::reset() {
     }
 
     // active edges
-    std::memset(m_net, 0, sizeof(m_net));
+    // Initialize m_net with small random values (not zeros) to match Python behavior
+    // Python: self.pg.net is typically initialized with small random values or from previous state
+    // Using small random initialization helps the model start with non-zero gradients
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::normal_distribution<float> dis(0.0f, 0.01f);  // Small random values around 0
+    for (int e = 0; e < MAX_EDGES; e++) {
+        for (int d = 0; d < NET_DIM; d++) {
+            m_net[e][d] = dis(gen);
+        }
+    }
     std::memset(m_ii, 0, sizeof(m_ii));
     std::memset(m_jj, 0, sizeof(m_jj));
     std::memset(m_kk, 0, sizeof(m_kk));

@@ -60,7 +60,7 @@ void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
 // Note: fmap and imap are at 1/4 resolution (RES=4), but image and coords are at full resolution
 // image: normalized float image [C, H, W] with values in range [-0.5, 1.5] (Python: 2 * (image / 255.0) - 0.5)
 void Patchifier::forward(
-    const float *image,  // Normalized float image [C, H, W] in range [-0.5, 1.5]
+    const uint8_t *image,  // Original uint8 image [C, H, W] in range [0, 255] - AMBA CV28 handles normalization
     int H, int W,   // Actual image dimensions (may differ from model input)
     float *fmap,    // [128, model_H/4, model_W/4] - at 1/4 resolution of model input
     float *imap,    // [DIM, model_H/4, model_W/4] - at 1/4 resolution of model input
@@ -78,8 +78,8 @@ void Patchifier::forward(
     if (m_fnet != nullptr && m_inet != nullptr)
     {
         // Use model output dimensions (models output at 1/4 of their input size)
-        fmap_H = m_fnet->getOutputHeight();  // e.g., 120 (480/4)
-        fmap_W = m_fnet->getOutputWidth();   // e.g., 160 (640/4)
+        fmap_H = m_fnet->getOutputHeight();  // e.g., 132 (528/4)
+        fmap_W = m_fnet->getOutputWidth();   // e.g., 240 (960/4)
         
         // Validate that fnet and inet have same output dimensions
         if (fmap_H != m_inet->getOutputHeight() || fmap_W != m_inet->getOutputWidth())
@@ -120,7 +120,7 @@ void Patchifier::forward(
         
         if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference");
         // Run fnet inference (models will resize input internally)
-        // Pass normalized float image directly (matching Python)
+        // Pass original uint8 image - AMBA CV28 models will handle normalization internally
         if (!m_fnet->runInference(image, H, W, m_fmap_buffer.data()))
         {
             if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference failed");
@@ -132,7 +132,7 @@ void Patchifier::forward(
 
         if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference");
         
-        // Pass normalized float image directly (matching Python)
+        // Pass original uint8 image - AMBA CV28 models will handle normalization internally
         if (!m_inet->runInference(image, H, W, m_imap_buffer.data()))
         {
             if (logger_patch) logger_patch->error("[Patchifier] inet->runInference failed");
@@ -162,7 +162,7 @@ void Patchifier::forward(
         if (logger_patch) logger_patch->info("[Patchifier] fmap memcpy completed");
         
         // NOTE: imap parameter is actually a buffer for patch features [M, DIM], not the full feature map
-        // We need to extract patches from the full feature map [384, 120, 160] using patchify_cpu_safe
+        // We need to extract patches from the full feature map [384, 132, 240] using patchify_cpu_safe
         // So we don't memcpy the full feature map to imap - instead we'll extract patches later
         if (logger_patch) logger_patch->info("[Patchifier] Skipping imap memcpy - will extract patches later");
     }
@@ -251,11 +251,15 @@ void Patchifier::forward(
 
     printf("[Patchifier] About to call patchify_cpu_safe (gmap)\n");
     fflush(stdout);
+    // patchify_cpu_safe extracts patches from fmap and writes to gmap
+    // radius = m_patch_size / 2
+    // patch dimension D = 2 * radius + 2 = m_patch_size + 2
+    // gmap shape: [M, 128, D, D] = [M, 128, (m_patch_size + 2), (m_patch_size + 2)]
     patchify_cpu_safe(
         fmap, fmap_coords.data(),
         M, 128, fmap_H, fmap_W, // Use 1/4 resolution dimensions
-        m_patch_size / 2,
-        gmap);
+        m_patch_size / 2,        // radius = m_patch_size / 2
+        gmap);                   // Output: [M, 128, D, D] where D = m_patch_size + 2
     printf("[Patchifier] patchify_cpu_safe (gmap) completed\n");
     fflush(stdout);
 
@@ -265,7 +269,7 @@ void Patchifier::forward(
     // 7. imap sampling (radius = 0) - scale coords to 1/4 resolution
     // Extract patches from the full feature map stored in m_imap_buffer
     // ------------------------------------------------
-    // Use m_imap_buffer (full feature map [384, 120, 160]) as source
+    // Use m_imap_buffer (full feature map [384, 132, 240]) as source
     // Extract patches and write to imap (which is [M, DIM] = [8, 384])
     if (m_fnet != nullptr && m_inet != nullptr) {
         // Verify m_imap_buffer has valid data before extracting patches
@@ -288,7 +292,7 @@ void Patchifier::forward(
         // Extract patches from the full feature map
         patchify_cpu_safe(
             m_imap_buffer.data(), fmap_coords.data(),  // Source: full feature map, coords at 1/4 resolution
-            M, inet_output_channels, fmap_H, fmap_W,   // M patches, 384 channels, 120x160 feature map
+            M, inet_output_channels, fmap_H, fmap_W,   // M patches, 384 channels, 132x240 feature map
             0,                                          // radius = 0 (single pixel)
             imap                                        // Output: [M, DIM, 1, 1] = [8, 384, 1, 1]
         );

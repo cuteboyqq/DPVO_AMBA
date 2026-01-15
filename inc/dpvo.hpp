@@ -37,7 +37,7 @@ struct DPVOConfig {
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
           MAX_EDGE_AGE(360),
-          KEYFRAME_INDEX(2),
+          KEYFRAME_INDEX(4),
           KEYFRAME_THRESH(10),
           PATCH_LIFETIME(6),
           REMOVAL_WINDOW(8)
@@ -123,10 +123,13 @@ private:
     // Helpers for indexing
     inline int imap_idx(int i, int j, int k) const { return i * m_cfg.PATCHES_PER_FRAME * m_DIM + j * m_DIM + k; }
     inline int gmap_idx(int i, int j, int c, int y, int x) const {
-        return i * m_cfg.PATCHES_PER_FRAME * 128 * m_P * m_P +
-               j * 128 * m_P * m_P +
-               c * m_P * m_P +
-               y * m_P +
+        // CRITICAL: gmap uses D_gmap = 4 (from patchify_cpu_safe with radius=1), NOT P=3
+        // patchify_cpu_safe: radius = m_patch_size/2 = 1, D = 2*radius + 2 = 4
+        const int D_gmap = 4;  // D_gmap = 2 * (m_P/2) + 2 = 4
+        return i * m_cfg.PATCHES_PER_FRAME * 128 * D_gmap * D_gmap +
+               j * 128 * D_gmap * D_gmap +
+               c * D_gmap * D_gmap +
+               y * D_gmap +
                x;
     }
     inline int fmap1_idx(int b, int m, int c, int y, int x) const {

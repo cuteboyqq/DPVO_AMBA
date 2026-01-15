@@ -372,6 +372,151 @@ void DPVOViewer::drawPoses()
     // Ensure matrices are up to date (in case poses changed)
     convertPosesToMatrices();
     
+    // Determine how many frames to process
+    int frames_to_process = m_numFrames;
+    if (frames_to_process > static_cast<int>(m_poses.size())) {
+        frames_to_process = static_cast<int>(m_poses.size());
+    }
+    
+    int valid_poses_drawn = 0;
+    int skipped_invalid = 0;
+    int skipped_out_of_bounds = 0;
+    
+    // Draw camera poses as square pyramids (frustums) to show position and orientation
+    for (int i = 0; i < frames_to_process; i++) {
+        // Validate matrix before using it
+        float* mat = &m_poseMatrices[i * 16];
+        bool matrix_valid = true;
+        for (int j = 0; j < 16; j++) {
+            if (!std::isfinite(mat[j])) {
+                matrix_valid = false;
+                break;
+            }
+        }
+        
+        if (!matrix_valid) {
+            skipped_invalid++;
+            continue;
+        }
+        
+        // Extract camera position from matrix (translation component)
+        float cam_x = mat[3];
+        float cam_y = mat[7];
+        float cam_z = mat[11];
+        
+        // Validate position
+        if (!std::isfinite(cam_x) || !std::isfinite(cam_y) || !std::isfinite(cam_z) ||
+            std::abs(cam_x) > 10000.0f || std::abs(cam_y) > 10000.0f || std::abs(cam_z) > 10000.0f) {
+            skipped_out_of_bounds++;
+            continue;
+        }
+        
+        // Extract rotation vectors from matrix
+        Eigen::Vector3f forward = Eigen::Vector3f(-mat[8], -mat[9], -mat[10]);  // -Z direction in camera frame
+        Eigen::Vector3f right = Eigen::Vector3f(mat[0], mat[1], mat[2]);         // X direction
+        Eigen::Vector3f up = Eigen::Vector3f(mat[4], mat[5], mat[6]);            // Y direction
+        
+        // Validate rotation vectors
+        if (!std::isfinite(forward.x()) || !std::isfinite(forward.y()) || !std::isfinite(forward.z()) ||
+            !std::isfinite(right.x()) || !std::isfinite(right.y()) || !std::isfinite(right.z()) ||
+            !std::isfinite(up.x()) || !std::isfinite(up.y()) || !std::isfinite(up.z()) ||
+            forward.norm() < 0.1f || right.norm() < 0.1f || up.norm() < 0.1f) {
+            skipped_invalid++;
+            continue;
+        }
+        
+        // Normalize direction vectors
+        forward.normalize();
+        right.normalize();
+        up.normalize();
+        
+        // Current frame in red, others in blue
+        if (i + 1 == m_numFrames) {
+            glColor3f(1.0f, 0.0f, 0.0f);  // Red for current frame
+        } else {
+            glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
+        }
+        
+        // Draw camera as a square pyramid (frustum) to show position and orientation
+        // Pyramid: tip at camera position, base square in front of camera
+        // Camera looks in -Z direction in camera frame, so base is at -Z in camera frame
+        
+        // Pyramid parameters
+        const float pyramid_base_size = 0.05f;  // Size of pyramid base (adjust for visibility)
+        const float pyramid_height = 0.1f;      // Distance from tip to base
+        
+        // Camera position (tip of pyramid)
+        Eigen::Vector3f tip(cam_x, cam_y, cam_z);
+        
+        // Base center is in front of camera (forward direction)
+        Eigen::Vector3f base_center = tip + forward * pyramid_height;
+        
+        // Base square corners
+        Eigen::Vector3f base_corner1 = base_center + right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner2 = base_center - right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner3 = base_center - right * pyramid_base_size - up * pyramid_base_size;
+        Eigen::Vector3f base_corner4 = base_center + right * pyramid_base_size - up * pyramid_base_size;
+        
+        // Draw pyramid using lines
+        glLineWidth(2.0f);
+        glBegin(GL_LINES);
+        
+        // Lines from tip to base corners
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
+        
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
+        
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
+        
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        
+        // Base square edges
+        glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
+        glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
+        
+        glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
+        glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
+        
+        glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
+        
+        glEnd();
+        
+        valid_poses_drawn++;
+    }
+    
+    // Log warnings only if there are issues (reduced frequency)
+    static int draw_count = 0;
+    draw_count++;
+    if (valid_poses_drawn != frames_to_process && draw_count % 300 == 0) {
+        printf("[DPVOViewer] drawPoses: WARNING - Only drew %d/%d valid poses (skipped_invalid=%d, skipped_out_of_bounds=%d)\n", 
+               valid_poses_drawn, frames_to_process, skipped_invalid, skipped_out_of_bounds);
+        fflush(stdout);
+    }
+#else
+    // Viewer disabled - no-op
+#endif
+}
+
+void DPVOViewer::drawPoses_fake()
+{
+#ifdef ENABLE_PANGOLIN_VIEWER
+    if (m_numFrames == 0) {
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(m_dataMutex);
+    
+    // Ensure matrices are up to date (in case poses changed)
+    convertPosesToMatrices();
+    
     // Debug counter (reduced logging frequency)
     static int draw_count = 0;
     draw_count++;
@@ -553,12 +698,12 @@ void DPVOViewer::drawPoses()
                     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
                     
                     // REDUCED movement speed to keep poses close together
-                    const float base_move_speed = 0.01f;  // Small base movement speed
+                    const float base_move_speed = 0.1f;  // Small base movement speed
                     
                     // Random offsets for more natural movement (very small variations)
-                    float forward_offset = dis(gen) * base_move_speed * 0.3f;  // Random forward/backward (small)
-                    float right_offset = dis(gen) * base_move_speed * 0.2f;     // Random left/right (small)
-                    float up_offset = dis(gen) * base_move_speed * 0.1f;        // Random up/down (small)
+                    float forward_offset = dis(gen) * base_move_speed * 0.4f;  // Random forward/backward (small)
+                    float right_offset = dis(gen) * base_move_speed * 0.5f;     // Random left/right (small)
+                    float up_offset = dis(gen) * base_move_speed * 1.2f;        // Random up/down (small)
                     
                     // Generate new position: previous position + small forward movement + small random offsets
                     // This ensures consecutive frames are close together (within ~0.01-0.02 units)
@@ -648,7 +793,7 @@ void DPVOViewer::drawPoses()
                 
                 // Use previous frame's pose with random small movement in all directions
                 // This creates a more natural trajectory while keeping poses close together
-                const float base_move_speed = 0.01f;  // SMALL movement speed to keep poses close together
+                const float base_move_speed = 0.1f;  // SMALL movement speed to keep poses close together
                 
                 // Generate random small offsets in all directions
                 static std::random_device rd;
@@ -656,9 +801,9 @@ void DPVOViewer::drawPoses()
                 static std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
                 
                 // Small random movement in forward, right, and up directions
-                float forward_offset = dis(gen) * base_move_speed * 0.3f;  // Small random forward/backward
-                float right_offset = dis(gen) * base_move_speed * 0.2f;     // Small random left/right
-                float up_offset = dis(gen) * base_move_speed * 0.1f;        // Small random up/down
+                float forward_offset = dis(gen) * base_move_speed * 0.4f;  // Small random forward/backward
+                float right_offset = dis(gen) * base_move_speed * 0.5f;     // Small random left/right
+                float up_offset = dis(gen) * base_move_speed * 1.2f;        // Small random up/down
                 
                 // Move in forward direction (main movement) plus random offsets
                 cam_x = prev_pos.x() + prev_fwd.x() * (base_move_speed + forward_offset) 
@@ -922,7 +1067,7 @@ void DPVOViewer::run()
         m_3dDisplay->Activate(*m_camera);
         
         drawPoints();
-        drawPoses();
+        drawPoses();  // Draw real poses from m_poseMatrices
         
         // Update and draw image
         if (m_textureSizeChanged) {

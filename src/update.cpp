@@ -865,13 +865,29 @@ int DPVOUpdate::reshapeInput(
     jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
     kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
     
-    // Zero-fill buffers (faster than resize with value)
-    std::fill(net_input.begin(), net_input.end(), 0.0f);
-    std::fill(inp_input.begin(), inp_input.end(), 0.0f);
-    std::fill(corr_input.begin(), corr_input.end(), 0.0f);
-    std::fill(ii_input.begin(), ii_input.end(), 0.0f);
-    std::fill(jj_input.begin(), jj_input.end(), 0.0f);
-    std::fill(kk_input.begin(), kk_input.end(), 0.0f);
+    // NOTE: Do NOT zero-fill active edges - they will be copied from m_net, ctx, corr below
+    // Python: active_net = self.pg.net[:, :num_active] reuses existing values
+    // Only zero-fill inactive edges (beyond num_edges_to_process) if needed
+    if (num_edges_to_process < MODEL_EDGE_COUNT) {
+        // Zero-fill only the inactive portion (edges >= num_edges_to_process)
+        size_t inactive_start = 1 * 384 * num_edges_to_process * 1;
+        size_t inactive_size = 1 * 384 * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
+        std::fill(net_input.begin() + inactive_start, net_input.begin() + inactive_start + inactive_size, 0.0f);
+        
+        inactive_start = 1 * 384 * num_edges_to_process * 1;
+        inactive_size = 1 * 384 * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
+        std::fill(inp_input.begin() + inactive_start, inp_input.begin() + inactive_start + inactive_size, 0.0f);
+        
+        inactive_start = 1 * CORR_DIM * num_edges_to_process * 1;
+        inactive_size = 1 * CORR_DIM * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
+        std::fill(corr_input.begin() + inactive_start, corr_input.begin() + inactive_start + inactive_size, 0.0f);
+        
+        inactive_start = 1 * 1 * num_edges_to_process * 1;
+        inactive_size = 1 * 1 * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
+        std::fill(ii_input.begin() + inactive_start, ii_input.begin() + inactive_start + inactive_size, 0.0f);
+        std::fill(jj_input.begin() + inactive_start, jj_input.begin() + inactive_start + inactive_size, 0.0f);
+        std::fill(kk_input.begin() + inactive_start, kk_input.begin() + inactive_start + inactive_size, 0.0f);
+    }
     
     // Check net state before copying
     int net_zero_count = 0;
@@ -892,6 +908,9 @@ int DPVOUpdate::reshapeInput(
     bool net_all_zero = (net_nonzero_count == 0);
     if (net_all_zero) {
         // Initialize net from context (inp) - this gives the model some initial state
+        // This happens on first call when m_pg.m_net is all zeros
+        printf("[DPVOUpdate::reshapeInput] WARNING: m_net is all zeros (first call). Initializing from context (ctx * 0.1)\n");
+        fflush(stdout);
         for (int e = 0; e < num_edges_to_process; e++) {
             if (e < 0 || e >= num_active) continue;
             for (int d = 0; d < 384; d++) {
@@ -899,6 +918,8 @@ int DPVOUpdate::reshapeInput(
                 m_net[e][d] = ctx[e * 384 + d] * 0.1f;
             }
         }
+        printf("[DPVOUpdate::reshapeInput] Initialized m_net for %d edges from context\n", num_edges_to_process);
+        fflush(stdout);
     }
     
     // Reshape net and inp data: [num_active, 384] -> [1, 384, 360, 1] (384=NET_DIM, 360=MAX_EDGES)

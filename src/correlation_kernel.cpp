@@ -3,6 +3,9 @@
 #include <cstring>
 #include <vector>
 #include <cstdio>
+#include <limits>
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 inline bool within_bounds(int h, int w, int H, int W)
 {
@@ -171,30 +174,123 @@ void patchify_cpu_safe(
 //     return y >= 0 && y < H && x >= 0 && x < W;
 // }
 
+// -----------------------------------------------------------------------------
+// Compute correlation between patch features (gmap) and frame features (pyramid)
+// -----------------------------------------------------------------------------
+// Purpose: Computes correlation volumes between patch features extracted from source frames
+//          and frame features at reprojected locations in target frames. This is used for
+//          visual odometry to match patches across frames.
+//
+// Algorithm:
+//   For each active edge e:
+//     1. Extract patch features from gmap (source frame, patch index from kk[e])
+//     2. Get reprojected coordinates for target frame (from coords)
+//     3. For each pixel (i0, j0) in patch and each offset (ii, jj) in correlation window:
+//        - Sample frame features at reprojected location + offset
+//        - Compute dot product between patch feature and frame feature over all channels
+//        - Store correlation value
+//     4. Process two pyramid levels: pyramid0 (1/4 res) and pyramid1 (1/16 res)
+//
+// Input Parameters:
+//   gmap: [num_gmap_frames * M * feature_dim * D_gmap * D_gmap] - Ring buffer of patch features
+//         Layout: [frame][patch][channel][y][x]
+//         - num_gmap_frames: Number of frames in ring buffer (e.g., m_pmem = 36)
+//         - M: Patches per frame (e.g., 4 or 8)
+//         - feature_dim: Feature dimension (128 for FNet features)
+//         - D_gmap: Patch dimension = 4 (from patchify_cpu_safe with radius=1, m_patch_size=3)
+//         - Contains patches extracted from source frames using patchify_cpu_safe
+//
+//   pyramid0: [num_frames * feature_dim * fmap1_H * fmap1_W] - Full resolution feature pyramid
+//             Layout: [frame][channel][y][x]
+//             - num_frames: Number of frames in pyramid buffer (e.g., m_mem = 36)
+//             - feature_dim: Feature dimension (128 for FNet features)
+//             - fmap1_H, fmap1_W: Feature map dimensions at 1/4 resolution (e.g., 132x240)
+//             - Used for correlation channel 0 (coords scaled by 1.0)
+//
+//   pyramid1: [num_frames * feature_dim * fmap2_H * fmap2_W] - 1/4 resolution feature pyramid
+//             Layout: [frame][channel][y][x]
+//             - Same structure as pyramid0 but at 1/16 resolution (fmap2_H, fmap2_W)
+//             - Used for correlation channel 1 (coords scaled by 0.25)
+//
+//   coords: [num_active * 2 * P * P] - Reprojected 2D coordinates
+//           Layout: [edge][channel][y][x] where channel 0=x, channel 1=y
+//           - num_active: Number of active edges (patch-frame pairs)
+//           - P: Patch size (typically 3)
+//           - Coordinates are at 1/4 resolution (from reproject function)
+//           - Used to sample frame features at reprojected locations
+//
+//   ii: [num_active] - Source patch indices within frame (NOT USED in current implementation)
+//       Kept for compatibility with Python/CUDA interface
+//
+//   jj: [num_active] - Target frame indices for pyramid buffers
+//       Indicates which frame in pyramid0/pyramid1 to sample from
+//       Range: [0, num_frames-1]
+//
+//   kk: [num_active] - Linear patch indices for gmap extraction
+//       Encodes: kk[e] = gmap_frame * M + patch_idx
+//       - gmap_frame = kk[e] / M (which frame in gmap ring buffer)
+//       - patch_idx = kk[e] % M (which patch within that frame)
+//       Range: [0, num_gmap_frames * M - 1]
+//
+//   num_active: Number of active edges to process
+//
+//   M: Patches per frame (PATCHES_PER_FRAME, typically 4 or 8)
+//
+//   P: Patch size (typically 3)
+//
+//   num_frames: Number of frames in pyramid buffers (e.g., m_mem = 36)
+//
+//   num_gmap_frames: Number of frames in gmap ring buffer (e.g., m_pmem = 36)
+//
+//   fmap1_H, fmap1_W: Feature map dimensions for pyramid0 at 1/4 resolution
+//                     (e.g., 132x240 for 528x960 input)
+//
+//   fmap2_H, fmap2_W: Feature map dimensions for pyramid1 at 1/16 resolution
+//                     (e.g., 33x60 for 528x960 input)
+//
+//   feature_dim: Feature dimension (128 for FNet features)
+//
+// Output Parameters:
+//   corr_out: [num_active * D * D * P * P * 2] - Correlation volumes
+//             Layout: [edge][corr_y][corr_x][patch_y][patch_x][channel]
+//             - D: Correlation window diameter = 8 (R=3, D = 2*R + 2)
+//             - P: Patch size (typically 3)
+//             - Channel 0: Correlation with pyramid0 (1/4 resolution)
+//             - Channel 1: Correlation with pyramid1 (1/16 resolution)
+//             - Each value is dot product between patch feature and frame feature
+//
+// Correlation Window:
+//   - Radius R = 3 (searches ±3 pixels around reprojected location)
+//   - Window size D = 2*R + 2 = 8
+//   - For each pixel in patch, computes correlation at 8×8 offsets
+//
+// Coordinate Scaling:
+//   - Reprojected coords are at 1/4 resolution
+//   - For pyramid0 (1/4 res): coords used directly (scale = 1.0)
+//   - For pyramid1 (1/16 res): coords scaled by 0.25 (coords / 4)
+//
+// Note: Matches Python CUDA kernel corr_forward_kernel behavior
+// -----------------------------------------------------------------------------
 void computeCorrelation(
-    const float* gmap,
-    const float* pyramid0,
-    const float* pyramid1,
-    const float* coords,
-    const int* ii,
-    const int* jj,
-    const int* kk,
-    int num_active,
-    int M,
-    int P,
-    int num_frames,  // Number of frames in pyramid buffers
-    int num_gmap_frames,  // Number of frames in gmap ring buffer (m_pmem)
-    int fmap1_H,    // Height for pyramid0 (full resolution)
-    int fmap1_W,    // Width for pyramid0 (full resolution)
-    int fmap2_H,    // Height for pyramid1 (1/4 resolution)
-    int fmap2_W,    // Width for pyramid1 (1/4 resolution)
-    int feature_dim,
-    float* corr_out)
+    const float* gmap,           // [num_gmap_frames, M, feature_dim, D_gmap, D_gmap] - Patch features ring buffer
+    const float* pyramid0,      // [num_frames, feature_dim, fmap1_H, fmap1_W] - Full-res feature pyramid
+    const float* pyramid1,      // [num_frames, feature_dim, fmap2_H, fmap2_W] - 1/4-res feature pyramid
+    const float* coords,        // [num_active, 2, P, P] - Reprojected (u, v) coordinates
+    const int* ii,              // [num_active] - Source patch indices (NOT USED, kept for compatibility)
+    const int* jj,              // [num_active] - Target frame indices for pyramid
+    const int* kk,              // [num_active] - Linear patch indices (gmap_frame * M + patch_idx)
+    int num_active,             // Number of active edges to process
+    int M,                      // Patches per frame (PATCHES_PER_FRAME)
+    int P,                      // Patch size (typically 3)
+    int num_frames,             // Number of frames in pyramid buffers (e.g., m_mem)
+    int num_gmap_frames,        // Number of frames in gmap ring buffer (e.g., m_pmem)
+    int fmap1_H, int fmap1_W,   // Dimensions for pyramid0 (1/4 resolution)
+    int fmap2_H, int fmap2_W,   // Dimensions for pyramid1 (1/16 resolution)
+    int feature_dim,            // Feature dimension (128 for FNet)
+    float* corr_out)            // Output: [num_active, D, D, P, P, 2] - Correlation volumes
 {
-    // Add entry logging
-    printf("[computeCorrelation] ENTERING: num_active=%d, M=%d, P=%d, num_frames=%d, num_gmap_frames=%d\n",
-           num_active, M, P, num_frames, num_gmap_frames);
-    fflush(stdout);
+    // Translated from CUDA corr_forward_kernel
+    // CUDA signature: corr_forward_kernel(int R, fmap1, fmap2, coords, us, vs, corr)
     
     // Validate inputs
     if (gmap == nullptr || pyramid0 == nullptr || pyramid1 == nullptr || 
@@ -211,188 +307,232 @@ void computeCorrelation(
     }
     
     // Correlation radius R (typically 3 in DPVO)
-    // D = 2*R + 2 is the correlation window diameter
-    const int R = 3;  // Correlation radius
+    const int R = 3;
     const int D = 2 * R + 2;  // Correlation window diameter (D = 8 for R=3)
     
-    // gmap structure: gmap is created by patchify_cpu_safe with radius=1, so D_gmap=4
-    // gmap is stored as [num_gmap_frames][M][feature_dim][D_gmap][D_gmap] in the ring buffer
-    const int D_gmap = 4;  // From patchify_cpu_safe with radius=1 (m_patch_size/2)
+    // gmap structure: created by patchify_cpu_safe with radius=1, so D_gmap=4
+    const int D_gmap = 4;
     const int gmap_center_offset = (D_gmap - P) / 2;  // Center the P×P region within D_gmap×D_gmap
     
-    // Calculate buffer sizes for bounds checking
+    // Calculate buffer sizes
     const size_t gmap_total_size = static_cast<size_t>(num_gmap_frames) * M * feature_dim * D_gmap * D_gmap;
     const size_t fmap1_total_size = static_cast<size_t>(num_frames) * feature_dim * fmap1_H * fmap1_W;
     const size_t fmap2_total_size = static_cast<size_t>(num_frames) * feature_dim * fmap2_H * fmap2_W;
     const size_t corr_total_size = static_cast<size_t>(num_active) * D * D * P * P * 2;
     
-    // For each active edge
+    // Zero output (matches CUDA behavior)
+    std::memset(corr_out, 0, sizeof(float) * corr_total_size);
+    
+    // Main loop: For each active edge (equivalent to CUDA's B * M * H * W * D * D threads)
     for (int e = 0; e < num_active; e++) {
-        // Validate input indices
-        if (e < 0 || e >= num_active) continue;
-        if (ii == nullptr || jj == nullptr || kk == nullptr) {
-            // Early return if null pointers
-            printf("[computeCorrelation] ERROR: Null pointer detected at edge %d\n", e);
-            fflush(stdout);
-            return;
-        }
-        
-        // Validate kk[e] and jj[e] are within reasonable bounds
-        if (kk[e] < 0 || kk[e] > 1000000) {
-            printf("[computeCorrelation] WARNING: Invalid kk[%d]=%d, skipping edge\n", e, kk[e]);
-            fflush(stdout);
-            continue;
-        }
-        if (jj[e] < 0 || jj[e] > 1000) {
-            printf("[computeCorrelation] WARNING: Invalid jj[%d]=%d, skipping edge\n", e, jj[e]);
-            fflush(stdout);
-            continue;
-        }
-        
-        // Python logic (dpvo.py lines 334, 337-338):
-        //   ii = self.pg.kk[:num_active]  # kk values become ii
-        //   ii1 = ii % (self.M * self.pmem)  # Linear patch index across all frames in gmap ring buffer
-        //   jj1 = jj % (self.mem)  # Frame index in pyramid ring buffer
-        // 
-        // CUDA kernel receives:
-        //   us[m] = ii1 (linear patch index in gmap)
-        //   vs[m] = jj1 (frame index in pyramid)
-        //
-        // C++ mapping to match Python:
-        //   kk[e] is the linear patch index (frame * M + patch) that needs modulo (M * num_gmap_frames)
-        //   jj[e] is the target frame index that needs modulo num_frames
-        // CRITICAL: Check for division by zero
+        // Get patch and frame indices (equivalent to CUDA's us[m] and vs[m])
+        // Python: ii1 = kk % (M * pmem), jj1 = jj % mem
         int mod_value = M * num_gmap_frames;
         if (mod_value == 0) {
             printf("[computeCorrelation] ERROR: Division by zero! M=%d, num_gmap_frames=%d\n", M, num_gmap_frames);
             fflush(stdout);
-            return;
+            continue;
         }
-        int ii1 = kk[e] % mod_value;  // Linear patch index in gmap ring buffer (matches Python: ii1 = ii % (M * pmem))
-        int gmap_frame = ii1 / M;                  // Extract frame from linear index
-        int patch_idx = ii1 % M;                   // Extract patch from linear index
-        int pyramid_frame = jj[e] % num_frames;   // Frame index in pyramid ring buffer (matches Python: jj1 = jj % mem)
+        
+        int ii1 = kk[e] % mod_value;  // Linear patch index in gmap (CUDA's us[m])
+        int gmap_frame = ii1 / M;
+        int patch_idx = ii1 % M;
+        int jj1 = jj[e] % num_frames;  // Frame index in pyramid (CUDA's vs[m])
+        int pyramid_frame = jj1;
         
         // Validate indices
-        if (patch_idx < 0 || patch_idx >= M) {
-            if (e < 5) {
-                printf("[computeCorrelation] WARNING: Invalid patch_idx=%d for edge %d (M=%d, ii1=%d)\n", 
-                       patch_idx, e, M, ii1);
-                fflush(stdout);
-            }
+        if (patch_idx < 0 || patch_idx >= M || 
+            gmap_frame < 0 || gmap_frame >= num_gmap_frames ||
+            pyramid_frame < 0 || pyramid_frame >= num_frames) {
             continue;
         }
-        if (gmap_frame < 0 || gmap_frame >= num_gmap_frames) {
-            if (e < 5) {
-                printf("[computeCorrelation] WARNING: Invalid gmap_frame=%d for edge %d (num_gmap_frames=%d, ii1=%d)\n", 
-                       gmap_frame, e, num_gmap_frames, ii1);
-                fflush(stdout);
-            }
-            continue;
-        }
-        if (pyramid_frame < 0 || pyramid_frame >= num_frames) {
-            if (e < 5) {
-                printf("[computeCorrelation] WARNING: Invalid pyramid_frame=%d for edge %d (num_frames=%d)\n", 
-                       pyramid_frame, e, num_frames);
-                fflush(stdout);
-            }
-            continue;
-        }
-
-        // Progress logging for first few edges
-        if (e < 3 || e % 20 == 0) {
-            printf("[computeCorrelation] Processing edge %d/%d: kk[%d]=%d, jj[%d]=%d, gmap_frame=%d, patch_idx=%d, pyramid_frame=%d\n",
-                   e, num_active, e, kk[e], e, jj[e], gmap_frame, patch_idx, pyramid_frame);
-            fflush(stdout);
-        }
-
-        for (int c = 0; c < 2; c++) { // two correlation channels: pyramid0, pyramid1
-            const float* fmap = (c == 0) ? pyramid0 : pyramid1;
-            float scale = (c == 0) ? 1.0f : 0.25f; // coords / 1 or /4
-            // Use different dimensions for pyramid0 and pyramid1
+        
+        // Process two correlation channels: pyramid0 (fmap1) and pyramid1 (fmap2)
+        // CUDA: fmap1 = patch features, fmap2 = frame features
+        // Python: corr1 = altcorr.corr(..., coords / 1, ...) for pyramid[0]
+        //         corr2 = altcorr.corr(..., coords / 4, ...) for pyramid[1]
+        // Reprojected coordinates are at 1/4 resolution (intrinsics scaled by RES=4)
+        // fmap1 is at 1/4 resolution, fmap2 is at 1/16 resolution
+        for (int c = 0; c < 2; c++) {
+            const float* fmap2 = (c == 0) ? pyramid0 : pyramid1;  // Frame features (target)
+            // Python: coords / 1 for pyramid[0], coords / 4 for pyramid[1]
+            // Reprojected coords are at 1/4 resolution, so:
+            // - For fmap1 (1/4 res): scale = 1.0f (coords / 1)
+            // - For fmap2 (1/16 res): scale = 0.25f (coords / 4)
+            float scale = (c == 0) ? 1.0f : 0.25f;
             int fmap_H = (c == 0) ? fmap1_H : fmap2_H;
             int fmap_W = (c == 0) ? fmap1_W : fmap2_W;
-            size_t fmap_total_size = (c == 0) ? fmap1_total_size : fmap2_total_size;
-
-            // For each pixel in the patch (i0, j0) in Python = (y, x) here
+            
+            // For each pixel in the patch (i0, j0) - equivalent to CUDA's H * W loop
             for (int i0 = 0; i0 < P; i0++) {
                 for (int j0 = 0; j0 < P; j0++) {
-                    // Get projected coordinate for this pixel
-                    // Python: x = coords[n][m][0][i0][j0], y = coords[n][m][1][i0][j0]
-                    // C++ coords layout from reproject: [num_active][2][P][P] flattened
-                    // coords[e * 2 * P * P + 0 * P * P + i0 * P + j0] = x coordinate
-                    // coords[e * 2 * P * P + 1 * P * P + i0 * P + j0] = y coordinate
-                    // For correlation channel c (0=pyramid0, 1=pyramid1), we use the same coordinates
-                    // but scale them differently (scale=1.0 for c=0, scale=0.25 for c=1)
+                    // Get reprojected coordinate for target frame (fmap2)
+                    // Python: coords / 1 for c=0, coords / 4 for c=1
                     int coord_x_idx = e * 2 * P * P + 0 * P * P + i0 * P + j0;
                     int coord_y_idx = e * 2 * P * P + 1 * P * P + i0 * P + j0;
-                    float x = coords[coord_x_idx] * scale;
-                    float y = coords[coord_y_idx] * scale;
+                    float x = coords[coord_x_idx] * scale;  // scale = 1.0f for c=0, 0.25f for c=1
+                    float y = coords[coord_y_idx] * scale;  // scale = 1.0f for c=0, 0.25f for c=1
                     
-                    // For each offset in the correlation window (ii, jj) in [0, D) × [0, D)
+                    // For each offset in correlation window (ii, jj) - equivalent to CUDA's D * D loop
                     for (int corr_ii = 0; corr_ii < D; corr_ii++) {
                         for (int corr_jj = 0; corr_jj < D; corr_jj++) {
-                            // Calculate sampling location in target frame
-                            // Python: i1 = floor(y) + (ii - R), j1 = floor(x) + (jj - R)
+                            // Calculate sampling location in target frame (fmap2)
+                            // CUDA: i1 = floor(y) + (ii - R), j1 = floor(x) + (jj - R)
                             int i1 = static_cast<int>(std::floor(y)) + (corr_ii - R);
                             int j1 = static_cast<int>(std::floor(x)) + (corr_jj - R);
-
-                            // Compute correlation: sum over feature channels
-                            // Python: sum over C of fmap1[n][ix][c][i0][j0] * fmap2[n][jx][c][i1][j1]
-                    float sum = 0.0f;
+                            
+                            // Compute correlation: dot product over features (matches CUDA)
+                            // CUDA: f1 = fmap1[n][ix][c][i0][j0], f2 = fmap2[n][jx][c][i1][j1]
+                            // fmap1 = patch features (from gmap, which contains patches from pyramid)
+                            // fmap2 = frame features from pyramid at reprojected location
+                            float sum = 0.0f;
                             if (within_bounds(i1, j1, fmap_H, fmap_W)) {
-                                // Access gmap: gmap[patch_idx][f][gmap_i][gmap_j]
-                                // gmap is [M][feature_dim][D_gmap][D_gmap] for a single frame
-                                // Extract center P×P region from D_gmap×D_gmap patch
+                                // Extract patch feature from gmap (fmap1 equivalent)
+                                // gmap layout: [num_gmap_frames][M][feature_dim][D_gmap][D_gmap]
+                                // Extract center P×P region: gmap_i = i0 + offset, gmap_j = j0 + offset
                                 int gmap_i = i0 + gmap_center_offset;
                                 int gmap_j = j0 + gmap_center_offset;
                                 
-                        for (int f = 0; f < feature_dim; f++) {
-                                    // gmap layout: [num_gmap_frames][M][feature_dim][D_gmap][D_gmap]
-                                    size_t gmap_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
-                                                      static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
-                                                      static_cast<size_t>(f) * D_gmap * D_gmap +
-                                                      static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
+                                // Dot product over feature channels (matches CUDA's loop over C)
+                                for (int f = 0; f < feature_dim; f++) {
+                                    // fmap1: patch feature from gmap
+                                    // CUDA: fmap1[n][ix][c][i0][j0] where ix = us[m] (patch index)
+                                    // gmap already contains patches extracted from pyramid, so use it as fmap1
+                                    size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
+                                                       static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
+                                                       static_cast<size_t>(f) * D_gmap * D_gmap +
+                                                       static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
                                     
-                                    // Validate gmap index
-                                    if (gmap_idx >= gmap_total_size) continue;
+                                    // fmap2: frame feature from pyramid at reprojected location
+                                    // CUDA: fmap2[n][jx][c][i1][j1] where jx = vs[m] (frame index)
+                                    size_t fmap2_idx = static_cast<size_t>(pyramid_frame) * feature_dim * fmap_H * fmap_W +
+                                                       static_cast<size_t>(f) * fmap_H * fmap_W +
+                                                       static_cast<size_t>(i1) * fmap_W + static_cast<size_t>(j1);
                                     
-                                    // fmap layout: [num_frames][feature_dim][fmap_H][fmap_W]
-                                    // Use channel-specific dimensions (fmap1_H/fmap1_W for c=0, fmap2_H/fmap2_W for c=1)
-                                    size_t fmap_idx = static_cast<size_t>(pyramid_frame) * feature_dim * fmap_H * fmap_W +
-                                                      static_cast<size_t>(f) * fmap_H * fmap_W +
-                                                      static_cast<size_t>(i1) * fmap_W + static_cast<size_t>(j1);
-                                    
-                                    // Validate fmap index using channel-specific size
-                                    if (fmap_idx >= fmap_total_size) continue;
-                                    
-                            sum += gmap[gmap_idx] * fmap[fmap_idx];
-                        }
-                    }
+                                    // Bounds check and compute correlation
+                                    if (fmap1_idx < gmap_total_size && fmap2_idx < (c == 0 ? fmap1_total_size : fmap2_total_size)) {
+                                        // CUDA: s += f1 * f2
+                                        float f1 = gmap[fmap1_idx];  // Patch feature (fmap1) - from gmap which contains patches
+                                        float f2 = fmap2[fmap2_idx]; // Frame feature (fmap2) - from pyramid
+                                        sum += f1 * f2;
+                                    }
+                                }
+                            }
+                            // If out of bounds, sum remains 0.0f (matches CUDA)
                             
-                            // Store correlation: corr[n][m][ii][jj][i0][j0]
-                            // Python CUDA kernel outputs: [B, M, D, D, H, W] per channel
-                            // Python then stacks: torch.stack([corr1, corr2], -1) -> [B, M, D, D, H, W, 2]
-                            // To match Python's stacking order (channel last), we use: [num_active, D, D, P, P, 2]
-                            // This matches Python's final shape before flattening: [B, M, D, D, H, W, 2]
+                            // Store correlation (matches CUDA's corr[n][m][ii][jj][i0][j0])
+                            // Output layout: [num_active, D, D, P, P, 2] (channel last)
                             size_t out_idx = static_cast<size_t>(e) * D * D * P * P * 2 +
                                              static_cast<size_t>(corr_ii) * D * P * P * 2 +
                                              static_cast<size_t>(corr_jj) * P * P * 2 +
                                              static_cast<size_t>(i0) * P * 2 +
                                              static_cast<size_t>(j0) * 2 +
-                                             static_cast<size_t>(c);  // Channel last (matches Python's stack along last dim)
+                                             static_cast<size_t>(c);
                             
-                            // Validate output index
                             if (out_idx < corr_total_size) {
-                    corr_out[out_idx] = sum;
+                                corr_out[out_idx] = sum;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+    
+    // Get logger
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    // Log statistics for entire correlation output
+    int zero_count = 0;
+    int nonzero_count = 0;
+    float min_corr = std::numeric_limits<float>::max();
+    float max_corr = std::numeric_limits<float>::lowest();
+    double sum_corr = 0.0;
+    const int sample_count = 20;  // Number of sample values to show
+    
+    // Count over entire output
+    for (size_t i = 0; i < corr_total_size; i++) {
+        float val = corr_out[i];
+        if (val == 0.0f) {
+            zero_count++;
+        } else {
+            nonzero_count++;
+        }
+        if (val < min_corr) min_corr = val;
+        if (val > max_corr) max_corr = val;
+        sum_corr += val;
+    }
+    
+    float mean_corr = corr_total_size > 0 ? static_cast<float>(sum_corr / corr_total_size) : 0.0f;
+    
+    // Log comprehensive statistics
+    logger->info("computeCorrelation: Output statistics - size={}, zero_count={}, nonzero_count={}, min={:.6f}, max={:.6f}, mean={:.6f}",
+                 corr_total_size, zero_count, nonzero_count, min_corr, max_corr, mean_corr);
+    
+    // Log sample values from different parts of the output
+    std::string sample_values = "[";
+    for (int i = 0; i < sample_count && i < static_cast<int>(corr_total_size); i++) {
+        sample_values += std::to_string(corr_out[i]);
+        if (i < sample_count - 1 && i < static_cast<int>(corr_total_size) - 1) {
+            sample_values += ", ";
+        }
+    }
+    sample_values += "]";
+    logger->info("computeCorrelation: First {} sample values: {}", sample_count, sample_values);
+    
+    // Log some values from middle and end of output
+    if (corr_total_size > sample_count * 2) {
+        std::string mid_values = "[";
+        int mid_start = static_cast<int>(corr_total_size / 2);
+        for (int i = 0; i < sample_count && (mid_start + i) < static_cast<int>(corr_total_size); i++) {
+            mid_values += std::to_string(corr_out[mid_start + i]);
+            if (i < sample_count - 1 && (mid_start + i + 1) < static_cast<int>(corr_total_size)) {
+                mid_values += ", ";
             }
+        }
+        mid_values += "]";
+        logger->info("computeCorrelation: Middle {} sample values (starting at index {}): {}", 
+                     sample_count, mid_start, mid_values);
+    }
+    
+    // Log per-edge statistics for first few edges
+    if (num_active > 0) {
+        int edges_to_log = std::min(3, num_active);
+        for (int e = 0; e < edges_to_log; e++) {
+            int edge_zero = 0;
+            int edge_nonzero = 0;
+            float edge_min = std::numeric_limits<float>::max();
+            float edge_max = std::numeric_limits<float>::lowest();
+            double edge_sum = 0.0;
+            
+            size_t edge_start = static_cast<size_t>(e) * D * D * P * P * 2;
+            size_t edge_size = D * D * P * P * 2;
+            
+            for (size_t i = 0; i < edge_size && (edge_start + i) < corr_total_size; i++) {
+                float val = corr_out[edge_start + i];
+                if (val == 0.0f) {
+                    edge_zero++;
+                } else {
+                    edge_nonzero++;
+                }
+                if (val < edge_min) edge_min = val;
+                if (val > edge_max) edge_max = val;
+                edge_sum += val;
+            }
+            
+            float edge_mean = edge_size > 0 ? static_cast<float>(edge_sum / edge_size) : 0.0f;
+            logger->info("computeCorrelation: Edge[{}] stats - zero={}, nonzero={}, min={:.6f}, max={:.6f}, mean={:.6f}",
+                         e, edge_zero, edge_nonzero, edge_min, edge_max, edge_mean);
         }
     }
     
-    printf("[computeCorrelation] COMPLETED: processed %d edges\n", num_active);
-    fflush(stdout);
+    logger->info("computeCorrelation: COMPLETED - processed {} edges", num_active);
 }

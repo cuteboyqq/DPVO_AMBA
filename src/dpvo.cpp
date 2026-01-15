@@ -46,18 +46,15 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
         m_pg.m_n = 0;
         m_pg.m_m = 0;
     }
-    // fmap sizes - Python uses RES=4, so work at 1/4 resolution
-    // Python: ht = ht // RES, wd = wd // RES (where RES=4)
-    // fmap1_: [ht // 1, wd // 1] = [ht/4, wd/4] in original coordinates
-    // fmap2_: [ht // 4, wd // 4] = [ht/16, wd/16] in original coordinates
-    const int RES = 4;
-    const int res_ht = ht / RES;  // e.g., 480 / 4 = 120
-    const int res_wd = wd / RES;  // e.g., 640 / 4 = 160
-    
-    m_fmap1_H = res_ht;      // 120 (1/4 resolution)
-    m_fmap1_W = res_wd;      // 160 (1/4 resolution)
-    m_fmap2_H = res_ht / 4;  // 30 (1/16 resolution)
-    m_fmap2_W = res_wd / 4;  // 40 (1/16 resolution)
+    // fmap sizes - Models (FNet/INet) already do /4 internally, so use model output dimensions directly
+    // fmap1: Model output at 1/4 of input (models handle /4 internally)
+    // fmap2: Downsampled from fmap1 by 4x (1/16 of original input)
+    // NOTE: We'll get actual dimensions from model output, but for buffer allocation use full image size
+    // The actual dimensions will be set when models are initialized
+    m_fmap1_H = ht;      // Will be updated to actual model output height (typically ht/4)
+    m_fmap1_W = wd;      // Will be updated to actual model output width (typically wd/4)
+    m_fmap2_H = ht / 4;  // 1/4 of fmap1 (1/16 of original)
+    m_fmap2_W = wd / 4;  // 1/4 of fmap1 (1/16 of original)
 
     // Validate dimensions to prevent bad_array_new_length
     if (m_fmap1_H <= 0 || m_fmap1_W <= 0 || m_fmap2_H <= 0 || m_fmap2_W <= 0) {
@@ -70,8 +67,13 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
 	const int M = cfg.PATCHES_PER_FRAME;
     
     // Calculate array sizes and validate
+    // CRITICAL: gmap uses D_gmap = 4 (from patchify_cpu_safe with radius=1), NOT P=3
+    // patchify_cpu_safe: radius = m_patch_size/2 = 1, D = 2*radius + 2 = 4
+    const int patch_radius = m_P / 2;  // m_P = 3, so radius = 1
+    const int D_gmap = 2 * patch_radius + 2;  // D_gmap = 4
+    
     size_t imap_size = static_cast<size_t>(m_pmem) * static_cast<size_t>(M) * static_cast<size_t>(m_DIM);
-    size_t gmap_size = static_cast<size_t>(m_pmem) * static_cast<size_t>(M) * 128 * static_cast<size_t>(m_P) * static_cast<size_t>(m_P);
+    size_t gmap_size = static_cast<size_t>(m_pmem) * static_cast<size_t>(M) * 128 * static_cast<size_t>(D_gmap) * static_cast<size_t>(D_gmap);
     size_t fmap1_size = static_cast<size_t>(m_mem) * 128 * static_cast<size_t>(m_fmap1_H) * static_cast<size_t>(m_fmap1_W);
     size_t fmap2_size = static_cast<size_t>(m_mem) * 128 * static_cast<size_t>(m_fmap2_H) * static_cast<size_t>(m_fmap2_W);
     
@@ -366,6 +368,7 @@ void DPVO::run(int64_t timestamp,
     // float* gmap_dst = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
     // float* fmap1_dst = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
     // float* fmap2_dst = &m_fmap2[fmap2_idx(0, mm, 0, 0, 0)];
+    // The pointer directly references the original memory
 	m_cur_imap  = &m_imap[imap_idx(pm, 0, 0)];
 	m_cur_gmap  = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
 	m_cur_fmap1 = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
@@ -403,12 +406,15 @@ void DPVO::run(int64_t timestamp,
     // Normalize image: 2 * (image / 255.0) - 0.5 (matches Python)
     // Python: image = 2 * (image[None,None] / 255.0) - 0.5
     // This normalizes from uint8 [0, 255] to float [-0.5, 1.5]
+    // 
+    // NOTE: normalized_image is kept for reference/other uses, but NOT passed to patchifier
+    // AMBA CV28 models (fnet/inet) will handle normalization internally, so we pass original uint8 image
     // -------------------------------------------------
     const int C = 3;  // RGB channels
     const int image_size = C * H * W;
     std::vector<float> normalized_image(image_size);
     
-    if (logger) logger->info("DPVO::run: Normalizing image from uint8 [0, 255] to float [-0.5, 1.5], size={}", image_size);
+    if (logger) logger->info("DPVO::run: Creating normalized_image for reference (not used for patchifier), size={}", image_size);
     
     // Image format is [C, H, W] (channel-first)
     for (int i = 0; i < image_size; i++) {
@@ -419,7 +425,7 @@ void DPVO::run(int64_t timestamp,
     if (logger) {
         float img_min = *std::min_element(normalized_image.begin(), normalized_image.end());
         float img_max = *std::max_element(normalized_image.begin(), normalized_image.end());
-        logger->info("DPVO::run: Normalized image range: [{}, {}]", img_min, img_max);
+        logger->info("DPVO::run: Normalized image range: [{}, {}] (for reference only)", img_min, img_max);
     }
     
     // CRITICAL: Save 'this' pointer to a safe location (static/global) before calling patchifier.forward()
@@ -442,16 +448,18 @@ void DPVO::run(int64_t timestamp,
         logger->info("DPVO::run: m_imap[{}] before patchifier.forward = {}", imap_write_offset, before_val);
     }
     
-    // Pass normalized float image to patchifier
-    // Note: We'll need to update Patchifier::forward() to accept float* and handle conversion to uint8 for models
+    // Pass original uint8 image to patchifier (AMBA CV28 models will handle normalization internally)
     m_patchifier.forward(
-        normalized_image.data(), H, W,  // Pass normalized float image
-        m_cur_fmap1,     // full-res fmap
-        m_cur_imap,
-        m_cur_gmap,
-        patches,
-        clr,
-        M
+        image, H, W,  // Pass original uint8 image (unnormalized) - AMBA CV28 handles normalization
+        m_cur_fmap1,     // Output: [128, fmap_H, fmap_W] - full-res fmap at 1/4 resolution
+        m_cur_imap,      // Output: [M, m_DIM] = [M, 384] - patch features extracted from INet
+                         //         Extracted via patchify_cpu_safe with radius=0 (single pixel per patch)
+                         //         Source: INet feature map [384, fmap_H, fmap_W] at 1/4 resolution
+                         //         Each patch gets 384 features (one per INet output channel)
+        m_cur_gmap,      // Output: [M, 128, D, D] where D = 2 * radius + 2 = 4 (radius = m_patch_size/2 = 1, m_patch_size=3)
+        patches,         // Output: [M, 3, D, D] where D = 2 * radius + 2 = 4 (radius = m_patch_size/2 = 1, RGB patches from coordinate grid)
+        clr,             // Output: [M, 3] - RGB colors for visualization
+        M                // Number of patches per frame
     );
     
     printf("[DPVO] patchifier.forward returned\n");
@@ -719,7 +727,7 @@ void DPVO::run(int64_t timestamp,
 
     // -------------------------------------------------
     // 6. Downsample fmap1 → fmap2 (Python avg_pool2d)
-    // fmap1 is at 1/4 resolution (e.g., 120x160), fmap2 is at 1/16 resolution (e.g., 30x40)
+    // fmap1 is at 1/4 resolution (e.g., 132x240), fmap2 is at 1/16 resolution (e.g., 33x60)
     // -------------------------------------------------
     if (logger) logger->info("DPVO::run: Starting downsample fmap1->fmap2, fmap1_H={}, fmap1_W={}, fmap2_H={}, fmap2_W={}", 
                               m_fmap1_H, m_fmap1_W, m_fmap2_H, m_fmap2_W);
@@ -1045,6 +1053,23 @@ void DPVO::update()
     if (m_updateModel != nullptr) {
         if (logger) logger->info("DPVO::update: m_updateModel is not null, preparing model inputs");
         
+        // Check m_pg.m_net state before reshapeInput
+        if (logger) {
+            int net_zero_count = 0;
+            int net_nonzero_count = 0;
+            for (int e = 0; e < std::min(num_active, 10); e++) {  // Check first 10 edges
+                for (int d = 0; d < 384; d++) {
+                    if (m_pg.m_net[e][d] == 0.0f) net_zero_count++;
+                    else net_nonzero_count++;
+                }
+            }
+            logger->info("DPVO::update: m_pg.m_net state (first 10 edges) - zero_count={}, nonzero_count={}",
+                         net_zero_count, net_nonzero_count);
+            if (net_nonzero_count == 0) {
+                logger->info("DPVO::update: m_pg.m_net is all zeros - will be initialized from context in reshapeInput");
+            }
+        }
+        
         // Reshape inputs using member function (reuses pre-allocated buffers)
         const int CORR_DIM = 882;
         num_edges_to_process = m_updateModel->reshapeInput(
@@ -1066,6 +1091,25 @@ void DPVO::update()
             m_maxEdge,   // Use member variable instead of hardcoded constant
             CORR_DIM
         );
+        
+        // Check m_pg.m_net state after reshapeInput (to see if it was initialized)
+        if (logger) {
+            int net_zero_count = 0;
+            int net_nonzero_count = 0;
+            float net_min = std::numeric_limits<float>::max();
+            float net_max = std::numeric_limits<float>::lowest();
+            for (int e = 0; e < std::min(num_edges_to_process, 10); e++) {
+                for (int d = 0; d < 384; d++) {
+                    float val = m_pg.m_net[e][d];
+                    if (val == 0.0f) net_zero_count++;
+                    else net_nonzero_count++;
+                    if (val < net_min) net_min = val;
+                    if (val > net_max) net_max = val;
+                }
+            }
+            logger->info("DPVO::update: m_pg.m_net state AFTER reshapeInput (first {} edges) - zero_count={}, nonzero_count={}, min={:.6f}, max={:.6f}",
+                         std::min(num_edges_to_process, 10), net_zero_count, net_nonzero_count, net_min, net_max);
+        }
         
         // Call update model inference synchronously
         DPVOUpdate_Prediction pred;
@@ -1774,27 +1818,81 @@ float DPVO::motionProbe() {
 }
 
 
+// -----------------------------------------------------------------------------
+// Reproject patches from source frame i to target frame j using SE3 poses
+// -----------------------------------------------------------------------------
+// Purpose: Projects 3D patches (with inverse depth) from frame i to frame j
+//          using camera poses and intrinsics. Computes 2D coordinates for each
+//          pixel in each patch, along with optional Jacobians for bundle adjustment.
+//
+// Input Parameters:
+//   ii: [num_edges] - Source frame indices for each edge (frame containing the patch)
+//   jj: [num_edges] - Target frame indices for each edge (frame to project into)
+//   kk: [num_edges] - Patch indices within source frame (which patch from frame i)
+//   num_edges: Number of edges (active patch-frame pairs) to reproject
+//
+// Output Parameters:
+//   coords_out: [num_edges, 2, P, P] flattened - Reprojected 2D coordinates (u, v) for each pixel
+//               Layout: [edge][channel][y][x] where channel 0=u, channel 1=v
+//               Coordinates are at 1/4 resolution (scaled by intrinsics)
+//
+// Optional Output Parameters (for Bundle Adjustment):
+//   Ji_out: [num_edges, 2, P, P, 6] flattened - Jacobian w.r.t. source pose i (SE3, 6 DOF)
+//           If nullptr, temporary buffer is allocated internally
+//   Jj_out: [num_edges, 2, P, P, 6] flattened - Jacobian w.r.t. target pose j (SE3, 6 DOF)
+//           If nullptr, temporary buffer is allocated internally
+//   Jz_out: [num_edges, 2, P, P, 1] flattened - Jacobian w.r.t. inverse depth z
+//           If nullptr, temporary buffer is allocated internally
+//   valid_out: [num_edges, P, P] flattened - Validity mask (1.0 if pixel projects within bounds, 0.0 otherwise)
+//              If nullptr, temporary buffer is allocated internally
+//
+// Internal Data Used:
+//   m_pg.m_poses: [N] - SE3 camera poses for all frames
+//   m_pg.m_patches: [N, M, 3, P, P] - 3D patches with inverse depth (x, y, z=1/inv_depth)
+//   m_pg.m_intrinsics: [N, 4] - Camera intrinsics [fx, fy, cx, cy] for each frame
+//   m_P: Patch size (typically 3)
+//   m_cfg.PATCHES_PER_FRAME: M (number of patches per frame, typically 4 or 8)
+//
+// Algorithm:
+//   1. For each edge e:
+//      - Get patch kk[e] from frame ii[e] (source)
+//      - Get poses for frames ii[e] and jj[e]
+//      - Get intrinsics for frame jj[e] (target)
+//   2. For each pixel (i0, j0) in patch:
+//      - Inverse project: 2D pixel → 3D point using inverse depth from patch
+//      - Transform: 3D point from frame i → frame j using SE3 poses
+//      - Project: 3D point → 2D pixel in frame j using target intrinsics
+//      - Store (u, v) coordinates in coords_out
+//      - Compute Jacobians if requested (for bundle adjustment)
+//      - Mark validity if pixel projects within image bounds
+//
+// Note: Coordinates are at 1/4 resolution (matching feature map resolution)
+//       This matches Python DPVO behavior where reprojection uses scaled intrinsics
+// -----------------------------------------------------------------------------
 void DPVO::reproject(
-    const int* ii,
-    const int* jj,
-    const int* kk,
-    int num_edges,
-    float* coords_out,
-    float* Ji_out,
-    float* Jj_out,
-    float* Jz_out,
-    float* valid_out)
+    const int* ii,          // [num_edges] - Source frame indices
+    const int* jj,          // [num_edges] - Target frame indices  
+    const int* kk,          // [num_edges] - Patch indices within source frame
+    int num_edges,          // Number of edges to reproject
+    float* coords_out,      // Output: [num_edges, 2, P, P] - Reprojected (u, v) coordinates
+    float* Ji_out,          // Optional: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose i
+    float* Jj_out,          // Optional: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose j
+    float* Jz_out,          // Optional: [num_edges, 2, P, P, 1] - Jacobian w.r.t. inverse depth
+    float* valid_out)       // Optional: [num_edges, P, P] - Validity mask
 {
     if (num_edges <= 0)
         return;
 
     // Flattened pointers to patches and intrinsics
+    // m_patches: [N, M, 3, P, P] - patches stored as (frame, patch_idx, channel, y, x)
+    // m_intrinsics: [N, 4] - intrinsics stored as (frame, [fx, fy, cx, cy])
     float* patches_flat = &m_pg.m_patches[0][0][0][0][0];
     float* intrinsics_flat = &m_pg.m_intrinsics[0][0];
 
     const int P = m_P;
     
     // Allocate temporary buffers if Jacobians are not provided
+    // This allows the function to work even when Jacobians are not needed
     std::vector<float> Ji_temp, Jj_temp, Jz_temp, valid_temp;
     float* Ji_ptr = Ji_out;
     float* Jj_ptr = Jj_out;
@@ -1802,41 +1900,52 @@ void DPVO::reproject(
     float* valid_ptr = valid_out;
     
     if (Ji_ptr == nullptr) {
+        // Allocate temporary buffer: [num_edges, 2, P, P, 6] = num_edges * 2 * P * P * 6
         Ji_temp.resize(num_edges * 2 * P * P * 6);
         Ji_ptr = Ji_temp.data();
     }
     if (Jj_ptr == nullptr) {
+        // Allocate temporary buffer: [num_edges, 2, P, P, 6] = num_edges * 2 * P * P * 6
         Jj_temp.resize(num_edges * 2 * P * P * 6);
         Jj_ptr = Jj_temp.data();
     }
     if (Jz_ptr == nullptr) {
+        // Allocate temporary buffer: [num_edges, 2, P, P, 1] = num_edges * 2 * P * P * 1
         Jz_temp.resize(num_edges * 2 * P * P * 1);
         Jz_ptr = Jz_temp.data();
     }
     if (valid_ptr == nullptr) {
+        // Allocate temporary buffer: [num_edges, P, P] = num_edges * P * P
         valid_temp.resize(num_edges * P * P);
         valid_ptr = valid_temp.data();
     }
 
-    // Call transformWithJacobians
+    // Call transformWithJacobians to perform the actual reprojection
+    // This function:
+    //   1. Extracts patches from m_pg.m_patches using indices (ii, jj, kk)
+    //   2. Inverse projects 2D pixels to 3D using inverse depth from patches
+    //   3. Transforms 3D points from frame i to frame j using SE3 poses
+    //   4. Projects 3D points to 2D in target frame using intrinsics
+    //   5. Computes Jacobians for bundle adjustment (if buffers provided)
     pops::transformWithJacobians(
-        m_pg.m_poses,         // SE3 poses [N]
-        patches_flat,         // flattened patches
-        intrinsics_flat,      // flattened intrinsics
-        ii, jj, kk,           // indices
-        num_edges,            // number of edges
-        m_cfg.PATCHES_PER_FRAME,
-        m_P,
-        coords_out,           // output [num_edges][2][P][P] flattened
-        Ji_ptr,               // Jacobian w.r.t. pose i
-        Jj_ptr,               // Jacobian w.r.t. pose j
-        Jz_ptr,               // Jacobian w.r.t. inverse depth
-        valid_ptr             // validity mask
+        m_pg.m_poses,         // SE3 poses [N] - camera poses for all frames
+        patches_flat,         // Flattened patches [N*M*3*P*P] - 3D patches with inverse depth
+        intrinsics_flat,      // Flattened intrinsics [N*4] - [fx, fy, cx, cy] for each frame
+        ii, jj, kk,           // Edge indices: source frame, target frame, patch index
+        num_edges,            // Number of edges to process
+        m_cfg.PATCHES_PER_FRAME,  // M - patches per frame
+        m_P,                  // P - patch size (typically 3)
+        coords_out,           // Output: [num_edges, 2, P, P] - Reprojected (u, v) coordinates
+        Ji_ptr,               // Output: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose i (SE3)
+        Jj_ptr,               // Output: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose j (SE3)
+        Jz_ptr,               // Output: [num_edges, 2, P, P, 1] - Jacobian w.r.t. inverse depth
+        valid_ptr             // Output: [num_edges, P, P] - Validity mask (1.0=valid, 0.0=invalid)
     );
 
-    // Output layout already matches Python coords.permute(0,1,4,2,3)
-    // Each edge: [2][P][P] → 2 channels: u,v
-    // Jacobians are stored if output buffers were provided
+    // Output layout matches Python coords.permute(0,1,4,2,3)
+    // Each edge: [2, P, P] → 2 channels (u, v) for each pixel in the patch
+    // Coordinates are at 1/4 resolution (matching feature map resolution)
+    // Jacobians are stored in output buffers if provided, otherwise discarded
 }
 
 

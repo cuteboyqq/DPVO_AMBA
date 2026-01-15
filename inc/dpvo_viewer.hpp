@@ -99,7 +99,8 @@ public:
 private:
     void run();  // Main rendering loop (runs in separate thread)
     void drawPoints();
-    void drawPoses();
+    void drawPoses();  // Draw real poses from m_poseMatrices
+    void drawPoses_fake();
     void convertPosesToMatrices();
     
     // Thread management
