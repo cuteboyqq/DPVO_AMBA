@@ -23,7 +23,10 @@ void patchify_cpu(
     float* gmap           // [M][C][D][D]
 )
 {
-    const int D = 2 * radius + 2;
+    // Formula matches Python altcorr.patchify behavior:
+    // - radius=0 -> D=1 (single pixel extraction)
+    // - radius>0 -> D = 2*radius + 1 (patch extraction)
+    const int D = (radius == 0) ? 1 : (2 * radius + 1);
 
     // zero output (matches CUDA behavior)
     std::memset(gmap, 0, sizeof(float) * M * C * D * D);
@@ -80,7 +83,12 @@ void patchify_cpu_safe(
     float* gmap           // [M][C][D][D]
 )
 {
-    const int D = 2 * radius + 2;
+    // Formula matches Python altcorr.patchify behavior:
+    // - radius=0 -> D=1 (single pixel extraction)
+    // - radius>0 -> D = 2*radius + 1 (patch extraction)
+    //   Example: radius=1 (P//2 where P=3) -> D=3, producing [M, C, 3, 3] patches
+    //   This matches Python: altcorr.patchify(..., P//2).view(..., P, P) where P=3
+    const int D = (radius == 0) ? 1 : (2 * radius + 1);
     const int fmap_size = C * H * W;
     const int gmap_size = M * C * D * D;
 
@@ -197,7 +205,7 @@ void patchify_cpu_safe(
 //         - num_gmap_frames: Number of frames in ring buffer (e.g., m_pmem = 36)
 //         - M: Patches per frame (e.g., 4 or 8)
 //         - feature_dim: Feature dimension (128 for FNet features)
-//         - D_gmap: Patch dimension = 4 (from patchify_cpu_safe with radius=1, m_patch_size=3)
+//         - D_gmap: Patch dimension = 3 (from patchify_cpu_safe with radius=1, matches Python altcorr.patchify)
 //         - Contains patches extracted from source frames using patchify_cpu_safe
 //
 //   pyramid0: [num_frames * feature_dim * fmap1_H * fmap1_W] - Full resolution feature pyramid
@@ -271,6 +279,389 @@ void patchify_cpu_safe(
 //
 // Note: Matches Python CUDA kernel corr_forward_kernel behavior
 // -----------------------------------------------------------------------------
+
+// Single pyramid level correlation (matches Python: altcorr.corr)
+// This function computes correlation for one pyramid level, matching Python's altcorr.corr call
+// Output: [num_active, D, D, P, P] (matches CUDA kernel output before permute)
+void computeCorrelationSingle(
+    const float* gmap,           // [num_gmap_frames, M, feature_dim, D_gmap, D_gmap] - Patch features ring buffer
+    const float* pyramid,         // [num_frames, feature_dim, fmap_H, fmap_W] - Frame features pyramid
+    const float* coords,         // [num_active, 2, P, P] - Reprojected (u, v) coordinates
+    const int* ii1,              // [num_active] - Patch indices for gmap (mapped from kk: ii1 = kk % (M * pmem))
+    const int* jj1,              // [num_active] - Frame indices for pyramid (mapped from jj: jj1 = jj % mem)
+    int num_active,              // Number of active edges to process
+    int M,                       // Patches per frame (PATCHES_PER_FRAME)
+    int P,                       // Patch size (typically 3)
+    int num_frames,              // Number of frames in pyramid buffers (e.g., m_mem)
+    int num_gmap_frames,         // Number of frames in gmap ring buffer (e.g., m_pmem)
+    int fmap_H, int fmap_W,      // Dimensions for pyramid
+    int feature_dim,             // Feature dimension (128 for FNet)
+    float coord_scale,          // Scale factor for coordinates (1.0 for pyramid0, 0.25 for pyramid1)
+    int radius,                  // Correlation radius (typically 3)
+    float* corr_out)            // Output: [num_active, D, D, P, P]
+{
+    // Translated from CUDA corr_forward_kernel
+    // CUDA signature: corr_forward_kernel(int R, fmap1, fmap2, coords, us, vs, corr)
+    // Python: altcorr.corr(fmap1, fmap2, coords, ii1, jj1, radius)
+    
+    // Validate inputs
+    if (gmap == nullptr || pyramid == nullptr || coords == nullptr || 
+        ii1 == nullptr || jj1 == nullptr || corr_out == nullptr) {
+        printf("[computeCorrelationSingle] ERROR: Null pointer in inputs\n");
+        fflush(stdout);
+        return;
+    }
+    
+    if (num_active <= 0 || M <= 0 || P <= 0 || num_frames <= 0 || num_gmap_frames <= 0) {
+        printf("[computeCorrelationSingle] ERROR: Invalid dimensions\n");
+        fflush(stdout);
+        return;
+    }
+    
+    const int R = radius;
+    const int D = 2 * R + 2;  // Correlation window diameter (D = 8 for R=3)
+    
+    // gmap structure: created by patchify_cpu_safe with radius=1, so D_gmap=3 (matches Python)
+    const int D_gmap = 3;  // D_gmap = 2*radius + 1 = 3 (matches Python: .view(..., P, P) where P=3)
+    const int gmap_center_offset = (D_gmap - P) / 2;  // Center the P×P region within D_gmap×D_gmap (0 when D_gmap=P=3)
+    
+    // Calculate buffer sizes
+    const size_t gmap_total_size = static_cast<size_t>(num_gmap_frames) * M * feature_dim * D_gmap * D_gmap;
+    const size_t pyramid_total_size = static_cast<size_t>(num_frames) * feature_dim * fmap_H * fmap_W;
+    const size_t corr_total_size = static_cast<size_t>(num_active) * D * D * P * P;
+    
+    // Zero output (matches CUDA behavior)
+    std::memset(corr_out, 0, sizeof(float) * corr_total_size);
+    
+    // Diagnostic logging setup
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    // Diagnostic: Check input coords array for NaN/Inf values
+    if (logger) {
+        int coords_total_size = num_active * 2 * P * P;
+        int nan_count = 0;
+        int inf_count = 0;
+        int valid_count = 0;
+        float min_val = std::numeric_limits<float>::max();
+        float max_val = std::numeric_limits<float>::lowest();
+        
+        // Sample first edge and a few others
+        for (int e = 0; e < std::min(num_active, 3); e++) {
+            for (int i0 = 0; i0 < P; i0++) {
+                for (int j0 = 0; j0 < P; j0++) {
+                    int coord_x_idx = e * 2 * P * P + 0 * P * P + i0 * P + j0;
+                    int coord_y_idx = e * 2 * P * P + 1 * P * P + i0 * P + j0;
+                    if (coord_x_idx < coords_total_size && coord_y_idx < coords_total_size) {
+                        float x = coords[coord_x_idx];
+                        float y = coords[coord_y_idx];
+                        if (!std::isfinite(x)) {
+                            if (std::isnan(x)) nan_count++;
+                            else if (std::isinf(x)) inf_count++;
+                        } else {
+                            valid_count++;
+                            min_val = std::min(min_val, x);
+                            max_val = std::max(max_val, x);
+                        }
+                        if (!std::isfinite(y)) {
+                            if (std::isnan(y)) nan_count++;
+                            else if (std::isinf(y)) inf_count++;
+                        } else {
+                            valid_count++;
+                            min_val = std::min(min_val, y);
+                            max_val = std::max(max_val, y);
+                        }
+                    }
+                }
+            }
+        }
+        
+        logger->info("computeCorrelationSingle: Input coords array check (first {} edges) - "
+                     "total_samples={}, valid={}, NaN={}, Inf={}, "
+                     "valid_range=[{:.2f}, {:.2f}], coord_scale={:.2f}",
+                     std::min(num_active, 3), (std::min(num_active, 3) * P * P * 2),
+                     valid_count, nan_count, inf_count, min_val, max_val, coord_scale);
+        
+        // Check first edge's first pixel specifically
+        if (num_active > 0) {
+            int first_x_idx = 0 * 2 * P * P + 0 * P * P + 0 * P + 0;
+            int first_y_idx = 0 * 2 * P * P + 1 * P * P + 0 * P + 0;
+            if (first_x_idx < coords_total_size && first_y_idx < coords_total_size) {
+                float first_x = coords[first_x_idx];
+                float first_y = coords[first_y_idx];
+                logger->info("computeCorrelationSingle: First edge[0] pixel[0][0] coords from input array - "
+                             "coords[{}]={:.6f}, coords[{}]={:.6f}, "
+                             "is_finite_x={}, is_finite_y={}, is_nan_x={}, is_nan_y={}",
+                             first_x_idx, first_x, first_y_idx, first_y,
+                             std::isfinite(first_x), std::isfinite(first_y),
+                             std::isnan(first_x), std::isnan(first_y));
+            }
+        }
+    }
+    
+    // Main loop: For each active edge (equivalent to CUDA's B * M * H * W * D * D threads)
+    for (int e = 0; e < num_active; e++) {
+        // Get patch and frame indices (equivalent to CUDA's us[m] and vs[m])
+        // ii1[e] and jj1[e] are already mapped (from Python: ii1 = kk % (M * pmem), jj1 = jj % mem)
+        int ii1_val = ii1[e];
+        int jj1_val = jj1[e];
+        
+        // Extract gmap frame and patch index from ii1
+        int gmap_frame = ii1_val / M;
+        int patch_idx = ii1_val % M;
+        int pyramid_frame = jj1_val;
+        
+        // Diagnostic: Log first edge indices
+        if (e == 0 && logger) {
+            logger->info("computeCorrelationSingle: Edge[0] - ii1={}, jj1={}, gmap_frame={}, patch_idx={}, pyramid_frame={}",
+                         ii1_val, jj1_val, gmap_frame, patch_idx, pyramid_frame);
+        }
+        
+        // Validate indices
+        if (patch_idx < 0 || patch_idx >= M || 
+            gmap_frame < 0 || gmap_frame >= num_gmap_frames ||
+            pyramid_frame < 0 || pyramid_frame >= num_frames) {
+            if (e == 0 && logger) {
+                logger->warn("computeCorrelationSingle: Edge[0] invalid indices - patch_idx={} (M={}), "
+                             "gmap_frame={} (max={}), pyramid_frame={} (max={})",
+                             patch_idx, M, gmap_frame, num_gmap_frames, pyramid_frame, num_frames);
+            }
+            continue;
+        }
+        
+        // For each pixel in the patch (i0, j0) - equivalent to CUDA's H * W loop
+        for (int i0 = 0; i0 < P; i0++) {
+            for (int j0 = 0; j0 < P; j0++) {
+                // Get reprojected coordinate for target frame (scaled)
+                int coord_x_idx = e * 2 * P * P + 0 * P * P + i0 * P + j0;
+                int coord_y_idx = e * 2 * P * P + 1 * P * P + i0 * P + j0;
+                
+                // Validate indices
+                int coords_total_size = num_active * 2 * P * P;
+                if (coord_x_idx < 0 || coord_x_idx >= coords_total_size || 
+                    coord_y_idx < 0 || coord_y_idx >= coords_total_size) {
+                    if (e == 0 && i0 == 0 && j0 == 0 && logger) {
+                        logger->error("computeCorrelationSingle: Edge[0] pixel[0][0] - Invalid coord indices! "
+                                     "coord_x_idx={}, coord_y_idx={}, coords_total_size={}, "
+                                     "num_active={}, P={}",
+                                     coord_x_idx, coord_y_idx, coords_total_size, num_active, P);
+                    }
+                    continue;  // Skip this pixel if indices are invalid
+                }
+                
+                float raw_x = coords[coord_x_idx];
+                float raw_y = coords[coord_y_idx];
+                
+                // Check if coordinates are NaN/Inf before scaling
+                bool is_nan_before_scale = !std::isfinite(raw_x) || !std::isfinite(raw_y);
+                
+                float x = raw_x * coord_scale;
+                float y = raw_y * coord_scale;
+                
+                // Check if coordinates are NaN/Inf after scaling
+                bool is_nan_after_scale = !std::isfinite(x) || !std::isfinite(y);
+                
+                // Diagnostic: Log coordinates for first edge, first pixel with detailed info
+                if (e == 0 && i0 == 0 && j0 == 0 && logger) {
+                    logger->info("computeCorrelationSingle: Edge[0] pixel[0][0] - "
+                                 "ii1={}, jj1={}, gmap_frame={}, patch_idx={}, pyramid_frame={}, "
+                                 "coord_x_idx={}, coord_y_idx={}, "
+                                 "raw_coords=({:.6f}, {:.6f}), "
+                                 "coord_scale={:.2f}, "
+                                 "scaled=({:.6f}, {:.6f}), "
+                                 "is_nan_before_scale={}, is_nan_after_scale={}, "
+                                 "fmap_H={}, fmap_W={}",
+                                 ii1_val, jj1_val, gmap_frame, patch_idx, pyramid_frame,
+                                 coord_x_idx, coord_y_idx,
+                                 raw_x, raw_y,
+                                 coord_scale,
+                                 x, y,
+                                 is_nan_before_scale, is_nan_after_scale,
+                                 fmap_H, fmap_W);
+                    
+                    // Also check center pixel of first edge
+                    if (P > 1) {
+                        int center_i0 = P / 2;
+                        int center_j0 = P / 2;
+                        int center_x_idx = e * 2 * P * P + 0 * P * P + center_i0 * P + center_j0;
+                        int center_y_idx = e * 2 * P * P + 1 * P * P + center_i0 * P + center_j0;
+                        if (center_x_idx < coords_total_size && center_y_idx < coords_total_size) {
+                            float center_x = coords[center_x_idx];
+                            float center_y = coords[center_y_idx];
+                            logger->info("computeCorrelationSingle: Edge[0] pixel[center] - "
+                                         "center_coords=({:.6f}, {:.6f}), is_finite={}",
+                                         center_x, center_y, std::isfinite(center_x) && std::isfinite(center_y));
+                        }
+                    }
+                    
+                    // Check if all coordinates for this edge are NaN
+                    int nan_count = 0;
+                    int total_count = 0;
+                    for (int py = 0; py < P; py++) {
+                        for (int px = 0; px < P; px++) {
+                            int px_idx = e * 2 * P * P + 0 * P * P + py * P + px;
+                            int py_idx = e * 2 * P * P + 1 * P * P + py * P + px;
+                            if (px_idx < coords_total_size && py_idx < coords_total_size) {
+                                total_count++;
+                                if (!std::isfinite(coords[px_idx]) || !std::isfinite(coords[py_idx])) {
+                                    nan_count++;
+                                }
+                            }
+                        }
+                    }
+                    logger->info("computeCorrelationSingle: Edge[0] coordinate statistics - "
+                                 "NaN_count={}/{}, all_nan={}",
+                                 nan_count, total_count, (nan_count == total_count));
+                }
+                
+                // Skip this pixel if coordinates are invalid
+                if (is_nan_after_scale) {
+                    continue;  // Skip correlation computation for invalid coordinates
+                }
+                
+                // For each offset in correlation window (ii, jj) - equivalent to CUDA's D * D loop
+                for (int corr_ii = 0; corr_ii < D; corr_ii++) {
+                    for (int corr_jj = 0; corr_jj < D; corr_jj++) {
+                        // Calculate sampling location in target frame
+                        // CUDA: i1 = floor(y) + (ii - R), j1 = floor(x) + (jj - R)
+                        int i1 = static_cast<int>(std::floor(y)) + (corr_ii - R);
+                        int j1 = static_cast<int>(std::floor(x)) + (corr_jj - R);
+                        
+                        // Diagnostic: Log sampling location for first edge, first pixel, center offset
+                        // Only log if out of bounds (to reduce noise)
+                        bool is_center = (corr_ii == R && corr_jj == R);
+                        if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
+                            bool in_bounds_check = within_bounds(i1, j1, fmap_H, fmap_W);
+                            if (!in_bounds_check) {
+                                // Only warn if out of bounds - this is expected for some reprojected coordinates
+                                logger->warn("computeCorrelationSingle: Edge[0] center sampling out of bounds - "
+                                             "i1={}, j1={}, bounds=({}, {}), scaled_coords=({:.2f}, {:.2f})",
+                                             i1, j1, fmap_H, fmap_W, x, y);
+                            }
+                        }
+                        
+                        // Compute correlation: dot product over features (matches CUDA)
+                        float sum = 0.0f;
+                        bool in_bounds = within_bounds(i1, j1, fmap_H, fmap_W);
+                        if (in_bounds) {
+                            // Extract patch feature from gmap
+                            int gmap_i = i0 + gmap_center_offset;
+                            int gmap_j = j0 + gmap_center_offset;
+                            
+                            // Dot product over feature channels
+                            int features_processed = 0;
+                            for (int f = 0; f < feature_dim; f++) {
+                                // fmap1: patch feature from gmap
+                                size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
+                                                   static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
+                                                   static_cast<size_t>(f) * D_gmap * D_gmap +
+                                                   static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
+                                
+                                // fmap2: frame feature from pyramid at reprojected location
+                                size_t fmap2_idx = static_cast<size_t>(pyramid_frame) * feature_dim * fmap_H * fmap_W +
+                                                   static_cast<size_t>(f) * fmap_H * fmap_W +
+                                                   static_cast<size_t>(i1) * fmap_W + static_cast<size_t>(j1);
+                                
+                                // Bounds check and compute correlation
+                                if (fmap1_idx < gmap_total_size && fmap2_idx < pyramid_total_size) {
+                                    float f1 = gmap[fmap1_idx];
+                                    float f2 = pyramid[fmap2_idx];
+                                    sum += f1 * f2;
+                                    features_processed++;
+                                    
+                                    // Diagnostic: Log first feature values for first edge, first pixel, center offset
+                                    if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
+                                        logger->info("computeCorrelationSingle: Edge[0] feature[0] - f1_idx={}, f2_idx={}, "
+                                                     "f1={:.6f}, f2={:.6f}, sum_so_far={:.6f}",
+                                                     fmap1_idx, fmap2_idx, f1, f2, sum);
+                                    }
+                                } else {
+                                    // Diagnostic: Log out-of-bounds access
+                                    if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
+                                        logger->warn("computeCorrelationSingle: Edge[0] feature[0] out of bounds - "
+                                                     "fmap1_idx={} (max={}), fmap2_idx={} (max={})",
+                                                     fmap1_idx, gmap_total_size, fmap2_idx, pyramid_total_size);
+                                    }
+                                }
+                            }
+                            
+                            // Diagnostic: Log correlation sum for first edge, first pixel, center offset
+                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
+                                logger->info("computeCorrelationSingle: Edge[0] center correlation - sum={:.6f}, "
+                                             "features_processed={}/{}",
+                                             sum, features_processed, feature_dim);
+                            }
+                        }
+                        // Note: Out-of-bounds sampling is expected for some reprojected coordinates
+                        // (e.g., when patches from one frame reproject outside the image in another frame)
+                        // The code correctly skips correlation computation for out-of-bounds pixels
+                        
+                        // Store correlation (matches CUDA's corr[n][m][ii][jj][i0][j0])
+                        // Output layout: [num_active, D, D, P, P]
+                        size_t out_idx = static_cast<size_t>(e) * D * D * P * P +
+                                         static_cast<size_t>(corr_ii) * D * P * P +
+                                         static_cast<size_t>(corr_jj) * P * P +
+                                         static_cast<size_t>(i0) * P +
+                                         static_cast<size_t>(j0);
+                        
+                        if (out_idx < corr_total_size) {
+                            corr_out[out_idx] = sum;
+                            
+                            // Diagnostic: Log stored value for first edge, first pixel, center offset
+                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
+                                logger->info("computeCorrelationSingle: Edge[0] stored correlation - out_idx={}, value={:.6f}",
+                                             out_idx, sum);
+                            }
+                        } else {
+                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
+                                logger->error("computeCorrelationSingle: Edge[0] out_idx={} >= corr_total_size={}",
+                                              out_idx, corr_total_size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Diagnostic: Log summary statistics
+    if (logger) {
+        int nonzero_count = 0;
+        float max_corr = std::numeric_limits<float>::lowest();
+        float min_corr = std::numeric_limits<float>::max();
+        double sum_corr = 0.0;
+        
+        for (size_t i = 0; i < corr_total_size; i++) {
+            float val = corr_out[i];
+            if (val != 0.0f) {
+                nonzero_count++;
+                if (val > max_corr) max_corr = val;
+                if (val < min_corr) min_corr = val;
+            }
+            sum_corr += val;
+        }
+        
+        float mean_corr = corr_total_size > 0 ? static_cast<float>(sum_corr / corr_total_size) : 0.0f;
+        logger->info("computeCorrelationSingle: Output stats - size={}, nonzero={}, zero={}, "
+                     "min={:.6f}, max={:.6f}, mean={:.6f}",
+                     corr_total_size, nonzero_count, corr_total_size - nonzero_count,
+                     min_corr, max_corr, mean_corr);
+    }
+}
+
+// Combined correlation for both pyramid levels (matches Python: torch.stack([corr1, corr2], -1).view(1, len(ii), -1))
+// This function calls computeCorrelationSingle twice and stacks the results
+// Python equivalent:
+//   corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
+//   corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
+//   return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
 void computeCorrelation(
     const float* gmap,           // [num_gmap_frames, M, feature_dim, D_gmap, D_gmap] - Patch features ring buffer
     const float* pyramid0,      // [num_frames, feature_dim, fmap1_H, fmap1_W] - Full-res feature pyramid
@@ -289,9 +680,6 @@ void computeCorrelation(
     int feature_dim,            // Feature dimension (128 for FNet)
     float* corr_out)            // Output: [num_active, D, D, P, P, 2] - Correlation volumes
 {
-    // Translated from CUDA corr_forward_kernel
-    // CUDA signature: corr_forward_kernel(int R, fmap1, fmap2, coords, us, vs, corr)
-    
     // Validate inputs
     if (gmap == nullptr || pyramid0 == nullptr || pyramid1 == nullptr || 
         coords == nullptr || ii == nullptr || jj == nullptr || kk == nullptr || corr_out == nullptr) {
@@ -306,132 +694,93 @@ void computeCorrelation(
         return;
     }
     
-    // Correlation radius R (typically 3 in DPVO)
-    const int R = 3;
+    const int R = 3;  // Correlation radius (matches Python: altcorr.corr(..., 3))
     const int D = 2 * R + 2;  // Correlation window diameter (D = 8 for R=3)
     
-    // gmap structure: created by patchify_cpu_safe with radius=1, so D_gmap=4
-    const int D_gmap = 4;
-    const int gmap_center_offset = (D_gmap - P) / 2;  // Center the P×P region within D_gmap×D_gmap
+    // Map indices (matches Python: ii1 = kk % (M * pmem), jj1 = jj % mem)
+    std::vector<int> ii1(num_active);
+    std::vector<int> jj1(num_active);
     
-    // Calculate buffer sizes
-    const size_t gmap_total_size = static_cast<size_t>(num_gmap_frames) * M * feature_dim * D_gmap * D_gmap;
-    const size_t fmap1_total_size = static_cast<size_t>(num_frames) * feature_dim * fmap1_H * fmap1_W;
-    const size_t fmap2_total_size = static_cast<size_t>(num_frames) * feature_dim * fmap2_H * fmap2_W;
-    const size_t corr_total_size = static_cast<size_t>(num_active) * D * D * P * P * 2;
+    int mod_value = M * num_gmap_frames;
+    if (mod_value == 0) {
+        printf("[computeCorrelation] ERROR: Division by zero! M=%d, num_gmap_frames=%d\n", M, num_gmap_frames);
+        fflush(stdout);
+        return;
+    }
     
-    // Zero output (matches CUDA behavior)
-    std::memset(corr_out, 0, sizeof(float) * corr_total_size);
-    
-    // Main loop: For each active edge (equivalent to CUDA's B * M * H * W * D * D threads)
     for (int e = 0; e < num_active; e++) {
-        // Get patch and frame indices (equivalent to CUDA's us[m] and vs[m])
-        // Python: ii1 = kk % (M * pmem), jj1 = jj % mem
-        int mod_value = M * num_gmap_frames;
-        if (mod_value == 0) {
-            printf("[computeCorrelation] ERROR: Division by zero! M=%d, num_gmap_frames=%d\n", M, num_gmap_frames);
-            fflush(stdout);
-            continue;
-        }
-        
-        int ii1 = kk[e] % mod_value;  // Linear patch index in gmap (CUDA's us[m])
-        int gmap_frame = ii1 / M;
-        int patch_idx = ii1 % M;
-        int jj1 = jj[e] % num_frames;  // Frame index in pyramid (CUDA's vs[m])
-        int pyramid_frame = jj1;
-        
-        // Validate indices
-        if (patch_idx < 0 || patch_idx >= M || 
-            gmap_frame < 0 || gmap_frame >= num_gmap_frames ||
-            pyramid_frame < 0 || pyramid_frame >= num_frames) {
-            continue;
-        }
-        
-        // Process two correlation channels: pyramid0 (fmap1) and pyramid1 (fmap2)
-        // CUDA: fmap1 = patch features, fmap2 = frame features
-        // Python: corr1 = altcorr.corr(..., coords / 1, ...) for pyramid[0]
-        //         corr2 = altcorr.corr(..., coords / 4, ...) for pyramid[1]
-        // Reprojected coordinates are at 1/4 resolution (intrinsics scaled by RES=4)
-        // fmap1 is at 1/4 resolution, fmap2 is at 1/16 resolution
-        for (int c = 0; c < 2; c++) {
-            const float* fmap2 = (c == 0) ? pyramid0 : pyramid1;  // Frame features (target)
-            // Python: coords / 1 for pyramid[0], coords / 4 for pyramid[1]
-            // Reprojected coords are at 1/4 resolution, so:
-            // - For fmap1 (1/4 res): scale = 1.0f (coords / 1)
-            // - For fmap2 (1/16 res): scale = 0.25f (coords / 4)
-            float scale = (c == 0) ? 1.0f : 0.25f;
-            int fmap_H = (c == 0) ? fmap1_H : fmap2_H;
-            int fmap_W = (c == 0) ? fmap1_W : fmap2_W;
-            
-            // For each pixel in the patch (i0, j0) - equivalent to CUDA's H * W loop
-            for (int i0 = 0; i0 < P; i0++) {
-                for (int j0 = 0; j0 < P; j0++) {
-                    // Get reprojected coordinate for target frame (fmap2)
-                    // Python: coords / 1 for c=0, coords / 4 for c=1
-                    int coord_x_idx = e * 2 * P * P + 0 * P * P + i0 * P + j0;
-                    int coord_y_idx = e * 2 * P * P + 1 * P * P + i0 * P + j0;
-                    float x = coords[coord_x_idx] * scale;  // scale = 1.0f for c=0, 0.25f for c=1
-                    float y = coords[coord_y_idx] * scale;  // scale = 1.0f for c=0, 0.25f for c=1
-                    
-                    // For each offset in correlation window (ii, jj) - equivalent to CUDA's D * D loop
-                    for (int corr_ii = 0; corr_ii < D; corr_ii++) {
-                        for (int corr_jj = 0; corr_jj < D; corr_jj++) {
-                            // Calculate sampling location in target frame (fmap2)
-                            // CUDA: i1 = floor(y) + (ii - R), j1 = floor(x) + (jj - R)
-                            int i1 = static_cast<int>(std::floor(y)) + (corr_ii - R);
-                            int j1 = static_cast<int>(std::floor(x)) + (corr_jj - R);
-                            
-                            // Compute correlation: dot product over features (matches CUDA)
-                            // CUDA: f1 = fmap1[n][ix][c][i0][j0], f2 = fmap2[n][jx][c][i1][j1]
-                            // fmap1 = patch features (from gmap, which contains patches from pyramid)
-                            // fmap2 = frame features from pyramid at reprojected location
-                            float sum = 0.0f;
-                            if (within_bounds(i1, j1, fmap_H, fmap_W)) {
-                                // Extract patch feature from gmap (fmap1 equivalent)
-                                // gmap layout: [num_gmap_frames][M][feature_dim][D_gmap][D_gmap]
-                                // Extract center P×P region: gmap_i = i0 + offset, gmap_j = j0 + offset
-                                int gmap_i = i0 + gmap_center_offset;
-                                int gmap_j = j0 + gmap_center_offset;
-                                
-                                // Dot product over feature channels (matches CUDA's loop over C)
-                                for (int f = 0; f < feature_dim; f++) {
-                                    // fmap1: patch feature from gmap
-                                    // CUDA: fmap1[n][ix][c][i0][j0] where ix = us[m] (patch index)
-                                    // gmap already contains patches extracted from pyramid, so use it as fmap1
-                                    size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
-                                                       static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
-                                                       static_cast<size_t>(f) * D_gmap * D_gmap +
-                                                       static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
-                                    
-                                    // fmap2: frame feature from pyramid at reprojected location
-                                    // CUDA: fmap2[n][jx][c][i1][j1] where jx = vs[m] (frame index)
-                                    size_t fmap2_idx = static_cast<size_t>(pyramid_frame) * feature_dim * fmap_H * fmap_W +
-                                                       static_cast<size_t>(f) * fmap_H * fmap_W +
-                                                       static_cast<size_t>(i1) * fmap_W + static_cast<size_t>(j1);
-                                    
-                                    // Bounds check and compute correlation
-                                    if (fmap1_idx < gmap_total_size && fmap2_idx < (c == 0 ? fmap1_total_size : fmap2_total_size)) {
-                                        // CUDA: s += f1 * f2
-                                        float f1 = gmap[fmap1_idx];  // Patch feature (fmap1) - from gmap which contains patches
-                                        float f2 = fmap2[fmap2_idx]; // Frame feature (fmap2) - from pyramid
-                                        sum += f1 * f2;
-                                    }
-                                }
-                            }
-                            // If out of bounds, sum remains 0.0f (matches CUDA)
-                            
-                            // Store correlation (matches CUDA's corr[n][m][ii][jj][i0][j0])
-                            // Output layout: [num_active, D, D, P, P, 2] (channel last)
-                            size_t out_idx = static_cast<size_t>(e) * D * D * P * P * 2 +
-                                             static_cast<size_t>(corr_ii) * D * P * P * 2 +
-                                             static_cast<size_t>(corr_jj) * P * P * 2 +
-                                             static_cast<size_t>(i0) * P * 2 +
-                                             static_cast<size_t>(j0) * 2 +
-                                             static_cast<size_t>(c);
-                            
-                            if (out_idx < corr_total_size) {
-                                corr_out[out_idx] = sum;
-                            }
+        // Python: ii = self.pg.kk[:num_active], then ii1 = ii % (self.M * self.pmem)
+        ii1[e] = kk[e] % mod_value;  // Map to gmap ring buffer
+        // Python: jj1 = jj % mem
+        jj1[e] = jj[e] % num_frames;  // Map to pyramid ring buffer
+    }
+    
+    // Allocate temporary buffers for individual correlation volumes
+    // Each correlation volume: [num_active, D, D, P, P]
+    const size_t corr_single_size = static_cast<size_t>(num_active) * D * D * P * P;
+    std::vector<float> corr1(corr_single_size);
+    std::vector<float> corr2(corr_single_size);
+    
+    // Call computeCorrelationSingle for pyramid0 (matches Python: corr1 = altcorr.corr(..., coords / 1, ...))
+    computeCorrelationSingle(
+        gmap, pyramid0, coords,
+        ii1.data(), jj1.data(),
+        num_active, M, P,
+        num_frames, num_gmap_frames,
+        fmap1_H, fmap1_W,
+        feature_dim,
+        1.0f,  // coord_scale = 1.0 (coords / 1)
+        R,     // radius = 3
+        corr1.data()
+    );
+    
+    // Call computeCorrelationSingle for pyramid1 (matches Python: corr2 = altcorr.corr(..., coords / 4, ...))
+    computeCorrelationSingle(
+        gmap, pyramid1, coords,
+        ii1.data(), jj1.data(),
+        num_active, M, P,
+        num_frames, num_gmap_frames,
+        fmap2_H, fmap2_W,
+        feature_dim,
+        0.25f, // coord_scale = 0.25 (coords / 4)
+        R,     // radius = 3
+        corr2.data()
+    );
+    
+    // Stack corr1 and corr2 together (matches Python: torch.stack([corr1, corr2], -1))
+    // Output layout: [num_active, D, D, P, P, 2] (channel last)
+    // This interleaves the two correlation volumes along the channel dimension
+    for (int e = 0; e < num_active; e++) {
+        for (int corr_ii = 0; corr_ii < D; corr_ii++) {
+            for (int corr_jj = 0; corr_jj < D; corr_jj++) {
+                for (int i0 = 0; i0 < P; i0++) {
+                    for (int j0 = 0; j0 < P; j0++) {
+                        // Source indices in corr1 and corr2: [e, corr_ii, corr_jj, i0, j0]
+                        size_t src_idx = static_cast<size_t>(e) * D * D * P * P +
+                                        static_cast<size_t>(corr_ii) * D * P * P +
+                                        static_cast<size_t>(corr_jj) * P * P +
+                                        static_cast<size_t>(i0) * P +
+                                        static_cast<size_t>(j0);
+                        
+                        // Destination indices in stacked output: [e, corr_ii, corr_jj, i0, j0, c]
+                        // Channel 0: corr1, Channel 1: corr2
+                        size_t dst_idx_c0 = static_cast<size_t>(e) * D * D * P * P * 2 +
+                                            static_cast<size_t>(corr_ii) * D * P * P * 2 +
+                                            static_cast<size_t>(corr_jj) * P * P * 2 +
+                                            static_cast<size_t>(i0) * P * 2 +
+                                            static_cast<size_t>(j0) * 2 +
+                                            0;  // Channel 0
+                        
+                        size_t dst_idx_c1 = static_cast<size_t>(e) * D * D * P * P * 2 +
+                                            static_cast<size_t>(corr_ii) * D * P * P * 2 +
+                                            static_cast<size_t>(corr_jj) * P * P * 2 +
+                                            static_cast<size_t>(i0) * P * 2 +
+                                            static_cast<size_t>(j0) * 2 +
+                                            1;  // Channel 1
+                        
+                        if (src_idx < corr_single_size) {
+                            corr_out[dst_idx_c0] = corr1[src_idx];  // Channel 0: pyramid0 correlation
+                            corr_out[dst_idx_c1] = corr2[src_idx];  // Channel 1: pyramid1 correlation
                         }
                     }
                 }
@@ -439,7 +788,9 @@ void computeCorrelation(
         }
     }
     
-    // Get logger
+    // Log statistics (matches original logging)
+    const size_t corr_total_size = static_cast<size_t>(num_active) * D * D * P * P * 2;
+    
     auto logger = spdlog::get("dpvo");
     if (!logger) {
 #ifdef SPDLOG_USE_SYSLOG
@@ -456,7 +807,7 @@ void computeCorrelation(
     float min_corr = std::numeric_limits<float>::max();
     float max_corr = std::numeric_limits<float>::lowest();
     double sum_corr = 0.0;
-    const int sample_count = 20;  // Number of sample values to show
+    const int sample_count = 20;
     
     // Count over entire output
     for (size_t i = 0; i < corr_total_size; i++) {
@@ -473,11 +824,10 @@ void computeCorrelation(
     
     float mean_corr = corr_total_size > 0 ? static_cast<float>(sum_corr / corr_total_size) : 0.0f;
     
-    // Log comprehensive statistics
     logger->info("computeCorrelation: Output statistics - size={}, zero_count={}, nonzero_count={}, min={:.6f}, max={:.6f}, mean={:.6f}",
                  corr_total_size, zero_count, nonzero_count, min_corr, max_corr, mean_corr);
     
-    // Log sample values from different parts of the output
+    // Log sample values
     std::string sample_values = "[";
     for (int i = 0; i < sample_count && i < static_cast<int>(corr_total_size); i++) {
         sample_values += std::to_string(corr_out[i]);
@@ -487,21 +837,6 @@ void computeCorrelation(
     }
     sample_values += "]";
     logger->info("computeCorrelation: First {} sample values: {}", sample_count, sample_values);
-    
-    // Log some values from middle and end of output
-    if (corr_total_size > sample_count * 2) {
-        std::string mid_values = "[";
-        int mid_start = static_cast<int>(corr_total_size / 2);
-        for (int i = 0; i < sample_count && (mid_start + i) < static_cast<int>(corr_total_size); i++) {
-            mid_values += std::to_string(corr_out[mid_start + i]);
-            if (i < sample_count - 1 && (mid_start + i + 1) < static_cast<int>(corr_total_size)) {
-                mid_values += ", ";
-            }
-        }
-        mid_values += "]";
-        logger->info("computeCorrelation: Middle {} sample values (starting at index {}): {}", 
-                     sample_count, mid_start, mid_values);
-    }
     
     // Log per-edge statistics for first few edges
     if (num_active > 0) {
@@ -534,5 +869,5 @@ void computeCorrelation(
         }
     }
     
-    logger->info("computeCorrelation: COMPLETED - processed {} edges", num_active);
+    logger->info("computeCorrelation: COMPLETED - processed {} edges (corr1 and corr2 stacked)", num_active);
 }

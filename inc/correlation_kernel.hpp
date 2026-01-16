@@ -4,7 +4,7 @@
 #include <algorithm>
 // fmap   : [C][H][W]
 // coords : [M][2]  (x, y)
-// gmap   : [M][C][D][D], D = 2*radius + 2
+// gmap   : [M][C][D][D], D = 1 if radius=0, else D = 2*radius + 1 (matches Python altcorr.patchify)
 
 void patchify_cpu(
     const float* fmap,
@@ -78,6 +78,28 @@ void patchify_cpu_safe(
 //
 // Matches Python CUDA kernel: corr_forward_kernel
 // -----------------------------------------------------------------------------
+
+// Single pyramid level correlation (matches Python: altcorr.corr)
+// Output: [num_active, D, D, P, P] (after permute: [num_active, P, P, D, D])
+void computeCorrelationSingle(
+    const float* gmap,           // [num_gmap_frames, M, feature_dim, D_gmap, D_gmap]
+    const float* pyramid,         // [num_frames, feature_dim, fmap_H, fmap_W]
+    const float* coords,         // [num_active, 2, P, P] - Reprojected (u, v) coordinates
+    const int* ii1,              // [num_active] - Patch indices for gmap (mapped from kk)
+    const int* jj1,              // [num_active] - Frame indices for pyramid (mapped from jj)
+    int num_active,              // Number of active edges
+    int M,                       // Patches per frame (PATCHES_PER_FRAME)
+    int P,                       // Patch size (typically 3)
+    int num_frames,              // Frames in pyramid buffers (e.g., m_mem)
+    int num_gmap_frames,         // Frames in gmap ring buffer (e.g., m_pmem)
+    int fmap_H, int fmap_W,      // Dimensions for pyramid
+    int feature_dim,             // Feature dimension (128 for FNet)
+    float coord_scale,          // Scale factor for coordinates (1.0 for pyramid0, 0.25 for pyramid1)
+    int radius,                  // Correlation radius (typically 3)
+    float* corr_out);            // Output: [num_active, D, D, P, P] (matches CUDA kernel output)
+
+// Combined correlation for both pyramid levels (matches Python: torch.stack([corr1, corr2], -1).view(1, len(ii), -1))
+// Output: [num_active, D, D, P, P, 2] (channel last) or flattened to [num_active, D*D*P*P*2]
 void computeCorrelation(
     const float* gmap,           // [num_gmap_frames, M, feature_dim, D_gmap, D_gmap]
     const float* pyramid0,       // [num_frames, feature_dim, fmap1_H, fmap1_W]

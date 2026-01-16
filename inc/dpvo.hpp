@@ -52,7 +52,14 @@ public:
 
     // Main processing function (called from thread)
     // intrinsics_in: [fx, fy, cx, cy] - if nullptr, uses stored m_intrinsics
-    void run(int64_t timestamp, const uint8_t* image, const float* intrinsics_in = nullptr, int H = 0, int W = 0);
+    // Tensor-based version (preferred, avoids conversion)
+    void run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsics_in = nullptr);
+    
+    // Helper function to continue run() logic after patchifier.forward() has been called
+    // This avoids duplicate inference calls when tensor-based run() calls uint8_t* run()
+    void runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H, int W,
+                          int n, int n_use, int pm, int mm, int M, int P, int patch_D,
+                          float* patches, uint8_t* clr, const uint8_t* image_for_viewer = nullptr);
     
     // Threading interface (similar to wnc_app)
     void startProcessingThread();
@@ -123,9 +130,9 @@ private:
     // Helpers for indexing
     inline int imap_idx(int i, int j, int k) const { return i * m_cfg.PATCHES_PER_FRAME * m_DIM + j * m_DIM + k; }
     inline int gmap_idx(int i, int j, int c, int y, int x) const {
-        // CRITICAL: gmap uses D_gmap = 4 (from patchify_cpu_safe with radius=1), NOT P=3
-        // patchify_cpu_safe: radius = m_patch_size/2 = 1, D = 2*radius + 2 = 4
-        const int D_gmap = 4;  // D_gmap = 2 * (m_P/2) + 2 = 4
+        // CRITICAL: gmap uses D_gmap = 3 (from patchify_cpu_safe with radius=1), matches P=3
+        // patchify_cpu_safe: radius = m_patch_size/2 = 1, D = 2*radius + 1 = 3 (matches Python altcorr.patchify)
+        const int D_gmap = 3;  // D_gmap = 2 * (m_P/2) + 1 = 3 (matches Python: .view(..., P, P) where P=3)
         return i * m_cfg.PATCHES_PER_FRAME * 128 * D_gmap * D_gmap +
                j * 128 * D_gmap * D_gmap +
                c * D_gmap * D_gmap +
@@ -191,8 +198,11 @@ private:
     
     // ---- Threading infrastructure (similar to wnc_app) ----
     struct InputFrame {
-        std::vector<uint8_t> image;  // Store converted image data [C, H, W] format
+        std::vector<uint8_t> image;  // Store converted image data [C, H, W] format (optional, for backward compatibility)
         int H, W;
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        ea_tensor_t* tensor_img;     // Store image tensor directly (preferred, avoids conversion)
+#endif
     };
     
     // ---- Intrinsics and timestamp (stored as member variables) ----
@@ -212,6 +222,14 @@ private:
     // Visualization (optional)
     std::unique_ptr<DPVOViewer> m_viewer;
     bool m_visualizationEnabled{false};
+    
+    // Store all historical poses for visualization (not just sliding window)
+    // This allows the viewer to show the full trajectory, not just the current optimization window
+    std::vector<SE3> m_allPoses;
+    
+    // Map sliding window indices to global frame indices using timestamps
+    // When keyframe() removes frames, we use timestamps to find which global frame each sliding window index corresponds to
+    std::vector<int64_t> m_allTimestamps;  // Global timestamps for all frames
     
     // Helper to compute point cloud from patches and poses
     void computePointCloud();

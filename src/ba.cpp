@@ -143,8 +143,10 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
         
         // Reject projections outside image bounds
-        // bounds = (xmin, ymin, xmax, ymax) = (0, 0, m_wd, m_ht)
-        if (cx < 0.0f || cy < 0.0f || cx >= m_wd || cy >= m_ht) {
+        // CRITICAL: Reprojected coordinates are at 1/4 resolution (feature map resolution)
+        // Use feature map dimensions, not full image dimensions
+        // bounds = (xmin, ymin, xmax, ymax) = (0, 0, m_fmap1_W, m_fmap1_H)
+        if (cx < 0.0f || cy < 0.0f || cx >= m_fmap1_W || cy >= m_fmap1_H) {
             v[e] = 0.0f;
         }
         
@@ -558,12 +560,36 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             if (pose_idx >= 0 && pose_idx < n) {
                 Eigen::Matrix<float, 6, 1> dx_vec = dX.segment<6>(6 * idx);
                 Eigen::Vector3f t_before = m_pg.m_poses[pose_idx].t;
+                
+                // Clamp pose update if it's too large (prevent divergence)
+                float dx_norm = dx_vec.norm();
+                if (dx_norm > 1.0f) {
+                    if (logger && idx < 3) {
+                        logger->warn("BA: Clamping large pose update for pose[{}]: dx_norm={:.6f} > 1.0, scaling down",
+                                     pose_idx, dx_norm);
+                    }
+                    dx_vec = dx_vec * (1.0f / dx_norm);  // Normalize to unit length
+                }
+                
                 m_pg.m_poses[pose_idx] = m_pg.m_poses[pose_idx].retr(dx_vec);
                 Eigen::Vector3f t_after = m_pg.m_poses[pose_idx].t;
                 
+                // Validate updated pose: check if translation is reasonable
+                float t_norm = t_after.norm();
+                if (t_norm > 100.0f) {
+                    if (logger) {
+                        logger->warn("BA: Pose[{}] translation too large after update (norm={:.2f}), reverting update. "
+                                     "t_before=({:.2f}, {:.2f}, {:.2f}), t_after=({:.2f}, {:.2f}, {:.2f})",
+                                     pose_idx, t_norm,
+                                     t_before.x(), t_before.y(), t_before.z(),
+                                     t_after.x(), t_after.y(), t_after.z());
+                    }
+                    // Revert to previous pose if update caused divergence
+                    m_pg.m_poses[pose_idx].t = t_before;
+                }
+                
                 // Log pose updates for debugging
                 if (logger) {
-                    float dx_norm = dx_vec.norm();
                     float t_change = (t_after - t_before).norm();
                     if (idx < 5 || dx_norm > 1e-6f || t_change > 1e-6f) {
                         logger->info("BA: Updated pose[{}]: dx_norm={:.6f}, t_change={:.6f}, "

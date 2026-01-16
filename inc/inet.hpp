@@ -12,9 +12,8 @@ class INetInference {
 public:
     INetInference(Config_S* config);
     ~INetInference();
-    // image: original uint8 image [C, H, W] with values in range [0, 255]
-    // AMBA CV28 model will handle normalization internally (std: 256, normalizes by dividing by 256)
-    bool runInference(const uint8_t* image, int H, int W, float* imap_out);
+    // Tensor-based version (preferred, avoids conversion)
+    bool runInference(ea_tensor_t* imgTensor, float* imap_out);
     
     // Getters for model input dimensions
     int getInputHeight() const;
@@ -26,7 +25,7 @@ private:
 #if defined(CV28) || defined(CV28_SIMULATOR)
     void _initModelIO();
     bool _releaseModel();
-    bool _loadInput(const uint8_t* image, int H, int W);  // Original uint8 input [0, 255] - AMBA CV28 handles normalization
+    bool _loadInput(ea_tensor_t* imgTensor);  // Tensor input (preferred, avoids conversion)
     
     std::string m_modelPathStr;    // Store model path as string
     char* m_ptrModelPath = nullptr;

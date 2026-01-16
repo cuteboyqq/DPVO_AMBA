@@ -59,140 +59,28 @@ void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
 // Forward pass: fill fmap, imap, gmap, patches, clr
 // Note: fmap and imap are at 1/4 resolution (RES=4), but image and coords are at full resolution
 // image: normalized float image [C, H, W] with values in range [-0.5, 1.5] (Python: 2 * (image / 255.0) - 0.5)
-void Patchifier::forward(
-    const uint8_t *image,  // Original uint8 image [C, H, W] in range [0, 255] - AMBA CV28 handles normalization
-    int H, int W,   // Actual image dimensions (may differ from model input)
-    float *fmap,    // [128, model_H/4, model_W/4] - at 1/4 resolution of model input
-    float *imap,    // [DIM, model_H/4, model_W/4] - at 1/4 resolution of model input
-    float *gmap,    // [M, 128, P, P]
-    float *patches, // [M, 3, P, P]
-    uint8_t *clr,   // [M, 3]
-    int M)
+// Helper function to extract patches after inference has been run
+void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap_W, int M,
+                                                float* fmap, float* imap, float* gmap,
+                                                float* patches, uint8_t* clr, const uint8_t* image_for_colors)
 {
-    const int RES = 4;  // Resolution factor (Python RES=4)
-    const int inet_output_channels = 384;  // INet model output channels (not m_DIM which defaults to 64)
+    const int inet_output_channels = 384;
     
-    // Get model output dimensions (models resize input internally)
-    // fmap/imap buffers are sized based on model output, not actual image size
-    int fmap_H = 0, fmap_W = 0;
-    if (m_fnet != nullptr && m_inet != nullptr)
-    {
-        // Use model output dimensions (models output at 1/4 of their input size)
-        fmap_H = m_fnet->getOutputHeight();  // e.g., 132 (528/4)
-        fmap_W = m_fnet->getOutputWidth();   // e.g., 240 (960/4)
-        
-        // Validate that fnet and inet have same output dimensions
-        if (fmap_H != m_inet->getOutputHeight() || fmap_W != m_inet->getOutputWidth())
-        {
-            throw std::runtime_error("FNet and INet output dimension mismatch");
-        }
-    }
-    else
-    {
-        // Fallback: calculate from actual image dimensions (should not happen if models are set)
-        fmap_H = H / RES;
-        fmap_W = W / RES;
-    }
-
-    // ------------------------------------------------
-    // 1. Run fnet and inet inference to get fmap and imap
-    // Pass normalized float image directly to models (matching Python)
-    // Models will convert to uint8 internally if needed
-    // ------------------------------------------------
-    if (m_fnet != nullptr && m_inet != nullptr)
-    {
-        // Allocate temporary buffers for model output size (1/4 resolution)
-        if (m_fmap_buffer.size() != 128 * fmap_H * fmap_W)
-        {
-            m_fmap_buffer.resize(128 * fmap_H * fmap_W);
-        }
-        // INet outputs 384 channels, so use that instead of m_DIM
-        // m_DIM might be 64 (default), but we need 384 for INet output
-        if (m_imap_buffer.size() != inet_output_channels * fmap_H * fmap_W)
-        {
-            m_imap_buffer.resize(inet_output_channels * fmap_H * fmap_W);
-        }
-        auto logger_patch = spdlog::get("fnet");
-        if (!logger_patch) {
-            logger_patch = spdlog::get("inet");
-        }
-
-        
-        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference");
-        // Run fnet inference (models will resize input internally)
-        // Pass original uint8 image - AMBA CV28 models will handle normalization internally
-        if (!m_fnet->runInference(image, H, W, m_fmap_buffer.data()))
-        {
-            if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference failed");
-            // Fallback: zero fill if inference fails
-            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
-        }else{
-            if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference successful");
-        }
-
-        if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference");
-        
-        // Pass original uint8 image - AMBA CV28 models will handle normalization internally
-        if (!m_inet->runInference(image, H, W, m_imap_buffer.data()))
-        {
-            if (logger_patch) logger_patch->error("[Patchifier] inet->runInference failed");
-            // Fallback: zero fill if inference fails
-            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
-        } else {
-            if (logger_patch) logger_patch->info("[Patchifier] inet->runInference successful");
-            // Verify m_imap_buffer is populated (not all zeros)
-            float imap_buffer_min = *std::min_element(m_imap_buffer.begin(), m_imap_buffer.end());
-            float imap_buffer_max = *std::max_element(m_imap_buffer.begin(), m_imap_buffer.end());
-            int imap_buffer_zero_count = 0;
-            int imap_buffer_nonzero_count = 0;
-            for (size_t i = 0; i < m_imap_buffer.size(); i++) {
-                if (m_imap_buffer[i] == 0.0f) imap_buffer_zero_count++;
-                else imap_buffer_nonzero_count++;
-            }
-            if (logger_patch) {
-                logger_patch->info("[Patchifier] m_imap_buffer stats - size={}, zero_count={}, nonzero_count={}, min={}, max={}",
-                                    m_imap_buffer.size(), imap_buffer_zero_count, imap_buffer_nonzero_count, 
-                                    imap_buffer_min, imap_buffer_max);
-            }
-        }
-
-        if (logger_patch) logger_patch->info("[Patchifier] About to memcpy fmap, size={}", 128 * fmap_H * fmap_W * sizeof(float));
-        // Copy to output buffers (already at 1/4 resolution of model input)
-        std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
-        if (logger_patch) logger_patch->info("[Patchifier] fmap memcpy completed");
-        
-        // NOTE: imap parameter is actually a buffer for patch features [M, DIM], not the full feature map
-        // We need to extract patches from the full feature map [384, 132, 240] using patchify_cpu_safe
-        // So we don't memcpy the full feature map to imap - instead we'll extract patches later
-        if (logger_patch) logger_patch->info("[Patchifier] Skipping imap memcpy - will extract patches later");
-    }
-    else
-    {
-        // Fallback: zero fill if models not available
-        std::fill(fmap, fmap + 128 * fmap_H * fmap_W, 0.0f);
-        // imap will be zero-filled later in patchify_cpu_safe fallback
-    }
-
     printf("[Patchifier] About to create grid, H=%d, W=%d\n", H, W);
     fflush(stdout);
     
     // ------------------------------------------------
-    // 3. Create coordinate grid (like Python's coords_grid_with_index)
-    // Python: grid, _ = coords_grid_with_index(disps, device=fmap.device)
-    //         coords = torch.stack([x, y, d], dim=2)  # [b, n, 3, h, w]
-    //         where x = [0..w-1], y = [0..h-1], d = depth (from disps)
-    // Grid channels: [x_coord, y_coord, depth]
+    // Create coordinate grid (like Python's coords_grid_with_index)
     // ------------------------------------------------
     std::vector<float> grid(3 * H * W);
     printf("[Patchifier] Grid created, size=%zu\n", grid.size());
     fflush(stdout);
-    // Create coordinate grid: channel 0 = x, channel 1 = y, channel 2 = depth (default 1.0)
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             int idx = y * W + x;
-            grid[0 * H * W + idx] = static_cast<float>(x);  // x coordinate [0, W-1]
-            grid[1 * H * W + idx] = static_cast<float>(y);  // y coordinate [0, H-1]
-            grid[2 * H * W + idx] = 1.0f;  // depth (default, will be updated later in dpvo.cpp)
+            grid[0 * H * W + idx] = static_cast<float>(x);
+            grid[1 * H * W + idx] = static_cast<float>(y);
+            grid[2 * H * W + idx] = 1.0f;
         }
     }
 
@@ -200,13 +88,13 @@ void Patchifier::forward(
     fflush(stdout);
     
     // ------------------------------------------------
-    // 4. Generate RANDOM coords (Python RANDOM mode) - full resolution
+    // Generate RANDOM coords (Python RANDOM mode) - full resolution
     // ------------------------------------------------
     m_last_coords.resize(M * 2);
     for (int m = 0; m < M; m++)
     {
-        m_last_coords[m * 2 + 0] = 1 + rand() % (W - 2); // Full resolution coordinates
-        m_last_coords[m * 2 + 1] = 1 + rand() % (H - 2); // Full resolution coordinates
+        m_last_coords[m * 2 + 0] = 1 + rand() % (W - 2);
+        m_last_coords[m * 2 + 1] = 1 + rand() % (H - 2);
     }
     const float* coords = m_last_coords.data();
     printf("[Patchifier] Coords created\n");
@@ -216,10 +104,10 @@ void Patchifier::forward(
     fflush(stdout);
     
     // ------------------------------------------------
-    // 5. Patchify grid → patches (RGB) - full resolution
+    // Patchify grid → patches (RGB) - full resolution
     // ------------------------------------------------
     patchify_cpu_safe(
-        grid.data(), coords,  // coords is already a pointer (const float*)
+        grid.data(), coords,
         M, 3, H, W,
         m_patch_size / 2,
         patches);
@@ -231,10 +119,8 @@ void Patchifier::forward(
     fflush(stdout);
     
     // ------------------------------------------------
-    // 6. Patchify fmap → gmap - scale coords to feature map resolution
+    // Patchify fmap → gmap - scale coords to feature map resolution
     // ------------------------------------------------
-    // fmap is at model output resolution (fmap_H x fmap_W), not necessarily 1/4 of image
-    // Scale coordinates by the ratio of feature map to image dimensions
     std::vector<float> fmap_coords(M * 2);
     float scale_x = static_cast<float>(fmap_W) / static_cast<float>(W);
     float scale_y = static_cast<float>(fmap_H) / static_cast<float>(H);
@@ -242,7 +128,6 @@ void Patchifier::forward(
     {
         float fx = coords[m * 2 + 0] * scale_x;
         float fy = coords[m * 2 + 1] * scale_y;
-        // Clamp to feature map bounds to prevent out-of-bounds access
         fmap_coords[m * 2 + 0] = std::max(0.0f, std::min(static_cast<float>(fmap_W - 1), fx));
         fmap_coords[m * 2 + 1] = std::max(0.0f, std::min(static_cast<float>(fmap_H - 1), fy));
     }
@@ -251,28 +136,20 @@ void Patchifier::forward(
 
     printf("[Patchifier] About to call patchify_cpu_safe (gmap)\n");
     fflush(stdout);
-    // patchify_cpu_safe extracts patches from fmap and writes to gmap
-    // radius = m_patch_size / 2
-    // patch dimension D = 2 * radius + 2 = m_patch_size + 2
-    // gmap shape: [M, 128, D, D] = [M, 128, (m_patch_size + 2), (m_patch_size + 2)]
     patchify_cpu_safe(
         fmap, fmap_coords.data(),
-        M, 128, fmap_H, fmap_W, // Use 1/4 resolution dimensions
-        m_patch_size / 2,        // radius = m_patch_size / 2
-        gmap);                   // Output: [M, 128, D, D] where D = m_patch_size + 2
+        M, 128, fmap_H, fmap_W,
+        m_patch_size / 2,
+        gmap);
     printf("[Patchifier] patchify_cpu_safe (gmap) completed\n");
     fflush(stdout);
 
     printf("[Patchifier] About to call patchify_cpu_safe (imap)\n");
     fflush(stdout);
     // ------------------------------------------------
-    // 7. imap sampling (radius = 0) - scale coords to 1/4 resolution
-    // Extract patches from the full feature map stored in m_imap_buffer
+    // imap sampling (radius = 0) - extract patches from m_imap_buffer
     // ------------------------------------------------
-    // Use m_imap_buffer (full feature map [384, 132, 240]) as source
-    // Extract patches and write to imap (which is [M, DIM] = [8, 384])
     if (m_fnet != nullptr && m_inet != nullptr) {
-        // Verify m_imap_buffer has valid data before extracting patches
         float imap_buffer_sample_min = *std::min_element(m_imap_buffer.begin(), 
                                                           m_imap_buffer.begin() + std::min(static_cast<size_t>(100), m_imap_buffer.size()));
         float imap_buffer_sample_max = *std::max_element(m_imap_buffer.begin(), 
@@ -281,7 +158,6 @@ void Patchifier::forward(
                imap_buffer_sample_min, imap_buffer_sample_max, m_imap_buffer.size());
         fflush(stdout);
         
-        // Log coordinates before extraction
         printf("[Patchifier] fmap_coords for imap extraction:\n");
         for (int m = 0; m < std::min(M, 8); m++) {
             printf("[Patchifier]   Patch %d: x=%.2f, y=%.2f (fmap_H=%d, fmap_W=%d)\n", 
@@ -289,15 +165,12 @@ void Patchifier::forward(
         }
         fflush(stdout);
         
-        // Extract patches from the full feature map
         patchify_cpu_safe(
-            m_imap_buffer.data(), fmap_coords.data(),  // Source: full feature map, coords at 1/4 resolution
-            M, inet_output_channels, fmap_H, fmap_W,   // M patches, 384 channels, 132x240 feature map
-            0,                                          // radius = 0 (single pixel)
-            imap                                        // Output: [M, DIM, 1, 1] = [8, 384, 1, 1]
-        );
+            m_imap_buffer.data(), fmap_coords.data(),
+            M, inet_output_channels, fmap_H, fmap_W,
+            0,
+            imap);
         
-        // Verify patches were extracted correctly
         float imap_min = *std::min_element(imap, imap + M * m_DIM);
         float imap_max = *std::max_element(imap, imap + M * m_DIM);
         int imap_zero_count = 0;
@@ -310,7 +183,6 @@ void Patchifier::forward(
                imap_zero_count, imap_nonzero_count, imap_min, imap_max);
         fflush(stdout);
     } else {
-        // Fallback: zero fill if models not available
         std::fill(imap, imap + M * m_DIM, 0.0f);
         printf("[Patchifier] WARNING: Models not available, zero-filling imap\n");
         fflush(stdout);
@@ -321,33 +193,117 @@ void Patchifier::forward(
     printf("[Patchifier] About to extract colors\n");
     fflush(stdout);
     // ------------------------------------------------
-    // 8. Color for visualization - full resolution
-    // Python: clr = altcorr.patchify(images[0], 4*(coords + 0.5), 0).view(b, -1, 3)
-    // Note: Python uses 4*(coords + 0.5) which suggests sampling at a different location
-    // For now, we'll use coords directly (matching the patch extraction)
-    // Convert normalized float image back to uint8 for color extraction
+    // Color for visualization - full resolution
     // ------------------------------------------------
-    for (int m = 0; m < M; m++)
-    {
-        // Python uses 4*(coords + 0.5), but since we're at full resolution, use coords directly
-        // The 4* factor in Python is because images are at 1/4 resolution in that context
-        int x = static_cast<int>(coords[m * 2 + 0]);
-        int y = static_cast<int>(coords[m * 2 + 1]);
-        // Clamp to valid image bounds
-        x = std::max(0, std::min(x, W - 1));
-        y = std::max(0, std::min(y, H - 1));
-        for (int c = 0; c < 3; c++) {
-            // Image is normalized float [-0.5, 1.5], convert back to uint8 [0, 255]
-            // Python: images = 2 * (images / 255.0) - 0.5, so reverse: (val + 0.5) / 2.0 * 255.0
-            float normalized_val = image[c * H * W + y * W + x];
-            float mapped_val = (normalized_val + 0.5f) / 2.0f * 255.0f;
-            clr[m * 3 + c] = static_cast<uint8_t>(std::max(0.0f, std::min(255.0f, mapped_val)));
+    if (image_for_colors != nullptr) {
+        for (int m = 0; m < M; m++)
+        {
+            int x = static_cast<int>(coords[m * 2 + 0]);
+            int y = static_cast<int>(coords[m * 2 + 1]);
+            x = std::max(0, std::min(x, W - 1));
+            y = std::max(0, std::min(y, H - 1));
+            for (int c = 0; c < 3; c++) {
+                // Image is in [C, H, W] format (uint8_t)
+                clr[m * 3 + c] = image_for_colors[c * H * W + y * W + x];
+            }
         }
+    } else {
+        // Fallback: zero fill if no image provided
+        std::fill(clr, clr + M * 3, 0);
     }
     printf("[Patchifier] Colors extracted\n");
     fflush(stdout);
+}
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+// Tensor-based forward - uses tensor directly, avoids conversion (preferred for CV28)
+void Patchifier::forward(
+    ea_tensor_t* imgTensor,  // Input tensor (preferred, avoids conversion)
+    float* fmap, float* imap, float* gmap,
+    float* patches, uint8_t* clr,
+    int patches_per_image)
+{
+    if (imgTensor == nullptr) {
+        throw std::runtime_error("Patchifier::forward: imgTensor is nullptr");
+    }
     
-    printf("[Patchifier] forward() about to return\n");
-    fflush(stdout);
+    // Get dimensions from tensor
+    const size_t* shape = ea_tensor_shape(imgTensor);
+    int H = static_cast<int>(shape[EA_H]);
+    int W = static_cast<int>(shape[EA_W]);
+    
+    // Use tensor-based runInference (avoids conversion)
+    const int M = patches_per_image;
+    const int inet_output_channels = 384;
+    int fmap_H = getOutputHeight();
+    int fmap_W = getOutputWidth();
+    
+    if (fmap_H == 0 || fmap_W == 0) {
+        throw std::runtime_error("Patchifier::forward: Model output dimensions not available");
+    }
+    
+    // Allocate buffers
+    if (m_fmap_buffer.size() != 128 * fmap_H * fmap_W) {
+        m_fmap_buffer.resize(128 * fmap_H * fmap_W);
+    }
+    if (m_imap_buffer.size() != inet_output_channels * fmap_H * fmap_W) {
+        m_imap_buffer.resize(inet_output_channels * fmap_H * fmap_W);
+    }
+    
+    auto logger_patch = spdlog::get("fnet");
+    if (!logger_patch) {
+        logger_patch = spdlog::get("inet");
+    }
+    
+    // Run inference using tensor directly
+    if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+    if (!m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
+        if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
+        std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+    } else {
+        if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
+    }
+    
+    if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+    if (!m_inet->runInference(imgTensor, m_imap_buffer.data())) {
+        if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
+        std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+    } else {
+        if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+    }
+    
+    // Copy fmap buffer to output
+    std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
+    
+    // Extract image data for color extraction (if needed)
+    std::vector<uint8_t> image_data;
+    const uint8_t* image_for_colors = nullptr;
+    void* tensor_data = ea_tensor_data(imgTensor);
+    if (tensor_data != nullptr) {
+        image_data.resize(H * W * 3);
+        const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
+        std::memcpy(image_data.data(), src, H * W * 3);
+        image_for_colors = image_data.data();
+    }
+    
+    // Extract patches using helper function (avoids duplicate inference)
+    extractPatchesAfterInference(H, W, fmap_H, fmap_W, M, fmap, imap, gmap, patches, clr, image_for_colors);
+}
+#endif
+
+int Patchifier::getOutputHeight() const
+{
+    if (m_fnet != nullptr) {
+        return m_fnet->getOutputHeight();
+    }
+    return 0;
+}
+
+int Patchifier::getOutputWidth() const
+{
+    if (m_fnet != nullptr) {
+        return m_fnet->getOutputWidth();
+    }
+    return 0;
 }
 

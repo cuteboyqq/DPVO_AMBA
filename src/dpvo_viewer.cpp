@@ -101,27 +101,21 @@ void DPVOViewer::updatePoses(const SE3* poses, int num_frames)
     
     int original_num_frames = num_frames;
     
-    // FOR TESTING: Force m_numFrames to increment each time for visualization testing
-    // This allows us to see all frames accumulate, not just the sliding window
-    static bool force_increment = true;  // Set to false to disable
-    if (force_increment) {
-        // Increment m_numFrames each time updatePoses is called
-        // This simulates frames accumulating for visualization testing
-        if (num_frames >= m_numFrames) {
-            // Only increment if the incoming num_frames is >= current m_numFrames
-            // This prevents going backwards
-            m_numFrames = m_numFrames + 1;
-            num_frames = m_numFrames;  // Use the incremented value
-        } else {
-            // If incoming num_frames is less, still increment for visualization testing
-            m_numFrames = m_numFrames + 1; // Alsiter add 2026-01-12
-        }
-    }
+    // CRITICAL: Use the actual number of frames passed in (m_pg.m_n, the sliding window size)
+    // Don't use force_increment - it causes issues where m_numFrames > num_frames
+    // and we try to copy more poses than are available
+    // 
+    // The sliding window (m_pg.m_n) typically stays at 8-10 frames, so we'll only see
+    // the current optimization window, not all historical frames.
+    // If you want to see all frames, you need to pass m_counter (total frames) instead
+    // of m_pg.m_n from DPVO::updateViewer()
+    
+    // Use the actual number of frames passed in
+    m_numFrames = num_frames;
     
     // CRITICAL: Dynamically resize buffers if num_frames exceeds current size
     // This allows the viewer to handle more frames than initially allocated
-    // if (num_frames > static_cast<int>(m_poses.size())) {
-    {
+    if (m_numFrames > static_cast<int>(m_poses.size())) {
         // Resize all pose-related buffers
         m_poses.resize(m_numFrames);
         m_poseMatrices.resize(m_numFrames * 16);  // 4x4 matrices
@@ -132,17 +126,10 @@ void DPVOViewer::updatePoses(const SE3* poses, int num_frames)
         m_saved_rights.resize(m_numFrames);
         m_saved_ups.resize(m_numFrames);
     }
-    // m_numFrames = num_frames; // Alsiter noted 2026-01-12
-    
-    // Log only warnings
-    if (original_num_frames > static_cast<int>(m_poses.size())) {
-        printf("[DPVOViewer] updatePoses: WARNING - Limiting frames from %d to %zu (m_poses buffer size)\n",
-               original_num_frames, m_poses.size());
-        fflush(stdout);
-    }
     
     // Copy poses and normalize quaternions to prevent corruption
-    for (int i = 0; i < num_frames; i++) {
+    int poses_to_copy = std::min(m_numFrames, original_num_frames);
+    for (int i = 0; i < poses_to_copy; i++) {
         m_poses[i] = poses[i];
         // Normalize quaternion to prevent corruption (should be ~1.0)
         float q_norm = m_poses[i].q.norm();
@@ -193,8 +180,16 @@ void DPVOViewer::convertPosesToMatrices()
 #ifdef ENABLE_PANGOLIN_VIEWER
     // Convert SE3 poses to 4x4 OpenGL matrices (column-major)
     // SE3 poses are world-to-camera (T_wc), we need camera-to-world (T_cw) for visualization
-    static int convert_count = 0;
-    for (int i = 0; i < m_numFrames; i++) {
+    
+    // CRITICAL: Ensure m_poseMatrices is large enough for m_numFrames
+    if (m_numFrames * 16 > static_cast<int>(m_poseMatrices.size())) {
+        m_poseMatrices.resize(m_numFrames * 16);
+    }
+    
+    // Limit loop to available matrices to prevent out-of-bounds access
+    int max_frames = std::min(m_numFrames, static_cast<int>(m_poseMatrices.size()) / 16);
+    
+    for (int i = 0; i < max_frames; i++) {
         // Get camera-to-world transformation: T_cw = T_wc^-1
         SE3 T_wc = m_poses[i];
         
@@ -206,8 +201,10 @@ void DPVOViewer::convertPosesToMatrices()
         float q_norm = q_wc.norm();
         
         // Check if translation is reasonable
+        // CRITICAL: Increase bounds to allow larger trajectories (e.g., 10000 instead of 1000)
+        // This was causing valid poses to be skipped if the camera moved far from origin
         bool t_valid = (std::isfinite(t_wc.x()) && std::isfinite(t_wc.y()) && std::isfinite(t_wc.z()) &&
-                       std::abs(t_wc.x()) < 1000.0f && std::abs(t_wc.y()) < 1000.0f && std::abs(t_wc.z()) < 1000.0f);
+                       std::abs(t_wc.x()) < 100000.0f && std::abs(t_wc.y()) < 100000.0f && std::abs(t_wc.z()) < 100000.0f);
         
         // Always try to normalize quaternion if it's not already normalized
         // Even if the norm is huge (like 466 or 23801), normalizing should give a valid quaternion
@@ -313,10 +310,7 @@ void DPVOViewer::convertPosesToMatrices()
         mat[1]  = T_cw(0,1); mat[5]  = T_cw(1,1); mat[9]  = T_cw(2,1); mat[13] = T_cw(3,1);
         mat[2]  = T_cw(0,2); mat[6]  = T_cw(1,2); mat[10] = T_cw(2,2); mat[14] = T_cw(3,2);
         mat[3]  = T_cw(0,3); mat[7]  = T_cw(1,3); mat[11] = T_cw(2,3); mat[15] = T_cw(3,3);
-        
-        // Verify: mat[3], mat[7], mat[11] should equal t_cw.x(), t_cw.y(), t_cw.z()
     }
-    convert_count++;
 #endif
 }
 
@@ -369,23 +363,49 @@ void DPVOViewer::drawPoses()
     
     std::lock_guard<std::mutex> lock(m_dataMutex);
     
+            // CRITICAL: Ensure buffers are resized before converting matrices
+            // This is a safety check in case convertPosesToMatrices is called before updatePoses
+            if (m_numFrames * 16 > static_cast<int>(m_poseMatrices.size())) {
+                m_poseMatrices.resize(m_numFrames * 16);
+            }
+            if (m_numFrames > static_cast<int>(m_poses.size())) {
+                m_poses.resize(m_numFrames);
+            }
+    
     // Ensure matrices are up to date (in case poses changed)
     convertPosesToMatrices();
     
     // Determine how many frames to process
+    // Draw ALL frames (no limit) - each frame should have one pose
     int frames_to_process = m_numFrames;
     if (frames_to_process > static_cast<int>(m_poses.size())) {
         frames_to_process = static_cast<int>(m_poses.size());
     }
     
+    // Draw all frames starting from frame 0
+    int start_frame = 0;
+    
     int valid_poses_drawn = 0;
     int skipped_invalid = 0;
     int skipped_out_of_bounds = 0;
     
+    // Draw all frames
+    
     // Draw camera poses as square pyramids (frustums) to show position and orientation
+    // This matches the approach used in drawPoses_fake() but uses real poses from matrices
+    glLineWidth(2.0f);
+    
+    // Pyramid parameters
+    const float pyramid_base_size = 0.05f;  // Size of pyramid base
+    const float pyramid_height = 0.1f;      // Distance from tip to base
+    
+    // Get pointer to transformation matrices (column-major, 16 floats per matrix)
+    float* tptr = m_poseMatrices.data();
+    
+    // Draw all frames (from 0 to frames_to_process-1)
     for (int i = 0; i < frames_to_process; i++) {
         // Validate matrix before using it
-        float* mat = &m_poseMatrices[i * 16];
+        float* mat = &tptr[4 * 4 * i];
         bool matrix_valid = true;
         for (int j = 0; j < 16; j++) {
             if (!std::isfinite(mat[j])) {
@@ -399,51 +419,50 @@ void DPVOViewer::drawPoses()
             continue;
         }
         
-        // Extract camera position from matrix (translation component)
+        // Debug: Check if matrix is identity (all poses at origin)
+        // CRITICAL: In column-major format, translation is in mat[3], mat[7], mat[11] (column 3, rows 0,1,2)
+        // NOT in mat[12], mat[13], mat[14] (which are the bottom row: 0, 0, 1)
+        float tx = mat[3];   // T_cw(0,3) = t_cw.x()
+        float ty = mat[7];   // T_cw(1,3) = t_cw.y()
+        float tz = mat[11];  // T_cw(2,3) = t_cw.z()
+        
+        // Check if this is an identity matrix (all cameras at origin)
+        // If translation is zero and rotation is identity, skip drawing to avoid clutter
+        bool is_identity = (std::abs(tx) < 1e-6f && std::abs(ty) < 1e-6f && std::abs(tz) < 1e-6f &&
+                           std::abs(mat[0] - 1.0f) < 1e-6f && std::abs(mat[5] - 1.0f) < 1e-6f && 
+                           std::abs(mat[10] - 1.0f) < 1e-6f && std::abs(mat[15] - 1.0f) < 1e-6f);
+        
+        // Skip drawing identity matrices (all cameras at origin) to avoid clutter
+        if (is_identity && i > 0) {
+            // Skip drawing, but don't count as invalid
+            continue;
+        }
+        
+        // Extract camera position from transformation matrix
+        // Translation is in mat[3], mat[7], mat[11] (column 3, rows 0,1,2)
         float cam_x = mat[3];
         float cam_y = mat[7];
         float cam_z = mat[11];
         
-        // Validate position
-        if (!std::isfinite(cam_x) || !std::isfinite(cam_y) || !std::isfinite(cam_z) ||
-            std::abs(cam_x) > 10000.0f || std::abs(cam_y) > 10000.0f || std::abs(cam_z) > 10000.0f) {
-            skipped_out_of_bounds++;
-            continue;
-        }
-        
-        // Extract rotation vectors from matrix
-        Eigen::Vector3f forward = Eigen::Vector3f(-mat[8], -mat[9], -mat[10]);  // -Z direction in camera frame
-        Eigen::Vector3f right = Eigen::Vector3f(mat[0], mat[1], mat[2]);         // X direction
-        Eigen::Vector3f up = Eigen::Vector3f(mat[4], mat[5], mat[6]);            // Y direction
-        
-        // Validate rotation vectors
-        if (!std::isfinite(forward.x()) || !std::isfinite(forward.y()) || !std::isfinite(forward.z()) ||
-            !std::isfinite(right.x()) || !std::isfinite(right.y()) || !std::isfinite(right.z()) ||
-            !std::isfinite(up.x()) || !std::isfinite(up.y()) || !std::isfinite(up.z()) ||
-            forward.norm() < 0.1f || right.norm() < 0.1f || up.norm() < 0.1f) {
-            skipped_invalid++;
-            continue;
-        }
+        // Extract rotation vectors from transformation matrix
+        // Forward is -Z direction in camera frame (third column, negated)
+        Eigen::Vector3f forward(-mat[8], -mat[9], -mat[10]);
+        // Right is X direction (first column)
+        Eigen::Vector3f right(mat[0], mat[1], mat[2]);
+        // Up is Y direction (second column)
+        Eigen::Vector3f up(mat[4], mat[5], mat[6]);
         
         // Normalize direction vectors
         forward.normalize();
         right.normalize();
         up.normalize();
         
-        // Current frame in red, others in blue
+        // Set color: current frame in red, others in blue
         if (i + 1 == m_numFrames) {
             glColor3f(1.0f, 0.0f, 0.0f);  // Red for current frame
         } else {
             glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
         }
-        
-        // Draw camera as a square pyramid (frustum) to show position and orientation
-        // Pyramid: tip at camera position, base square in front of camera
-        // Camera looks in -Z direction in camera frame, so base is at -Z in camera frame
-        
-        // Pyramid parameters
-        const float pyramid_base_size = 0.05f;  // Size of pyramid base (adjust for visibility)
-        const float pyramid_height = 0.1f;      // Distance from tip to base
         
         // Camera position (tip of pyramid)
         Eigen::Vector3f tip(cam_x, cam_y, cam_z);
@@ -458,7 +477,6 @@ void DPVOViewer::drawPoses()
         Eigen::Vector3f base_corner4 = base_center + right * pyramid_base_size - up * pyramid_base_size;
         
         // Draw pyramid using lines
-        glLineWidth(2.0f);
         glBegin(GL_LINES);
         
         // Lines from tip to base corners
@@ -490,15 +508,6 @@ void DPVOViewer::drawPoses()
         glEnd();
         
         valid_poses_drawn++;
-    }
-    
-    // Log warnings only if there are issues (reduced frequency)
-    static int draw_count = 0;
-    draw_count++;
-    if (valid_poses_drawn != frames_to_process && draw_count % 300 == 0) {
-        printf("[DPVOViewer] drawPoses: WARNING - Only drew %d/%d valid poses (skipped_invalid=%d, skipped_out_of_bounds=%d)\n", 
-               valid_poses_drawn, frames_to_process, skipped_invalid, skipped_out_of_bounds);
-        fflush(stdout);
     }
 #else
     // Viewer disabled - no-op
@@ -614,7 +623,7 @@ void DPVOViewer::drawPoses_fake()
         // FOR TESTING: Always use fake values (close to previous frame) to create smooth trajectory
         // Set to false to use real poses when they're valid
         // FORCE ALL FRAMES TO USE FAKE VALUES FOR VISUALIZATION TESTING
-        const bool FORCE_FAKE_FOR_TESTING = true;
+        const bool FORCE_FAKE_FOR_TESTING = false;  // DISABLED: Use real poses from bundle adjustment
         
         // Check if this frame already has a saved position (previous frame)
         // Note: After resize, new elements are zero, so we check if norm > 0
@@ -1011,9 +1020,11 @@ void DPVOViewer::run()
     glEnable(GL_DEPTH_TEST);
     
     // Setup 3D camera
+    // Use a wider view frustum to accommodate larger trajectories
+    // Far plane set to 1000 to see poses that are far from origin
     m_camera = new pangolin::OpenGlRenderState(
         pangolin::ProjectionMatrix(m_imageWidth, m_imageHeight, 400, 400, 
-                                  m_imageWidth/2, m_imageHeight/2, 0.1, 500),
+                                  m_imageWidth/2, m_imageHeight/2, 0.1, 1000),
         pangolin::ModelViewLookAt(0, -1, -1, 0, 0, 0, pangolin::AxisNegY));
     
     // 3D visualization view
@@ -1063,7 +1074,7 @@ void DPVOViewer::run()
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
         
-        // Draw 3D scene
+        // Draw 3D scene (Handler3D allows user to control camera with mouse)
         m_3dDisplay->Activate(*m_camera);
         
         drawPoints();

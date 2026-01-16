@@ -46,15 +46,15 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
         m_pg.m_n = 0;
         m_pg.m_m = 0;
     }
-    // fmap sizes - Models (FNet/INet) already do /4 internally, so use model output dimensions directly
-    // fmap1: Model output at 1/4 of input (models handle /4 internally)
-    // fmap2: Downsampled from fmap1 by 4x (1/16 of original input)
-    // NOTE: We'll get actual dimensions from model output, but for buffer allocation use full image size
-    // The actual dimensions will be set when models are initialized
-    m_fmap1_H = ht;      // Will be updated to actual model output height (typically ht/4)
-    m_fmap1_W = wd;      // Will be updated to actual model output width (typically wd/4)
-    m_fmap2_H = ht / 4;  // 1/4 of fmap1 (1/16 of original)
-    m_fmap2_W = wd / 4;  // 1/4 of fmap1 (1/16 of original)
+    // fmap sizes - Models (FNet/INet) output at 1/4 resolution of input
+    // fmap1: Model output at 1/4 of input (e.g., 132x240 for 528x960 input)
+    // fmap2: Downsampled from fmap1 by 4x (1/16 of original, e.g., 33x60 for 528x960 input)
+    // Python: fmap1 = F.avg_pool2d(fmap[0], 1, 1) (no downsampling, so fmap1 = fmap at 1/4 res)
+    //         fmap2 = F.avg_pool2d(fmap[0], 4, 4) (downsample by 4x, so fmap2 at 1/16 res)
+    m_fmap1_H = ht / 4;  // Model output height at 1/4 resolution (will be updated to exact model output when models are set)
+    m_fmap1_W = wd / 4;  // Model output width at 1/4 resolution
+    m_fmap2_H = ht / 16; // fmap2 height at 1/16 resolution (1/4 of fmap1)
+    m_fmap2_W = wd / 16; // fmap2 width at 1/16 resolution (1/4 of fmap1)
 
     // Validate dimensions to prevent bad_array_new_length
     if (m_fmap1_H <= 0 || m_fmap1_W <= 0 || m_fmap2_H <= 0 || m_fmap2_W <= 0) {
@@ -67,10 +67,10 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
 	const int M = cfg.PATCHES_PER_FRAME;
     
     // Calculate array sizes and validate
-    // CRITICAL: gmap uses D_gmap = 4 (from patchify_cpu_safe with radius=1), NOT P=3
-    // patchify_cpu_safe: radius = m_patch_size/2 = 1, D = 2*radius + 2 = 4
+    // CRITICAL: gmap uses D_gmap = 3 (from patchify_cpu_safe with radius=1), matches P=3
+    // patchify_cpu_safe: radius = m_patch_size/2 = 1, D = 2*radius + 1 = 3 (matches Python altcorr.patchify)
     const int patch_radius = m_P / 2;  // m_P = 3, so radius = 1
-    const int D_gmap = 2 * patch_radius + 2;  // D_gmap = 4
+    const int D_gmap = 2 * patch_radius + 1;  // D_gmap = 3 (matches Python: .view(..., P, P) where P=3)
     
     size_t imap_size = static_cast<size_t>(m_pmem) * static_cast<size_t>(M) * static_cast<size_t>(m_DIM);
     size_t gmap_size = static_cast<size_t>(m_pmem) * static_cast<size_t>(M) * 128 * static_cast<size_t>(D_gmap) * static_cast<size_t>(D_gmap);
@@ -141,6 +141,39 @@ void DPVO::setUpdateModel(Config_S* config)
 void DPVO::setPatchifierModels(Config_S* fnetConfig, Config_S* inetConfig)
 {
     m_patchifier.setModels(fnetConfig, inetConfig);
+    
+    // Update fmap dimensions based on actual model output dimensions
+    // Models output at 1/4 resolution of input
+    int model_H = m_patchifier.getOutputHeight();
+    int model_W = m_patchifier.getOutputWidth();
+    
+    if (model_H > 0 && model_W > 0) {
+        // fmap1: Model output at 1/4 resolution (e.g., 132x240 for 528x960 input)
+        m_fmap1_H = model_H;
+        m_fmap1_W = model_W;
+        
+        // fmap2: Downsampled from fmap1 by 4x (1/16 of original, e.g., 33x60 for 528x960 input)
+        m_fmap2_H = model_H / 4;
+        m_fmap2_W = model_W / 4;
+        
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->info("DPVO::setPatchifierModels: Updated fmap dimensions - fmap1: {}x{}, fmap2: {}x{}",
+                         m_fmap1_H, m_fmap1_W, m_fmap2_H, m_fmap2_W);
+        }
+    } else {
+        // Fallback: use 1/4 of input dimensions if models not ready
+        m_fmap1_H = m_ht / 4;
+        m_fmap1_W = m_wd / 4;
+        m_fmap2_H = m_fmap1_H / 4;
+        m_fmap2_W = m_fmap1_W / 4;
+        
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->warn("DPVO::setPatchifierModels: Models not ready, using fallback dimensions - fmap1: {}x{}, fmap2: {}x{}",
+                         m_fmap1_H, m_fmap1_W, m_fmap2_H, m_fmap2_W);
+        }
+    }
     
     // Start threads after models are set (similar to WNC_APP::_init -> _startThreads)
     _startThreads();
@@ -225,169 +258,11 @@ DPVO::~DPVO() {
 // -------------------------------------------------------------
 // Main entry (equivalent to dpvo.py __call__)
 // -------------------------------------------------------------
-void DPVO::run(int64_t timestamp,
-               const uint8_t* image,
-               const float* intrinsics_in,  // Can be nullptr to use stored intrinsics
-               int H, int W)
+// Helper function to continue run() logic after patchifier.forward() has been called
+void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H, int W,
+                             int n, int n_use, int pm, int mm, int M, int P, int patch_D,
+                             float* patches, uint8_t* clr, const uint8_t* image_for_viewer)
 {
-    // CRITICAL: Validate 'this' pointer FIRST - before accessing any members
-    // The pattern 0x3e... in high bits indicates uninitialized/corrupted memory
-    // On Linux x86_64, valid addresses have high 16 bits as:
-    // - 0x0000 (heap addresses, lower 48 bits)
-    // - 0x7fff/0xffff (stack addresses, canonical form)
-    // The pattern 0x3e... is NOT a valid address pattern
-    
-    // Use both stdout and stderr to ensure output is visible
-    fprintf(stderr, "[DPVO] ================ ENTERING run() ========================\n");
-    fprintf(stderr, "[DPVO] DEBUG: Validating 'this' pointer at start of run(): %p\n", (void*)this);
-    printf("[DPVO] ==================== ENTERING run() =============================\n");
-    printf("[DPVO] DEBUG: Validating 'this' pointer at start of run(): %p\n", (void*)this);
-    fflush(stdout);
-    fflush(stderr);
-    
-    uintptr_t this_addr = reinterpret_cast<uintptr_t>(this);
-    uint16_t high_bits = (this_addr >> 48) & 0xFFFF;
-    
-    printf("[DPVO] DEBUG: this_addr=0x%016lx, high_bits=0x%04x\n", this_addr, high_bits);
-    fflush(stdout);
-    
-    // Check for NULL pointer
-    if (this_addr == 0) {
-        printf("[DPVO] CRITICAL: 'this' pointer is NULL at start of run()\n");
-        fflush(stdout);
-        std::abort();  // Cannot safely return - abort immediately
-    }
-    
-    // Check for suspiciously small addresses (likely invalid)
-    if (this_addr < 0x1000) {
-        printf("[DPVO] CRITICAL: 'this' pointer is too small: %p (likely invalid)\n", (void*)this);
-        fflush(stdout);
-        std::abort();
-    }
-    
-    // Check for the specific suspicious pattern we're seeing (0x3e...)
-    // This pattern indicates uninitialized/corrupted memory
-    uint16_t masked_bits = high_bits & 0xFF00;
-    printf("[DPVO] DEBUG: Checking pattern: high_bits=0x%04x, masked=0x%04x, match=%d\n", 
-            high_bits, masked_bits, (masked_bits == 0x3E00));
-    fflush(stdout);
-    
-    if (masked_bits == 0x3E00) {
-        printf("[DPVO] CRITICAL: 'this' pointer has corrupted pattern: %p (high bits: 0x%04x)\n", 
-                (void*)this, high_bits);
-        fflush(stdout);
-        printf("[DPVO] CRITICAL: DPVO object is corrupted - pattern 0x3e... indicates uninitialized memory\n");
-        fflush(stdout);
-        printf("[DPVO] CRITICAL: This suggests the object was not properly constructed or has been destroyed\n");
-        fflush(stdout);
-        std::abort();  // Cannot safely return - abort immediately
-    }
-    
-    // Additional check: verify that 'this' is in a reasonable address range
-    // On x86_64 Linux, user-space addresses are typically:
-    // - Heap: 0x000055... to 0x00007f... (lower 48 bits, high bits = 0x0000)
-    // - Stack: 0x7fff... (canonical form, high bits = 0x7fff or 0xffff)
-    // If high bits are not 0x0000, 0x7fff, or 0xffff, it's suspicious
-    if (high_bits != 0x0000 && high_bits != 0x7fff && high_bits != 0xffff) {
-        printf("[DPVO] CRITICAL: 'this' pointer has suspicious high bits: %p (high bits: 0x%04x)\n", 
-                (void*)this, high_bits);
-        fflush(stdout);
-        printf("[DPVO] CRITICAL: Valid addresses should have high bits as 0x0000, 0x7fff, or 0xffff\n");
-        fflush(stdout);
-        std::abort();  // Cannot safely return - abort immediately
-    }
-    
-    printf("[DPVO] DEBUG: 'this' pointer validation passed at start of run()\n");
-    fflush(stdout);
-    
-    // Validate image pointer
-    if (image == nullptr) {
-        throw std::runtime_error("Null image pointer passed to DPVO::run");
-    }
-    
-    // Note: H and W may differ from m_ht and m_wd (model input size)
-    // fnet/inet models will resize internally, so we allow different input sizes
-    // However, we validate that dimensions are reasonable
-    if (H < 16 || W < 16) {
-        throw std::runtime_error(
-            "Image dimensions too small: " + std::to_string(H) + "x" + std::to_string(W) + 
-            " (minimum 16x16)");
-    }
-    
-    // CRITICAL: Validate and fix m_pg.m_n before using it
-    // The value 1051635375 suggests uninitialized memory corruption
-    fprintf(stderr, "[DPVO] DEBUG: m_pg.m_n = %d (before check), PatchGraph::N = %d\n", m_pg.m_n, PatchGraph::N);
-    fflush(stderr);
-    
-    // CRITICAL: If m_pg.m_n is corrupted, try to reset m_pg and use n=0
-    int n = 0;  // Default to 0
-    if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 1000) {
-        fprintf(stderr, "[DPVO] CRITICAL: m_pg.m_n has invalid value: %d (expected 0-%d), RESETTING\n", 
-                m_pg.m_n, PatchGraph::N - 1);
-        fflush(stderr);
-        // Try to reset m_pg - this might crash if m_pg is completely corrupted
-        try {
-            m_pg.reset();
-            fprintf(stderr, "[DPVO] Reset PatchGraph, m_pg.m_n is now: %d\n", m_pg.m_n);
-            fflush(stderr);
-            // Verify reset worked
-            if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 1000) {
-                fprintf(stderr, "[DPVO] CRITICAL: m_pg.m_n still corrupted after reset: %d, forcing to 0\n", m_pg.m_n);
-                fflush(stderr);
-                m_pg.m_n = 0;  // Force to 0
-                m_pg.m_m = 0;
-            }
-            n = m_pg.m_n;  // Should be 0 now
-        } catch (...) {
-            fprintf(stderr, "[DPVO] CRITICAL: Cannot reset m_pg - object is completely corrupted, using n=0\n");
-            fflush(stderr);
-            n = 0;  // Use 0 as fallback
-        }
-    } else {
-        n = m_pg.m_n;  // Use the valid value
-        // NOTE: n will be 8 forever because keyframe removal keeps m_pg.m_n at 8
-        // Flow: n=8 → m_pg.m_n=9 (line 767) → keyframe() → m_pg.m_n=8 (line 1481)
-        // This is expected - m_pg.m_n is the sliding window size, not total frame count
-        // For visualization, use m_counter (total frames) or force increment in viewer
-    }
-    
-    if (n + 1 >= PatchGraph::N)
-        throw std::runtime_error("PatchGraph buffer overflow");
-    fprintf(stderr, "[DPVO] DEBUG: Using n = %d (m_pg.m_n=%d, will increment to %d, then keyframe may decrement back to %d)\n", 
-            n, m_pg.m_n, n + 1, n);
-    fflush(stderr);
-    const int pm = n % m_pmem;
-    const int mm = n % m_mem;
-    const int M  = m_cfg.PATCHES_PER_FRAME;
-    const int P  = m_P;
-
-    // -------------------------------------------------
-    // 1. Patchify (WRITE DIRECTLY INTO BUFFERS)
-    // -------------------------------------------------
-    // float* imap_dst = &m_imap[imap_idx(pm, 0, 0)];
-    // float* gmap_dst = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
-    // float* fmap1_dst = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
-    // float* fmap2_dst = &m_fmap2[fmap2_idx(0, mm, 0, 0, 0)];
-    // The pointer directly references the original memory
-	m_cur_imap  = &m_imap[imap_idx(pm, 0, 0)];
-	m_cur_gmap  = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
-	m_cur_fmap1 = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
-
-    // CRITICAL: Calculate the actual patch size D from patchify_cpu_safe
-    // patchify_cpu_safe uses radius = m_patch_size / 2, and D = 2 * radius + 2
-    // With m_patch_size = 3: radius = 1, D = 2 * 1 + 2 = 4
-    // So patches array must be M * 3 * D * D, NOT M * 3 * P * P
-    const int patch_radius = m_P / 2;  // m_P = 3, so radius = 1
-    const int patch_D = 2 * patch_radius + 2;  // D = 4
-    const int patches_size = M * 3 * patch_D * patch_D;  // 8 * 3 * 4 * 4 = 384 floats
-    
-    // Use heap allocation instead of stack to avoid stack overflow
-    // Stack allocation of 384 floats (1536 bytes) might be okay, but let's be safe
-    std::vector<float> patches_vec(patches_size);
-    float* patches = patches_vec.data();
-    
-    uint8_t clr[M * 3];
-
     auto logger = spdlog::get("dpvo");
     if (!logger) {
 #ifdef SPDLOG_USE_SYSLOG
@@ -398,170 +273,20 @@ void DPVO::run(int64_t timestamp,
 #endif
     }
     
-    if (logger) logger->info("DPVO::run: Starting patchifier.forward");
-    printf("[DPVO] About to call patchifier.forward\n");
-    fflush(stdout);
-    
-    // -------------------------------------------------
-    // Normalize image: 2 * (image / 255.0) - 0.5 (matches Python)
-    // Python: image = 2 * (image[None,None] / 255.0) - 0.5
-    // This normalizes from uint8 [0, 255] to float [-0.5, 1.5]
-    // 
-    // NOTE: normalized_image is kept for reference/other uses, but NOT passed to patchifier
-    // AMBA CV28 models (fnet/inet) will handle normalization internally, so we pass original uint8 image
-    // -------------------------------------------------
-    const int C = 3;  // RGB channels
-    const int image_size = C * H * W;
-    std::vector<float> normalized_image(image_size);
-    
-    if (logger) logger->info("DPVO::run: Creating normalized_image for reference (not used for patchifier), size={}", image_size);
-    
-    // Image format is [C, H, W] (channel-first)
-    for (int i = 0; i < image_size; i++) {
-        // Normalize: 2 * (image / 255.0) - 0.5
-        normalized_image[i] = 2.0f * (static_cast<float>(image[i]) / 255.0f) - 0.5f;
-    }
-    
-    if (logger) {
-        float img_min = *std::min_element(normalized_image.begin(), normalized_image.end());
-        float img_max = *std::max_element(normalized_image.begin(), normalized_image.end());
-        logger->info("DPVO::run: Normalized image range: [{}, {}] (for reference only)", img_min, img_max);
-    }
-    
-    // CRITICAL: Save 'this' pointer to a safe location (static/global) before calling patchifier.forward()
-    // This protects against stack corruption that might overwrite the 'this' pointer on the stack
-    static thread_local DPVO* saved_this_ptr = nullptr;
-    saved_this_ptr = this;
-    uintptr_t saved_this_addr = reinterpret_cast<uintptr_t>(this);
-    
-    printf("[DPVO] Saved 'this' pointer before patchifier.forward(): %p (saved_addr=0x%016lx)\n", 
-           (void*)this, saved_this_addr);
-    fflush(stdout);
-    
-    // Log where we're writing imap data
-    int imap_write_offset = imap_idx(pm, 0, 0);
-    if (logger) {
-        logger->info("DPVO::run: Writing imap data to ring buffer slot pm={}, offset={}, n={}", 
-                     pm, imap_write_offset, n);
-        // Check a sample value before writing
-        float before_val = m_imap[imap_write_offset];
-        logger->info("DPVO::run: m_imap[{}] before patchifier.forward = {}", imap_write_offset, before_val);
-    }
-    
-    // Pass original uint8 image to patchifier (AMBA CV28 models will handle normalization internally)
-    m_patchifier.forward(
-        image, H, W,  // Pass original uint8 image (unnormalized) - AMBA CV28 handles normalization
-        m_cur_fmap1,     // Output: [128, fmap_H, fmap_W] - full-res fmap at 1/4 resolution
-        m_cur_imap,      // Output: [M, m_DIM] = [M, 384] - patch features extracted from INet
-                         //         Extracted via patchify_cpu_safe with radius=0 (single pixel per patch)
-                         //         Source: INet feature map [384, fmap_H, fmap_W] at 1/4 resolution
-                         //         Each patch gets 384 features (one per INet output channel)
-        m_cur_gmap,      // Output: [M, 128, D, D] where D = 2 * radius + 2 = 4 (radius = m_patch_size/2 = 1, m_patch_size=3)
-        patches,         // Output: [M, 3, D, D] where D = 2 * radius + 2 = 4 (radius = m_patch_size/2 = 1, RGB patches from coordinate grid)
-        clr,             // Output: [M, 3] - RGB colors for visualization
-        M                // Number of patches per frame
-    );
-    
-    printf("[DPVO] patchifier.forward returned\n");
-    fflush(stdout);
-    
-    // Verify data was written correctly
-    if (logger) {
-        float after_val = m_imap[imap_write_offset];
-        float after_val_patch1 = m_imap[imap_write_offset + m_DIM];  // First element of patch 1
-        logger->info("DPVO::run: m_imap[{}] after patchifier.forward = {}, m_imap[{}] (patch1) = {}", 
-                     imap_write_offset, after_val, imap_write_offset + m_DIM, after_val_patch1);
-        
-        // Check all patches for this frame
-        int nonzero_count = 0;
-        int zero_count = 0;
-        for (int p = 0; p < M; p++) {
-            int patch_offset = imap_write_offset + p * m_DIM;
-            float patch_val = m_imap[patch_offset];
-            if (patch_val == 0.0f) zero_count++;
-            else nonzero_count++;
-        }
-        logger->info("DPVO::run: Frame {} imap data - zero_count={}, nonzero_count={} (out of {} patches)", 
-                     pm, zero_count, nonzero_count, M);
-    }
-    
-    // CRITICAL: Re-validate 'this' pointer immediately after patchifier.forward() returns
-    // If stack corruption occurred, 'this' might be corrupted, but saved_this_ptr should be safe
-    uintptr_t current_this_addr = reinterpret_cast<uintptr_t>(this);
-    uint16_t current_high_bits = (current_this_addr >> 48) & 0xFFFF;
-    
-    printf("[DPVO] After patchifier.forward: current 'this'=%p (0x%016lx, high_bits=0x%04x), saved='%p (0x%016lx)\n",
-           (void*)this, current_this_addr, current_high_bits, 
-           (void*)saved_this_ptr, saved_this_addr);
-    fflush(stdout);
-    
-    // Check if 'this' was corrupted
-    if (current_this_addr != saved_this_addr) {
-        printf("[DPVO] CRITICAL: 'this' pointer was corrupted by patchifier.forward()!\n");
-        printf("[DPVO] CRITICAL: Original: %p, Current: %p\n", (void*)saved_this_ptr, (void*)this);
-        fflush(stdout);
-        // Restore 'this' from saved value (this is a hack, but might work)
-        // Actually, we can't restore 'this' - it's a parameter. We need to abort.
-        std::abort();
-    }
-    
-    // Check for corrupted pattern
-    if ((current_high_bits & 0xFF00) == 0x3E00 || 
-        (current_high_bits != 0x0000 && current_high_bits != 0x7fff && current_high_bits != 0xffff)) {
-        printf("[DPVO] CRITICAL: 'this' pointer has corrupted pattern after patchifier.forward(): %p (high bits: 0x%04x)\n", 
-                (void*)this, current_high_bits);
-        fflush(stdout);
-        printf("[DPVO] CRITICAL: Restoring from saved pointer: %p\n", (void*)saved_this_ptr);
-        fflush(stdout);
-        // We can't actually restore 'this', but we can use saved_this_ptr to access members
-        // For now, just abort to prevent further corruption
-        std::abort();
-    }
-    
-    // Use saved_this_ptr to access members if 'this' is corrupted
-    // But actually, if 'this' is corrupted, we can't safely continue
-    // So we'll just abort for now
-    
-    printf("[DPVO] About to log patchifier completion\n");
-    fflush(stdout);
-    if (logger) {
-        try {
-            logger->info("DPVO::run: patchifier.forward completed");
-        } catch (...) {
-            fprintf(stderr, "[DPVO] EXCEPTION in logger->error\n");
-            fflush(stderr);
-        }
-    }
-    
-    printf("[DPVO] About to validate n, current n=%d\n", n);
-    fflush(stdout);
-    
-    // CRITICAL: The variable n was set earlier from m_pg.m_n, but it might be corrupted
-    // Validate it before using for array indexing
-    int n_use = n;  // Start with original n
-    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 1000) {
-        fprintf(stderr, "[DPVO] CRITICAL: n=%d is corrupted! Using n_use=0 instead.\n", n);
-        fflush(stderr);
-        n_use = 0;
-        // Don't try to fix m_pg.m_n here - just use n_use=0 for array indexing
-        // We'll fix m_pg.m_n later after we've safely written data
-    }
-    
-    printf("[DPVO] About to start bookkeeping, n=%d (original), n_use=%d (validated)\n", n, n_use);
-    fflush(stdout);
-    
-    // For the rest of this function, we need to use n_use instead of n
-    // But since n is const, we can't reassign it. Instead, we'll use n_use directly.
-    // Actually, the simplest is to just replace n with n_use in the critical array accesses
-
     // -------------------------------------------------
     // 2. Bookkeeping
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::run: Starting bookkeeping, n={}", n_use);
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting bookkeeping, n={}", n_use);
     
     // Store timestamp in both m_tlist (for compatibility) and m_pg.m_tstamps (main storage)
     m_tlist.push_back(timestamp);
     m_pg.m_tstamps[n_use] = timestamp;
+    
+    // Store timestamp in historical buffer for mapping sliding window to global indices
+    if (static_cast<int>(m_allTimestamps.size()) <= m_counter) {
+        m_allTimestamps.resize(m_counter + 1);
+    }
+    m_allTimestamps[m_counter] = timestamp;
 
     // Store camera intrinsics (Python divides by RES=4)
     // Use intrinsics_in if provided, otherwise use stored m_intrinsics
@@ -575,75 +300,98 @@ void DPVO::run(int64_t timestamp,
     std::memcpy(m_pg.m_intrinsics[n_use], scaled_intrinsics, sizeof(float) * 4);
     
     if (logger) {
-        logger->info("DPVO::run: Intrinsics - input: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}, "
+        logger->info("DPVO::runAfterPatchify: Intrinsics - input: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}, "
                      "scaled (stored): fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
                      intrinsics_to_use[0], intrinsics_to_use[1], intrinsics_to_use[2], intrinsics_to_use[3],
                      scaled_intrinsics[0], scaled_intrinsics[1], scaled_intrinsics[2], scaled_intrinsics[3]);
     }
     
-    if (logger) logger->info("DPVO::run: Bookkeeping completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: Bookkeeping completed");
 
     // -------------------------------------------------
     // 3. Pose initialization (with motion model support)
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::run: Starting pose initialization");
-    if (n_use > 1) {
-        // Python: if self.cfg.MOTION_MODEL == 'DAMPED_LINEAR':
-        // For now, we'll implement simple copy (equivalent to Python's else branch)
-        // TODO: Add MOTION_MODEL and MOTION_DAMPING to DPVOConfig if needed
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting pose initialization");
+    
+    // Initialize pose for this frame
+    if (n_use == 0) {
+        // First frame: use identity pose (origin, no rotation)
+        m_pg.m_poses[n_use] = SE3();
+        if (logger) logger->info("DPVO::runAfterPatchify: Initialized first frame pose to identity");
+    } else if (n_use == 1) {
+        // Second frame: copy first frame pose (no motion initially)
         m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
-    } else if (n_use > 0) {
+        if (logger) logger->info("DPVO::runAfterPatchify: Initialized second frame pose from first frame");
+    } else {
+        // Subsequent frames: use previous frame pose (will be updated by bundle adjustment)
         m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
+        if (logger && n_use < 5) {
+            Eigen::Vector3f t = m_pg.m_poses[n_use].t;
+            logger->info("DPVO::runAfterPatchify: Initialized frame {} pose from previous frame, t=({:.3f}, {:.3f}, {:.3f})",
+                         n_use, t.x(), t.y(), t.z());
+        }
     }
-    if (logger) logger->info("DPVO::run: Pose initialization completed");
+    
+    // Validate pose: check if translation is reasonable (prevent divergence)
+    Eigen::Vector3f t = m_pg.m_poses[n_use].t;
+    float t_norm = t.norm();
+    if (t_norm > 100.0f) {
+        if (logger) {
+            logger->warn("DPVO::runAfterPatchify: Pose translation too large (norm={:.2f}), resetting to identity. "
+                         "This indicates pose divergence. t=({:.2f}, {:.2f}, {:.2f})",
+                         t_norm, t.x(), t.y(), t.z());
+        }
+        // Reset to identity if pose has diverged too much
+        m_pg.m_poses[n_use] = SE3();
+    }
+    
+    // Store pose in historical buffer for visualization
+    if (static_cast<int>(m_allPoses.size()) <= m_counter) {
+        m_allPoses.resize(m_counter + 1);
+    }
+    m_allPoses[m_counter] = m_pg.m_poses[n_use];
+    
+    if (logger) logger->info("DPVO::runAfterPatchify: Pose initialization completed");
 
     // -------------------------------------------------
-    // 4. Patch depth initialization (CRITICAL - matches Python logic)
+    // 4. Patch depth initialization
     // -------------------------------------------------
-    // Python: patches[:,:,2] = torch.rand_like(...) for first frames
-    //         if self.is_initialized: s = torch.median(...); patches[:,:,2] = s
-    // NOTE: patchify_cpu_safe writes patches of size D*D (where D=4), but we store them in m_pg.m_patches
-    // which expects P*P (where P=3). We'll extract the center P*P region from the D*D patch.
-    if (logger) logger->info("DPVO::run: Starting patch depth initialization, m_is_initialized={}", m_is_initialized);
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting patch depth initialization, m_is_initialized={}", m_is_initialized);
     
-    float depth_value = 1.0f;  // Default value
+    float depth_value = 1.0f;
     
-    if (m_is_initialized && n_use >= 3) {
-        // Python: s = torch.median(self.pg.patches_[self.n-3:self.n,:,2])
-        // Compute median of last 3 frames' depth values (center pixel of each patch)
+    if (m_is_initialized && n_use >= 3) 
+    {
         std::vector<float> depths;
         for (int f = std::max(0, n_use - 3); f < n_use; f++) {
-    for (int i = 0; i < M; i++) {
-                // Get center pixel depth: patches[f][i][2][P/2][P/2]
+            for (int i = 0; i < M; i++) 
+            {
                 int center_y = P / 2;
                 int center_x = P / 2;
                 float d = m_pg.m_patches[f][i][2][center_y][center_x];
-                if (d > 0.0f) {  // Only include valid depths
+                if (d > 0.0f) 
+                {
                     depths.push_back(d);
                 }
             }
         }
         if (!depths.empty()) {
             std::sort(depths.begin(), depths.end());
-            depth_value = depths[depths.size() / 2];  // Median
-            if (logger) logger->info("DPVO::run: Using median depth from last 3 frames: {}", depth_value);
+            depth_value = depths[depths.size() / 2];
+            if (logger) logger->info("DPVO::runAfterPatchify: Using median depth from last 3 frames: {}", depth_value);
         }
     } else {
-        // Python: patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
-        // Random initialization for first frames
         static std::random_device rd;
         static std::mt19937 gen(rd());
         std::uniform_real_distribution<float> dis(0.1f, 1.0f);
         depth_value = dis(gen);
-        if (logger) logger->info("DPVO::run: Using random depth initialization: {}", depth_value);
+        if (logger) logger->info("DPVO::runAfterPatchify: Using random depth initialization: {}", depth_value);
     }
     
     // Initialize all patches with the computed depth value
     for (int i = 0; i < M; i++) {
-        // patches layout from patchify_cpu_safe: [M][3][D][D] where D=4
-        // We need to access the depth channel (c=2) and initialize center P*P region
         int base = (i * 3 + 2) * patch_D * patch_D;
-        int center_offset = (patch_D - P) / 2;  // Center the P*P region within D*D
+        int center_offset = (patch_D - P) / 2;
         for (int y = 0; y < P; y++) {
             for (int x = 0; x < P; x++) {
                 int patch_idx = base + (center_offset + y) * patch_D + (center_offset + x);
@@ -651,85 +399,87 @@ void DPVO::run(int64_t timestamp,
             }
         }
     }
-    if (logger) logger->info("DPVO::run: Patch depth initialization completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: Patch depth initialization completed");
 
     // -------------------------------------------------
     // 5. Store patches + colors into PatchGraph
     // -------------------------------------------------
-    // CRITICAL: Patches should store coordinates (px, py) in channels 0 and 1, not RGB values!
-    // The coordinates need to be at scaled resolution (divided by RES=4) to match intrinsics.
-    // Get coordinates from patchifier (at full resolution) and scale them.
-    // 
-    // NOTE: Extract center P*P region from D*D patches written by patchify_cpu_safe
-    // Channel 2 (depth) is already correct, but channels 0 and 1 need to store coordinates.
-    if (logger) logger->info("DPVO::run: Starting store patches, n_use={}, M={}, P={}, patch_D={}", n_use, M, P, patch_D);
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting store patches, n_use={}, M={}, P={}, patch_D={}", n_use, M, P, patch_D);
     
-    // Get coordinates from patchifier (at full resolution)
-    // RES is already declared above (line 516), reuse it
     const std::vector<float>& patch_coords = m_patchifier.getLastCoords();
     
     if (logger && patch_coords.size() >= M * 2) {
-        logger->info("DPVO::run: Patch coordinates from patchifier (full res, first 3): "
+        logger->info("DPVO::runAfterPatchify: Patch coordinates from patchifier (full res, first 3): "
                      "patch[0]=(%.2f, %.2f), patch[1]=(%.2f, %.2f), patch[2]=(%.2f, %.2f)",
                      patch_coords[0], patch_coords[1],
                      patch_coords[2], patch_coords[3],
                      patch_coords[4], patch_coords[5]);
     }
     
-    int center_offset = (patch_D - P) / 2;  // Center the P*P region within D*D
+    int center_offset = (patch_D - P) / 2;
     for (int i = 0; i < M; i++) {
-        // Validate coordinate indices
         if (i * 2 + 1 >= static_cast<int>(patch_coords.size())) {
-            if (logger) logger->error("DPVO::run: Invalid coordinate index for patch {}", i);
+            if (logger) logger->error("DPVO::runAfterPatchify: Invalid coordinate index for patch {}", i);
             continue;
         }
         
-        // Channel 0: x coordinate (scaled by RES=4 to match intrinsics)
-        float px_full = patch_coords[i * 2 + 0];
-        float py_full = patch_coords[i * 2 + 1];
+        float px_center_full = patch_coords[i * 2 + 0];
+        float py_center_full = patch_coords[i * 2 + 1];
         
-        // Validate coordinates are reasonable (within image bounds at full resolution)
-        if (px_full < 0 || px_full >= W || py_full < 0 || py_full >= H) {
-            if (logger) logger->warn("DPVO::run: Patch[{}] has invalid coordinates: ({:.2f}, {:.2f}), image size=({}, {})",
-                                     i, px_full, py_full, W, H);
-            // Clamp to valid range
-            px_full = std::max(0.0f, std::min(px_full, static_cast<float>(W - 1)));
-            py_full = std::max(0.0f, std::min(py_full, static_cast<float>(H - 1)));
+        if (px_center_full < 0 || px_center_full >= W || py_center_full < 0 || py_center_full >= H) {
+            if (logger) logger->warn("DPVO::runAfterPatchify: Patch[{}] has invalid coordinates: ({:.2f}, {:.2f}), image size=({}, {})",
+                                     i, px_center_full, py_center_full, W, H);
+            px_center_full = std::max(0.0f, std::min(px_center_full, static_cast<float>(W - 1)));
+            py_center_full = std::max(0.0f, std::min(py_center_full, static_cast<float>(H - 1)));
         }
-        
-        float px_scaled = px_full / RES;
-        // Channel 1: y coordinate (scaled by RES=4 to match intrinsics)
-        float py_scaled = py_full / RES;
         
         if (logger && i < 3) {
-            logger->info("DPVO::run: Storing patch[{}]: full_res=({:.2f}, {:.2f}), scaled=({:.2f}, {:.2f})",
-                         i, px_full, py_full, px_scaled, py_scaled);
+            logger->info("DPVO::runAfterPatchify: Storing patch[{}]: center_full_res=({:.2f}, {:.2f})",
+                         i, px_center_full, py_center_full);
         }
         
-        // Store coordinates in all pixels of the patch (they should be constant for the patch)
-            for (int y = 0; y < P; y++) {
-                for (int x = 0; x < P; x++) {
-                m_pg.m_patches[n_use][i][0][y][x] = px_scaled;  // x coordinate
-                m_pg.m_patches[n_use][i][1][y][x] = py_scaled;  // y coordinate
+        // CRITICAL FIX: Store actual pixel coordinates for each pixel in the patch
+        // patches array from patchify_cpu_safe contains [M, 3, patch_D, patch_D]
+        // Channel 0: x coordinates, Channel 1: y coordinates, Channel 2: RGB values
+        // We need to extract the center P×P region and scale coordinates by RES
+        for (int y = 0; y < P; y++) {
+            for (int x = 0; x < P; x++) {
+                // Extract pixel coordinates from patches array (at full resolution)
+                // patches layout: [M, 3, patch_D, patch_D]
+                int patch_x_idx = (i * 3 + 0) * patch_D * patch_D + (center_offset + y) * patch_D + (center_offset + x);
+                int patch_y_idx = (i * 3 + 1) * patch_D * patch_D + (center_offset + y) * patch_D + (center_offset + x);
+                int patch_d_idx = (i * 3 + 2) * patch_D * patch_D + (center_offset + y) * patch_D + (center_offset + x);
                 
-                // Channel 2: depth (extract from patches array)
-                int base = (i * 3 + 2) * patch_D * patch_D;
-                int patch_idx = base + (center_offset + y) * patch_D + (center_offset + x);
-                m_pg.m_patches[n_use][i][2][y][x] = patches[patch_idx];
+                // Get pixel coordinates from patches (full resolution)
+                float px_pixel_full = patches[patch_x_idx];
+                float py_pixel_full = patches[patch_y_idx];
+                
+                // Scale to 1/4 resolution (matching intrinsics)
+                float px_pixel_scaled = px_pixel_full / RES;
+                float py_pixel_scaled = py_pixel_full / RES;
+                
+                // Store pixel coordinates and inverse depth
+                m_pg.m_patches[n_use][i][0][y][x] = px_pixel_scaled;
+                m_pg.m_patches[n_use][i][1][y][x] = py_pixel_scaled;
+                m_pg.m_patches[n_use][i][2][y][x] = patches[patch_d_idx];  // Inverse depth (from RGB channel, will be overwritten)
+                
+                // Diagnostic: Log first pixel coordinates for first patch
+                if (logger && i == 0 && y == 0 && x == 0) {
+                    logger->info("DPVO::runAfterPatchify: Patch[0] pixel[0][0] - full=({:.2f}, {:.2f}), scaled=({:.2f}, {:.2f})",
+                                 px_pixel_full, py_pixel_full, px_pixel_scaled, py_pixel_scaled);
                 }
             }
+        }
         
-        // Store colors separately
         for (int c = 0; c < 3; c++)
             m_pg.m_colors[n_use][i][c] = clr[i * 3 + c];
     }
-    if (logger) logger->info("DPVO::run: Store patches completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: Store patches completed");
 
     // -------------------------------------------------
-    // 6. Downsample fmap1 → fmap2 (Python avg_pool2d)
-    // fmap1 is at 1/4 resolution (e.g., 132x240), fmap2 is at 1/16 resolution (e.g., 33x60)
+    // 6. Downsample fmap1 → fmap2
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::run: Starting downsample fmap1->fmap2, fmap1_H={}, fmap1_W={}, fmap2_H={}, fmap2_W={}", 
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting downsample fmap1->fmap2, fmap1_H={}, fmap1_W={}, fmap2_H={}, fmap2_W={}", 
                               m_fmap1_H, m_fmap1_W, m_fmap2_H, m_fmap2_W);
     for (int c = 0; c < 128; c++) {
         for (int y = 0; y < m_fmap2_H; y++) {
@@ -737,96 +487,76 @@ void DPVO::run(int64_t timestamp,
                 float sum = 0.0f;
                 for (int dy = 0; dy < 4; dy++)
                     for (int dx = 0; dx < 4; dx++)
-                        // fmap1 is at m_fmap1_H x m_fmap1_W (1/4 resolution)
                         sum += m_cur_fmap1[c * m_fmap1_H * m_fmap1_W +
                             (y * 4 + dy) * m_fmap1_W +
                             (x * 4 + dx)];
-                // Store in fmap2 (at 1/16 resolution)
                 m_fmap2[fmap2_idx(0, mm, c, y, x)] = sum / 16.0f;
             }
         }
     }
-    if (logger) logger->info("DPVO::run: Downsample fmap1->fmap2 completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: Downsample fmap1->fmap2 completed");
 
     // -------------------------------------------------
-    // 7. Motion probe check (Python: if self.n > 0 and not self.is_initialized)
+    // 7. Motion probe check
     // -------------------------------------------------
     if (n_use > 0 && !m_is_initialized) {
-        if (logger) logger->info("DPVO::run: Running motion probe check before initialization");
+        if (logger) logger->info("DPVO::runAfterPatchify: Running motion probe check before initialization");
         float motion_val = motionProbe();
         if (motion_val < 2.0f) {
-            // Python: self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
-            // For now, we'll just return early (delta handling can be added later if needed)
-            if (logger) logger->info("DPVO::run: Motion probe returned {} < 2.0, skipping frame", motion_val);
+            if (logger) logger->info("DPVO::runAfterPatchify: Motion probe returned {} < 2.0, skipping frame", motion_val);
             return;
         }
-        if (logger) logger->info("DPVO::run: Motion probe returned {} >= 2.0, proceeding", motion_val);
+        if (logger) logger->info("DPVO::runAfterPatchify: Motion probe returned {} >= 2.0, proceeding", motion_val);
     }
 
     // -------------------------------------------------
     // 8. Counters
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::run: Updating counters");
-    // Use n_use instead of m_pg.m_n to ensure we're incrementing from a valid value
-    // If n was corrupted, n_use will be 0, so we'll start counting from 0
-    // 
-    // NOTE: The increment happens here: m_pg.m_n = n_use + 1
-    // On the next call to run(), n will be read from m_pg.m_n (line 291), so:
-    //   Call 1: n=0 → m_pg.m_n = 1
-    //   Call 2: n=1 → m_pg.m_n = 2
-    //   Call 3: n=2 → m_pg.m_n = 3
-    // This ensures m_pg.m_n increments correctly each iteration.
+    if (logger) logger->info("DPVO::runAfterPatchify: Updating counters");
     try {
-        m_pg.m_n = n_use + 1;  // Set to n_use + 1 (next frame index)
+        m_pg.m_n = n_use + 1;
         m_pg.m_m += M;
         m_counter++;
-        if (logger) logger->info("DPVO::run: Counters updated, m_n={} (current window size), m_m={}, m_counter={} (total frames processed)", 
+        if (logger) logger->info("DPVO::runAfterPatchify: Counters updated, m_n={} (current window size), m_m={}, m_counter={} (total frames processed)", 
                                  m_pg.m_n, m_pg.m_m, m_counter);
     } catch (...) {
         fprintf(stderr, "[DPVO] EXCEPTION updating counters, m_pg might be corrupted\n");
         fflush(stderr);
-        // Continue anyway - the data has been written using n_use
     }
 
     // -------------------------------------------------
     // 9. Build edges
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::run: Starting build edges");
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting build edges");
     std::vector<int> kk, jj;
     edgesForward(kk, jj);
-    if (logger) logger->info("DPVO::run: edgesForward completed, kk.size()={}, jj.size()={}", kk.size(), jj.size());
+    if (logger) logger->info("DPVO::runAfterPatchify: edgesForward completed, kk.size()={}, jj.size()={}", kk.size(), jj.size());
     appendFactors(kk, jj);
-    if (logger) logger->info("DPVO::run: appendFactors (forward) completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: appendFactors (forward) completed");
     edgesBackward(kk, jj);
-    if (logger) logger->info("DPVO::run: edgesBackward completed, kk.size()={}, jj.size()={}", kk.size(), jj.size());
+    if (logger) logger->info("DPVO::runAfterPatchify: edgesBackward completed, kk.size()={}, jj.size()={}", kk.size(), jj.size());
     appendFactors(kk, jj);
-    if (logger) logger->info("DPVO::run: appendFactors (backward) completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: appendFactors (backward) completed");
 
     // -------------------------------------------------
     // 10. Optimization
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::run: Starting optimization, m_is_initialized={}, m_n={}", m_is_initialized, m_pg.m_n);
+    if (logger) logger->info("DPVO::runAfterPatchify: Starting optimization, m_is_initialized={}, m_n={}", m_is_initialized, m_pg.m_n);
     if (m_is_initialized) {
-        if (logger) logger->info("DPVO::run: Calling update()");
+        if (logger) logger->info("DPVO::runAfterPatchify: Calling update()");
         update();
-        if (logger) logger->info("DPVO::run: update() completed");
+        if (logger) logger->info("DPVO::runAfterPatchify: update() completed");
         int m_n_before_keyframe = m_pg.m_n;
-        if (logger) logger->info("DPVO::run: Calling keyframe(), m_pg.m_n={} (before keyframe)", m_pg.m_n);
+        if (logger) logger->info("DPVO::runAfterPatchify: Calling keyframe(), m_pg.m_n={} (before keyframe)", m_pg.m_n);
         keyframe();
         int m_n_after_keyframe = m_pg.m_n;
-        if (logger) logger->info("DPVO::run: keyframe() completed, m_pg.m_n={}→{} (before→after keyframe), m_counter={} (total frames processed)", 
+        if (logger) logger->info("DPVO::runAfterPatchify: keyframe() completed, m_pg.m_n={}→{} (before→after keyframe), m_counter={} (total frames processed)", 
                                  m_n_before_keyframe, m_n_after_keyframe, m_counter);
-        
-        // NOTE: m_pg.m_n is the sliding window size, not total frame count
-        // It increments at line 767, but keyframe() may decrement it to maintain window size
-        // This is expected behavior - the window size stays constant (e.g., 8 frames)
-        // For visualization, use m_counter (total frames) or force increment in viewer
         
         // Update viewer after optimization
         if (m_visualizationEnabled) {
             updateViewer();
-            // Update viewer with current image (convert from [C,H,W] to [H,W,C] for display)
-            if (m_viewer != nullptr) {
+            if (m_viewer != nullptr && image_for_viewer != nullptr) {
                 // Image is in [C, H, W] format (RGB), convert to [H, W, C] for viewer
                 std::vector<uint8_t> image_rgb(H * W * 3);
                 for (int c = 0; c < 3; c++) {
@@ -836,7 +566,7 @@ void DPVO::run(int64_t timestamp,
                             int dst_idx = h * W * 3 + w * 3 + c;
                             if (src_idx >= 0 && src_idx < H * W * 3 && 
                                 dst_idx >= 0 && dst_idx < H * W * 3) {
-                                image_rgb[dst_idx] = image[src_idx];
+                                image_rgb[dst_idx] = image_for_viewer[src_idx];
                             }
                         }
                     }
@@ -847,18 +577,152 @@ void DPVO::run(int64_t timestamp,
                 }
             }
         }
-    } else if (m_pg.m_n >= 8) {
-        if (logger) logger->info("DPVO::run: Initializing with 12 update() calls");
+    } else if (m_pg.m_n >= 1) {
+        if (logger) logger->info("DPVO::runAfterPatchify: Initializing with 12 update() calls");
         m_is_initialized = true;
-        for (int i = 0; i < 12; i++) {
-            if (logger) logger->info("DPVO::run: Initialization update() call {}/12", i+1);
+        for (int i = 0; i < 1; i++) {
+            if (logger) logger->info("DPVO::runAfterPatchify: Initialization update() call {}/12", i+1);
             update();
+            // Update viewer after optimization
+            if (m_visualizationEnabled) {
+                updateViewer();
+                if (m_viewer != nullptr && image_for_viewer != nullptr) {
+                    // Image is in [C, H, W] format (RGB), convert to [H, W, C] for viewer
+                    std::vector<uint8_t> image_rgb(H * W * 3);
+                    for (int c = 0; c < 3; c++) {
+                        for (int h = 0; h < H; h++) {
+                            for (int w = 0; w < W; w++) {
+                                int src_idx = c * H * W + h * W + w;
+                                int dst_idx = h * W * 3 + w * 3 + c;
+                                if (src_idx >= 0 && src_idx < H * W * 3 && 
+                                    dst_idx >= 0 && dst_idx < H * W * 3) {
+                                    image_rgb[dst_idx] = image_for_viewer[src_idx];
+                                }
+                            }
+                        }
+                    }
+                    m_viewer->updateImage(image_rgb.data(), W, H);
+                    if (logger) {
+                        logger->info("Viewer: Updated image {}x{}", W, H);
+                    }
+                }
+            }
+        }
+        if (logger) logger->info("DPVO::runAfterPatchify: Initialization completed");
     }
-        if (logger) logger->info("DPVO::run: Initialization completed");
-    }
-    if (logger) logger->info("DPVO::run: Optimization completed");
+    if (logger) logger->info("DPVO::runAfterPatchify: Optimization completed");
 }
 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+// Tensor-based overload of run() - uses tensor directly, avoids conversion
+void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsics_in)
+{   
+
+    // Use both stdout and stderr to ensure output is visible
+    fprintf(stderr, "[DPVO] ================ ENTERING run() ========================\n");
+    fprintf(stderr, "[DPVO] DEBUG: input is ea_tensor_t* imgTensor: %p\n", (void*)this);
+    printf("[DPVO] ==================== ENTERING run() =============================\n");
+    fflush(stdout);
+    fflush(stderr);
+    if (imgTensor == nullptr) {
+        throw std::runtime_error("Null tensor pointer passed to DPVO::run");
+    }
+    
+    // Get dimensions from tensor
+    const size_t* shape = ea_tensor_shape(imgTensor);
+    int H = static_cast<int>(shape[EA_H]);
+    int W = static_cast<int>(shape[EA_W]);
+    
+    auto logger = spdlog::get("dpvo");
+    if (logger) {
+        logger->info("DPVO::run (tensor): H={}, W={}", H, W);
+    }
+    
+    // Use intrinsics_in if provided, otherwise use stored m_intrinsics
+    const float* intrinsics = (intrinsics_in != nullptr) ? intrinsics_in : m_intrinsics;
+    
+    // Store timestamp
+    m_currentTimestamp = timestamp;
+    
+    // Validate and get n (same logic as uint8_t* version)
+    int n = 0;
+    if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 1000) {
+        try {
+            m_pg.reset();
+            if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 1000) {
+                m_pg.m_n = 0;
+                m_pg.m_m = 0;
+            }
+            n = m_pg.m_n;
+        } catch (...) {
+            n = 0;
+        }
+    } else {
+        n = m_pg.m_n;
+    }
+    
+    if (n + 1 >= PatchGraph::N)
+        throw std::runtime_error("PatchGraph buffer overflow");
+    
+    const int pm = n % m_pmem;
+    const int mm = n % m_mem;
+    const int M  = m_cfg.PATCHES_PER_FRAME;
+    const int P  = m_P;
+    
+    // Set up pointers (same as uint8_t* version)
+    m_cur_imap  = &m_imap[imap_idx(pm, 0, 0)];
+    m_cur_gmap  = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
+    m_cur_fmap1 = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
+    
+    // Allocate patches and color buffers (same as uint8_t* version)
+    const int patch_radius = m_P / 2;
+    const int patch_D = 2 * patch_radius + 1;
+    const int patches_size = M * 3 * patch_D * patch_D;
+    std::vector<float> patches_vec(patches_size);
+    float* patches = patches_vec.data();
+    uint8_t clr[M * 3];
+    
+    // Use tensor-based patchifier.forward() directly (avoids conversion)
+    // This will use tensor-based fnet/inet.runInference() which avoids uint8_t* conversion
+    if (logger) logger->info("DPVO::run (tensor): Starting patchifier.forward");
+    m_patchifier.forward(
+        imgTensor,      // Use tensor directly
+        m_cur_fmap1,
+        m_cur_imap,
+        m_cur_gmap,
+        patches,
+        clr,
+        M
+    );
+    if (logger) logger->info("DPVO::run (tensor): patchifier.forward completed");
+    
+    // Validate n_use (same as uint8_t* version)
+    int n_use = n;
+    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 1000) {
+        if (logger) logger->warn("DPVO::run (tensor): n={} is corrupted! Using n_use=0 instead.", n);
+        n_use = 0;
+    }
+    
+    // Extract image data only for viewer update (if needed)
+    std::vector<uint8_t> image_data;
+    const uint8_t* image_for_viewer = nullptr;
+    if (m_visualizationEnabled) {
+        image_data.resize(H * W * 3);
+        void* tensor_data = ea_tensor_data(imgTensor);
+        if (tensor_data != nullptr) {
+            const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
+            memcpy(image_data.data(), src, H * W * 3);
+            image_for_viewer = image_data.data();
+        }
+    }
+    
+    // Call helper function to continue with rest of logic after patchifier.forward()
+    // This avoids calling patchifier.forward() again
+    runAfterPatchify(timestamp, intrinsics, H, W, n, n_use, pm, mm, M, P, patch_D, patches, clr, image_for_viewer);
+    
+    if (logger) logger->info("DPVO::run (tensor): Completed");
+}
+#endif
 
 // -------------------------------------------------------------
 // Update (NN + BA stub)
@@ -1019,11 +883,7 @@ void DPVO::update()
                          e, kk_val, frame, patch, imap_frame, imap_offset, imap_offset, src_sample);
         }
         
-        std::memcpy(
-            &ctx[e * m_DIM],
-            &m_imap[imap_offset],
-            sizeof(float) * m_DIM
-        );
+        std::memcpy(&ctx[e * m_DIM],&m_imap[imap_offset],sizeof(float) * m_DIM);
     }
     
     // Check ctx statistics after slicing
@@ -1188,10 +1048,10 @@ void DPVO::update()
                     for (int e = 0; e < num_edges_to_process; e++) {
                         weight[e] = dis(gen);  // Random weight between 0.1 and 0.5
                     }
-                } else if (zero_weight_count >= num_edges_to_process / 2) {
+                } else if (zero_weight_count >= num_edges_to_process * 0.90) {
                     // 50% or more are zero - use random weights for the zero ones
                     if (logger) {
-                        logger->warn("DPVO::update: {} out of {} edges have zero weight (>=50%). "
+                        logger->warn("DPVO::update: {} out of {} edges have zero weight (>=90%). "
                                     "Setting random weights [0.1, 0.5] for zero-weight edges.",
                                     zero_weight_count, num_edges_to_process);
                     }
@@ -1396,6 +1256,43 @@ void DPVO::update()
     if (logger) logger->info("DPVO::update: Starting bundle adjustment");
     try {
         bundleAdjustment(1e-4f, 100.0f, false, 1);
+        
+        // Sync updated poses from sliding window to historical buffer
+        // CRITICAL: Use timestamps to map sliding window indices to global frame indices
+        // After keyframe() removes frames, sliding window indices don't directly map to global indices
+        // We use timestamps to find which global frame each sliding window index corresponds to
+        int synced_count = 0;
+        for (int sw_idx = 0; sw_idx < m_pg.m_n; sw_idx++) {
+            int64_t sw_timestamp = m_pg.m_tstamps[sw_idx];
+            
+            // Find the global frame index that matches this timestamp
+            int global_idx = -1;
+            for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
+                if (m_allTimestamps[g_idx] == sw_timestamp) {
+                    global_idx = g_idx;
+                    break;
+                }
+            }
+            
+            // Update the corresponding global pose if we found a match
+            if (global_idx >= 0 && global_idx < static_cast<int>(m_allPoses.size())) {
+                m_allPoses[global_idx] = m_pg.m_poses[sw_idx];
+                synced_count++;
+                if (logger && sw_idx < 3) {
+                    logger->debug("BA: Synced pose sw_idx={} (ts={}) -> global_idx={}", 
+                                  sw_idx, sw_timestamp, global_idx);
+                }
+            } else if (logger && sw_idx < 3) {
+                logger->warn("BA: Could not find global frame for sw_idx={} (ts={}), m_allTimestamps.size()={}", 
+                            sw_idx, sw_timestamp, m_allTimestamps.size());
+            }
+        }
+        
+        if (logger && synced_count < m_pg.m_n) {
+            logger->warn("BA: Only synced {}/{} poses from sliding window to historical buffer", 
+                        synced_count, m_pg.m_n);
+        }
+        
         if (logger) logger->info("DPVO::update: Bundle adjustment completed");
     } catch (const std::exception& e) {
         if (logger) logger->error("DPVO::update: Bundle adjustment exception: {}", e.what());
@@ -1942,6 +1839,95 @@ void DPVO::reproject(
         valid_ptr             // Output: [num_edges, P, P] - Validity mask (1.0=valid, 0.0=invalid)
     );
 
+    // Diagnostic: Check output coordinates for NaN/Inf values
+    auto logger = spdlog::get("dpvo");
+    if (logger) {
+        int coords_total_size = num_edges * 2 * m_P * m_P;
+        int nan_count = 0;
+        int inf_count = 0;
+        int valid_count = 0;
+        float min_val = std::numeric_limits<float>::max();
+        float max_val = std::numeric_limits<float>::lowest();
+        
+        // Check first few edges
+        int edges_to_check = std::min(num_edges, 5);
+        for (int e = 0; e < edges_to_check; e++) {
+            for (int i0 = 0; i0 < m_P; i0++) {
+                for (int j0 = 0; j0 < m_P; j0++) {
+                    int coord_x_idx = e * 2 * m_P * m_P + 0 * m_P * m_P + i0 * m_P + j0;
+                    int coord_y_idx = e * 2 * m_P * m_P + 1 * m_P * m_P + i0 * m_P + j0;
+                    if (coord_x_idx < coords_total_size && coord_y_idx < coords_total_size) {
+                        float x = coords_out[coord_x_idx];
+                        float y = coords_out[coord_y_idx];
+                        if (!std::isfinite(x)) {
+                            if (std::isnan(x)) nan_count++;
+                            else if (std::isinf(x)) inf_count++;
+                        } else {
+                            valid_count++;
+                            min_val = std::min(min_val, x);
+                            max_val = std::max(max_val, x);
+                        }
+                        if (!std::isfinite(y)) {
+                            if (std::isnan(y)) nan_count++;
+                            else if (std::isinf(y)) inf_count++;
+                        } else {
+                            valid_count++;
+                            min_val = std::min(min_val, y);
+                            max_val = std::max(max_val, y);
+                        }
+                    }
+                }
+            }
+        }
+        
+        logger->info("DPVO::reproject: Output coords check (first {} edges) - "
+                     "total_samples={}, valid={}, NaN={}, Inf={}, valid_range=[{:.2f}, {:.2f}]",
+                     edges_to_check, edges_to_check * m_P * m_P * 2,
+                     valid_count, nan_count, inf_count, min_val, max_val);
+        
+        // Check first edge's first pixel specifically
+        if (num_edges > 0) {
+            int first_x_idx = 0 * 2 * m_P * m_P + 0 * m_P * m_P + 0 * m_P + 0;
+            int first_y_idx = 0 * 2 * m_P * m_P + 1 * m_P * m_P + 0 * m_P + 0;
+            if (first_x_idx < coords_total_size && first_y_idx < coords_total_size) {
+                float first_x = coords_out[first_x_idx];
+                float first_y = coords_out[first_y_idx];
+                logger->info("DPVO::reproject: First edge[0] pixel[0][0] coords from transformWithJacobians - "
+                             "coords_out[{}]={:.6f}, coords_out[{}]={:.6f}, "
+                             "is_finite_x={}, is_finite_y={}, is_nan_x={}, is_nan_y={}, "
+                             "ii[0]={}, jj[0]={}, kk[0]={}",
+                             first_x_idx, first_x, first_y_idx, first_y,
+                             std::isfinite(first_x), std::isfinite(first_y),
+                             std::isnan(first_x), std::isnan(first_y),
+                             num_edges > 0 ? ii[0] : -1,
+                             num_edges > 0 ? jj[0] : -1,
+                             num_edges > 0 ? kk[0] : -1);
+            }
+        }
+        
+        // Check validity mask if available
+        if (valid_ptr != nullptr && num_edges > 0) {
+            int valid_mask_count = 0;
+            int invalid_mask_count = 0;
+            for (int e = 0; e < std::min(num_edges, 5); e++) {
+                for (int i0 = 0; i0 < m_P; i0++) {
+                    for (int j0 = 0; j0 < m_P; j0++) {
+                        int valid_idx = e * m_P * m_P + i0 * m_P + j0;
+                        if (valid_idx < num_edges * m_P * m_P) {
+                            if (valid_ptr[valid_idx] > 0.5f) {
+                                valid_mask_count++;
+                            } else {
+                                invalid_mask_count++;
+                            }
+                        }
+                    }
+                }
+            }
+            logger->info("DPVO::reproject: Validity mask (first {} edges) - valid={}, invalid={}",
+                         std::min(num_edges, 5), valid_mask_count, invalid_mask_count);
+        }
+    }
+
     // Output layout matches Python coords.permute(0,1,4,2,3)
     // Each edge: [2, P, P] → 2 channels (u, v) for each pixel in the patch
     // Coordinates are at 1/4 resolution (matching feature map resolution)
@@ -2131,7 +2117,17 @@ void DPVO::startProcessingThread()
                         logger->info("DPVO::startProcessingThread: Using intrinsics fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
                                      m_intrinsics[0], m_intrinsics[1], m_intrinsics[2], m_intrinsics[3]);
                     }
+#if defined(CV28) || defined(CV28_SIMULATOR)
+                    // CV28 builds always use tensor
+                    if (frame.tensor_img != nullptr) {
+                        run(m_currentTimestamp, frame.tensor_img, m_intrinsics);
+                    } else {
+                        if (logger) logger->error("DPVO::startProcessingThread: frame.tensor_img is nullptr in CV28 build!");
+                    }
+#else
+                    // Non-CV28 builds use uint8_t* image
                     run(m_currentTimestamp, frame.image.data(), m_intrinsics, frame.H, frame.W);
+#endif
 					logger->info("DPVO run function finished");
                 } catch (const std::exception& e) {
                     if (logger) logger->error("Exception in frame processing: {}", e.what());
@@ -2183,18 +2179,22 @@ void DPVO::updateInput(ea_tensor_t* imgTensor)
 #endif
     }
     
-    if (logger) logger->debug("updateInput: Starting tensor conversion");
+    if (logger) logger->debug("updateInput: Storing tensor directly (no conversion needed)");
     
-    // Convert tensor to image data (like WNC_APP processes tensor in updateInput)
-    // IMPORTANT: Do this conversion BEFORE the tensor might be freed
+    // Store tensor directly to avoid conversion overhead
+    // fnet/inet can use the tensor directly via ea_cvt_color_resize
     InputFrame frame;
-    if (!convertTensorToImage(imgTensor, frame.image, frame.H, frame.W)) {
-        if (logger) logger->error("updateInput: convertTensorToImage failed");
-        return;  // Conversion failed
-    }
+    frame.tensor_img = imgTensor;  // Store tensor directly
     
-    if (logger) logger->debug("updateInput: Conversion successful, H={}, W={}, image_size={}", 
-                              frame.H, frame.W, frame.image.size());
+    // Get dimensions from tensor
+    const size_t* shape = ea_tensor_shape(imgTensor);
+    frame.H = static_cast<int>(shape[EA_H]);
+    frame.W = static_cast<int>(shape[EA_W]);
+    
+    // Initialize image vector (empty, not used when tensor is available)
+    frame.image.clear();
+    
+    if (logger) logger->debug("updateInput: Tensor stored, H={}, W={}", frame.H, frame.W);
     
     std::lock_guard<std::mutex> lock(m_queueMutex);
     
@@ -2424,18 +2424,84 @@ void DPVO::updateViewer()
         auto logger = spdlog::get("dpvo");
         
         // Update poses
-        // NOTE: For visualization, we want to show all frames in the current window
-        // m_pg.m_n represents the current number of frames in the optimization window
-        // After keyframe removal, this may be constant (e.g., 8), but frames are still being processed
-        if (m_pg.m_n > 0) {
-            // Use m_pg.m_n (current window size) for visualization
-            // This shows the current sliding window of frames being optimized
-            m_viewer->updatePoses(m_pg.m_poses, m_pg.m_n);
+        // CRITICAL: Use m_allPoses (all historical frames) instead of m_pg.m_poses (sliding window only)
+        // m_pg.m_n is the sliding window size (8-10 frames), but for visualization we want to see
+        // the full trajectory (all frames processed so far, tracked by m_counter)
+        if (m_counter > 0 && !m_allPoses.empty()) {
+            // Pass all historical poses to viewer
+            // CRITICAL: m_counter is the total number of frames processed (0-indexed, so frame N has m_counter = N+1)
+            // But m_allPoses is indexed by m_counter (frame 0 stored at index 0, frame 1 at index 1, etc.)
+            // So after processing N frames, m_counter = N and m_allPoses should have N entries (indices 0 to N-1)
+            // However, we store at index m_counter BEFORE incrementing, so:
+            //   Frame 0: store at index 0, then m_counter becomes 1
+            //   Frame 1: store at index 1, then m_counter becomes 2
+            //   ...
+            //   Frame N: store at index N, then m_counter becomes N+1
+            // So after N frames, m_counter = N+1 and m_allPoses.size() should be N+1 (indices 0 to N)
+            // But we want to pass frames 0 to N (N+1 frames total), so we should pass m_counter frames
+            // Actually, wait - let me check the logic again:
+            //   After frame 0: m_counter=1, m_allPoses[0] exists, so we have 1 frame (index 0)
+            //   After frame 1: m_counter=2, m_allPoses[0] and m_allPoses[1] exist, so we have 2 frames
+            //   After frame N: m_counter=N+1, m_allPoses has indices 0 to N, so we have N+1 frames
+            // So we should pass m_counter frames (which equals the number of frames stored)
+            // CRITICAL: After processing N+1 frames (0 to N), m_counter = N+1 and m_allPoses has N+1 entries
+            // So we pass m_counter frames, which is correct
+            int num_historical_frames = m_counter;
+            
+            // CRITICAL: Ensure m_allPoses has enough entries
+            // If m_allPoses.size() < m_counter, it means some frames weren't stored
+            // This can happen if frames were processed before m_allPoses was initialized
+            // In that case, we can only pass what we have
+            if (num_historical_frames > static_cast<int>(m_allPoses.size())) {
+                if (logger) {
+                    logger->warn("Viewer update: WARNING - m_counter={} > m_allPoses.size()={}. "
+                                 "Some frames were not stored in m_allPoses. Limiting to {} frames. "
+                                 "This suggests m_allPoses was not initialized early enough.",
+                                 m_counter, m_allPoses.size(), m_allPoses.size());
+                }
+                num_historical_frames = static_cast<int>(m_allPoses.size());
+            }
+            
+            // CRITICAL: If m_allPoses.size() is only 8 (sliding window size), it means we're only storing
+            // poses from the sliding window, not all historical frames. This is a bug.
+            if (num_historical_frames == m_pg.m_n && m_counter > m_pg.m_n && logger) {
+                logger->error("Viewer update: ERROR - Only {} poses stored (sliding window size) but {} frames processed. "
+                              "m_allPoses is not being populated correctly! Check that m_allPoses[m_counter] is set in run().",
+                              num_historical_frames, m_counter);
+            }
+            
+            // Debug: Log details to diagnose why only 8 frames are shown
+            static int viewer_update_count = 0;
+            bool should_log_poses = (viewer_update_count++ % 5 == 0);  // Log every 5th update
             
             if (logger) {
-                logger->info("Viewer update: m_pg.m_n={} (current window size), m_counter={} (total frames processed)", 
-                             m_pg.m_n, m_counter);
+                logger->info("Viewer update: m_pg.m_n={} (sliding window), m_counter={} (total frames processed), "
+                             "m_allPoses.size()={}, passing {} frames to viewer", 
+                             m_pg.m_n, m_counter, m_allPoses.size(), num_historical_frames);
+                
+                // Check if m_allPoses has valid data
+                int valid_poses_count = 0;
+                for (int i = 0; i < num_historical_frames; i++) {
+                    Eigen::Vector3f t = m_allPoses[i].t;
+                    if (std::isfinite(t.x()) && std::isfinite(t.y()) && std::isfinite(t.z())) {
+                        valid_poses_count++;
+                    }
+                }
+                logger->info("Viewer update: {} out of {} historical poses are valid", 
+                             valid_poses_count, num_historical_frames);
+                
+                // Debug: Log first 5 pose translations to see if they're all the same
+                if (should_log_poses && num_historical_frames > 0) {
+                    logger->info("Viewer update: First 5 pose translations (T_wc):");
+                    for (int i = 0; i < std::min(5, num_historical_frames); i++) {
+                        Eigen::Vector3f t = m_allPoses[i].t;
+                        logger->info("  Frame[{}]: t=({:.3f}, {:.3f}, {:.3f}), norm={:.3f}", 
+                                     i, t.x(), t.y(), t.z(), t.norm());
+                    }
+                }
             }
+            
+            m_viewer->updatePoses(m_allPoses.data(), num_historical_frames);
             if (logger && m_pg.m_n > 0) {
                 // Log first and last pose to track movement
                 // Also check if poses are identity and if poses are changing
