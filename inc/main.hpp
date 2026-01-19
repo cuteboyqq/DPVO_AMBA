@@ -34,6 +34,10 @@
 #include "dpvo.hpp"
 #include "fnet.hpp"  // FNetInference
 #include "inet.hpp"  // INetInference
+#ifdef USE_ONNX_RUNTIME
+#include "fnet_onnx.hpp"  // FNetInferenceONNX
+#include "inet_onnx.hpp"  // INetInferenceONNX
+#endif
 #include "path_utils.hpp"
 #include "video_handler.hpp"
 // System includes

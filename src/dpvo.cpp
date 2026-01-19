@@ -1,6 +1,9 @@
 #include "dpvo.hpp"
 #include "patchify.hpp" // Patchifier
 #include "update.hpp"   // DPVOUpdate
+#ifdef USE_ONNX_RUNTIME
+#include "update_onnx.hpp"  // DPVOUpdateONNX
+#endif
 #include "dpvo_viewer.hpp"  // DPVOViewer
 #include <algorithm>
 #include <cstring>
@@ -98,7 +101,19 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     // Initialize intrinsics from config or use defaults
     if (config != nullptr) {
         setIntrinsicsFromConfig(config);
+#ifdef USE_ONNX_RUNTIME
+        if (config->useOnnxRuntime) {
+            m_updateModel_onnx = std::make_unique<DPVOUpdateONNX>(config);
+            m_useOnnxUpdateModel = true;
+            m_updateModel = nullptr;
+        } else {
+            m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+            m_updateModel_onnx = nullptr;
+            m_useOnnxUpdateModel = false;
+        }
+#else
         m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+#endif
     } else {
         // Default intrinsics (will be updated when frame dimensions are known)
         m_intrinsics[0] = static_cast<float>(wd) * 0.5f;  // fx
@@ -133,8 +148,22 @@ void DPVO::_startThreads()
 
 void DPVO::setUpdateModel(Config_S* config)
 {
-    if (config != nullptr && m_updateModel == nullptr) {
-        m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+    if (config != nullptr) {
+#ifdef USE_ONNX_RUNTIME
+        if (config->useOnnxRuntime && m_updateModel_onnx == nullptr) {
+            m_updateModel_onnx = std::make_unique<DPVOUpdateONNX>(config);
+            m_useOnnxUpdateModel = true;
+            m_updateModel = nullptr;
+        } else if (!config->useOnnxRuntime && m_updateModel == nullptr) {
+            m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+            m_updateModel_onnx = nullptr;
+            m_useOnnxUpdateModel = false;
+        }
+#else
+        if (m_updateModel == nullptr) {
+            m_updateModel = std::make_unique<DPVOUpdate>(config, nullptr);
+        }
+#endif
     }
 }
 
@@ -205,6 +234,8 @@ void DPVO::setIntrinsicsFromConfig(Config_S* config)
     int frameHeight = config->frameHeight;
 
     // Store intrinsics as 4 values: [fx, fy, cx, cy] (matching Python format)
+    // NOTE: These intrinsics are for the original image resolution (e.g., 1920x1080)
+    // They will be automatically scaled by RES=4 when stored in PatchGraph for feature map resolution
     // fx: Use intrinsic_fx if > 0, otherwise use frameWidth/2 as fallback
     if (intrinsic_fx > 0.0f) {
         m_intrinsics[0] = intrinsic_fx;  // fx
@@ -333,6 +364,10 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     }
     
     // Validate pose: check if translation is reasonable (prevent divergence)
+    // NOTE: This check uses the norm (magnitude) of the translation vector, which allows
+    // negative Z values. There is NO constraint preventing negative Z - poses can move
+    // in any direction (forward/backward, left/right, up/down) as long as the total
+    // translation magnitude is reasonable (< 100 units).
     Eigen::Vector3f t = m_pg.m_poses[n_use].t;
     float t_norm = t.norm();
     if (t_norm > 100.0f) {
@@ -346,6 +381,8 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     }
     
     // Store pose in historical buffer for visualization
+    // Store immediately after initialization to ensure consecutive poses
+    // Bundle adjustment will update these poses later via sync mechanism
     if (static_cast<int>(m_allPoses.size()) <= m_counter) {
         m_allPoses.resize(m_counter + 1);
     }
@@ -479,18 +516,61 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     // -------------------------------------------------
     // 6. Downsample fmap1 → fmap2
     // -------------------------------------------------
+    // Python equivalent: fmap2 = F.avg_pool2d(fmap[0], 4, 4)
+    // This performs average pooling with a 4x4 kernel, downsampling fmap1 by 4x in both dimensions
+    // fmap1: [128, fmap1_H, fmap1_W] at 1/4 resolution (e.g., 132x240)
+    // fmap2: [128, fmap2_H, fmap2_W] at 1/16 resolution (e.g., 33x60)
+    // 
+    // Algorithm: For each output pixel (y, x) in fmap2, average the 4x4 block from fmap1:
+    //   fmap2[y, x] = mean(fmap1[y*4:(y+1)*4, x*4:(x+1)*4])
+    //
+    // Note: m_cur_fmap1 points to frame 'mm' in the ring buffer, layout is [C, H, W]
+    //       fmap2 is stored at frame 'mm' in the ring buffer using fmap2_idx(0, mm, c, y, x)
     if (logger) logger->info("DPVO::runAfterPatchify: Starting downsample fmap1->fmap2, fmap1_H={}, fmap1_W={}, fmap2_H={}, fmap2_W={}", 
                               m_fmap1_H, m_fmap1_W, m_fmap2_H, m_fmap2_W);
+    
+    // Validate dimensions: fmap2 should be exactly 1/4 of fmap1 in each dimension
+    if (m_fmap2_H * 4 != m_fmap1_H || m_fmap2_W * 4 != m_fmap1_W) {
+        if (logger) {
+            logger->error("DPVO::runAfterPatchify: Dimension mismatch in downsample - "
+                          "fmap1: {}x{}, fmap2: {}x{} (expected fmap2 to be 1/4 of fmap1)",
+                          m_fmap1_H, m_fmap1_W, m_fmap2_H, m_fmap2_W);
+        }
+        // Continue anyway, but bounds checking below will catch any issues
+    }
+    
     for (int c = 0; c < 128; c++) {
         for (int y = 0; y < m_fmap2_H; y++) {
             for (int x = 0; x < m_fmap2_W; x++) {
                 float sum = 0.0f;
-                for (int dy = 0; dy < 4; dy++)
-                    for (int dx = 0; dx < 4; dx++)
-                        sum += m_cur_fmap1[c * m_fmap1_H * m_fmap1_W +
-                            (y * 4 + dy) * m_fmap1_W +
-                            (x * 4 + dx)];
-                m_fmap2[fmap2_idx(0, mm, c, y, x)] = sum / 16.0f;
+                int count = 0;
+                
+                // Average over 4x4 block from fmap1
+                for (int dy = 0; dy < 4; dy++) {
+                    for (int dx = 0; dx < 4; dx++) {
+                        int src_y = y * 4 + dy;
+                        int src_x = x * 4 + dx;
+                        
+                        // Bounds check (should not be needed if dimensions are correct, but safety first)
+                        if (src_y < m_fmap1_H && src_x < m_fmap1_W) {
+                            // m_cur_fmap1 layout: [C, H, W] where C=128, H=fmap1_H, W=fmap1_W
+                            int src_idx = c * m_fmap1_H * m_fmap1_W + src_y * m_fmap1_W + src_x;
+                            sum += m_cur_fmap1[src_idx];
+                            count++;
+                        }
+                    }
+                }
+                
+                // Store average (divide by actual count in case of bounds issues)
+                if (count > 0) {
+                    m_fmap2[fmap2_idx(0, mm, c, y, x)] = sum / static_cast<float>(count);
+                } else {
+                    // Should never happen if dimensions are correct
+                    m_fmap2[fmap2_idx(0, mm, c, y, x)] = 0.0f;
+                    if (logger && c == 0 && y == 0 && x == 0) {
+                        logger->warn("DPVO::runAfterPatchify: No valid pixels in 4x4 block for fmap2[0,0,0]");
+                    }
+                }
             }
         }
     }
@@ -577,36 +657,36 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
                 }
             }
         }
-    } else if (m_pg.m_n >= 1) {
+    } else if (m_pg.m_n >= 8) {
         if (logger) logger->info("DPVO::runAfterPatchify: Initializing with 12 update() calls");
         m_is_initialized = true;
-        for (int i = 0; i < 1; i++) {
+        for (int i = 0; i < 2; i++) {
             if (logger) logger->info("DPVO::runAfterPatchify: Initialization update() call {}/12", i+1);
             update();
-            // Update viewer after optimization
-            if (m_visualizationEnabled) {
-                updateViewer();
-                if (m_viewer != nullptr && image_for_viewer != nullptr) {
-                    // Image is in [C, H, W] format (RGB), convert to [H, W, C] for viewer
-                    std::vector<uint8_t> image_rgb(H * W * 3);
-                    for (int c = 0; c < 3; c++) {
-                        for (int h = 0; h < H; h++) {
-                            for (int w = 0; w < W; w++) {
-                                int src_idx = c * H * W + h * W + w;
-                                int dst_idx = h * W * 3 + w * 3 + c;
-                                if (src_idx >= 0 && src_idx < H * W * 3 && 
-                                    dst_idx >= 0 && dst_idx < H * W * 3) {
-                                    image_rgb[dst_idx] = image_for_viewer[src_idx];
-                                }
+             // Update viewer after optimization
+        if (m_visualizationEnabled) {
+            updateViewer();
+            if (m_viewer != nullptr && image_for_viewer != nullptr) {
+                // Image is in [C, H, W] format (RGB), convert to [H, W, C] for viewer
+                std::vector<uint8_t> image_rgb(H * W * 3);
+                for (int c = 0; c < 3; c++) {
+                    for (int h = 0; h < H; h++) {
+                        for (int w = 0; w < W; w++) {
+                            int src_idx = c * H * W + h * W + w;
+                            int dst_idx = h * W * 3 + w * 3 + c;
+                            if (src_idx >= 0 && src_idx < H * W * 3 && 
+                                dst_idx >= 0 && dst_idx < H * W * 3) {
+                                image_rgb[dst_idx] = image_for_viewer[src_idx];
                             }
                         }
                     }
-                    m_viewer->updateImage(image_rgb.data(), W, H);
-                    if (logger) {
-                        logger->info("Viewer: Updated image {}x{}", W, H);
-                    }
+                }
+                m_viewer->updateImage(image_rgb.data(), W, H);
+                if (logger) {
+                    logger->info("Viewer: Updated image {}x{}", W, H);
                 }
             }
+        }
         }
         if (logger) logger->info("DPVO::runAfterPatchify: Initialization completed");
     }
@@ -664,14 +744,35 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     if (n + 1 >= PatchGraph::N)
         throw std::runtime_error("PatchGraph buffer overflow");
     
-    const int pm = n % m_pmem;
-    const int mm = n % m_mem;
-    const int M  = m_cfg.PATCHES_PER_FRAME;
-    const int P  = m_P;
+    const int pm = n % m_pmem;  // Ring buffer index for imap/gmap (pmem = 36)
+    const int mm = n % m_mem;   // Ring buffer index for fmap1/fmap2 (mem = 36)
+    const int M  = m_cfg.PATCHES_PER_FRAME;  // Patches per frame (typically 8)
+    const int P  = m_P;         // Patch size (typically 3)
     
-    // Set up pointers (same as uint8_t* version)
+    // Set up pointers to current frame's data in ring buffers
+    // These pointers point to the start of the current frame's data within the ring buffers
+    //
+    // m_imap: Ring buffer [m_pmem][M][m_DIM] = [36][8][384]
+    //   - Stores INet patch features (single pixel per patch, 384 channels)
+    //   - pm = n % 36: ring buffer slot for current frame
+    //   - m_cur_imap points to: m_imap[pm][0][0] = start of frame pm's imap data
+    //   - Shape of m_cur_imap: [M][m_DIM] = [8][384] (8 patches, 384 features each)
     m_cur_imap  = &m_imap[imap_idx(pm, 0, 0)];
+    
+    // m_gmap: Ring buffer [m_pmem][M][128][D_gmap][D_gmap] = [36][8][128][3][3]
+    //   - Stores FNet patch features (3×3 patches per patch, 128 channels)
+    //   - pm = n % 36: ring buffer slot for current frame
+    //   - m_cur_gmap points to: m_gmap[pm][0][0][0][0] = start of frame pm's gmap data
+    //   - Shape of m_cur_gmap: [M][128][D_gmap][D_gmap] = [8][128][3][3] (8 patches, each 3×3 with 128 channels)
+    //   - D_gmap = 3 (from patchify_cpu_safe with radius=1: D = 2*radius + 1 = 3)
     m_cur_gmap  = &m_gmap[gmap_idx(pm, 0, 0, 0, 0)];
+    
+    // m_fmap1: Ring buffer [1][m_mem][128][fmap1_H][fmap1_W] = [1][36][128][132][240]
+    //   - Stores full FNet feature maps at 1/4 resolution (e.g., 132×240 for 1920×1080 input)
+    //   - mm = n % 36: ring buffer slot for current frame
+    //   - m_cur_fmap1 points to: m_fmap1[0][mm][0][0][0] = start of frame mm's fmap1 data
+    //   - Shape of m_cur_fmap1: [128][fmap1_H][fmap1_W] = [128][132][240] (128 channels, 132×240 spatial)
+    //   - Note: First dimension is always 0 (batch dimension, kept for compatibility with Python)
     m_cur_fmap1 = &m_fmap1[fmap1_idx(0, mm, 0, 0, 0)];
     
     // Allocate patches and color buffers (same as uint8_t* version)
@@ -905,13 +1006,28 @@ void DPVO::update()
     // -------------------------------------------------
     // 4. Network update (DPVO Update Model Inference)
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::update: Starting network update, m_updateModel={}", (void*)m_updateModel.get());
+#ifdef USE_ONNX_RUNTIME
+    bool hasUpdateModel = (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) || 
+                          (!m_useOnnxUpdateModel && m_updateModel != nullptr);
+#else
+    bool hasUpdateModel = (m_updateModel != nullptr);
+#endif
+    
+    if (logger) {
+#ifdef USE_ONNX_RUNTIME
+        logger->info("DPVO::update: Starting network update, useOnnx={}, m_updateModel={}, m_updateModel_onnx={}", 
+                     m_useOnnxUpdateModel, (void*)m_updateModel.get(), (void*)m_updateModel_onnx.get());
+#else
+        logger->info("DPVO::update: Starting network update, m_updateModel={}", (void*)m_updateModel.get());
+#endif
+    }
+    
     std::vector<float> delta(num_active * 2);
     std::vector<float> weight(num_active);
     int num_edges_to_process = 0;  // Declare outside if block for use later
 
-    if (m_updateModel != nullptr) {
-        if (logger) logger->info("DPVO::update: m_updateModel is not null, preparing model inputs");
+    if (hasUpdateModel) {
+        if (logger) logger->info("DPVO::update: Update model is available, preparing model inputs");
         
         // Check m_pg.m_net state before reshapeInput
         if (logger) {
@@ -932,25 +1048,71 @@ void DPVO::update()
         
         // Reshape inputs using member function (reuses pre-allocated buffers)
         const int CORR_DIM = 882;
-        num_edges_to_process = m_updateModel->reshapeInput(
-            num_active,
-            m_pg.m_net,  // Pointer to 2D array [MAX_EDGES][384]
-            ctx.data(),  // Context data [num_active * 384]
-            corr,        // Correlation data [num_active * D * D * P * P * 2]
-            m_pg.m_ii,   // Indices [num_active]
-            m_pg.m_jj,   // Indices [num_active]
-            m_pg.m_kk,   // Indices [num_active]
-            D,           // Correlation window size (typically 8)
-            P,           // Patch size (typically 3)
-            m_reshape_net_input,   // Pre-allocated output buffers
-            m_reshape_inp_input,
-            m_reshape_corr_input,
-            m_reshape_ii_input,
-            m_reshape_jj_input,
-            m_reshape_kk_input,
-            m_maxEdge,   // Use member variable instead of hardcoded constant
-            CORR_DIM
-        );
+#ifdef USE_ONNX_RUNTIME
+        if (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) {
+            num_edges_to_process = m_updateModel_onnx->reshapeInput(
+                num_active,
+                m_pg.m_net,  // Pointer to 2D array [MAX_EDGES][384]
+                ctx.data(),  // Context data [num_active * 384]
+                corr,        // Correlation data [num_active * D * D * P * P * 2]
+                m_pg.m_ii,   // Indices [num_active]
+                m_pg.m_jj,   // Indices [num_active]
+                m_pg.m_kk,   // Indices [num_active]
+                D,           // Correlation window size (typically 8)
+                P,           // Patch size (typically 3)
+                m_reshape_net_input,   // Pre-allocated output buffers
+                m_reshape_inp_input,
+                m_reshape_corr_input,
+                m_reshape_ii_input,
+                m_reshape_jj_input,
+                m_reshape_kk_input,
+                m_maxEdge,   // Use member variable instead of hardcoded constant
+                CORR_DIM
+            );
+        } else if (m_updateModel != nullptr) {
+            num_edges_to_process = m_updateModel->reshapeInput(
+                num_active,
+                m_pg.m_net,  // Pointer to 2D array [MAX_EDGES][384]
+                ctx.data(),  // Context data [num_active * 384]
+                corr,        // Correlation data [num_active * D * D * P * P * 2]
+                m_pg.m_ii,   // Indices [num_active]
+                m_pg.m_jj,   // Indices [num_active]
+                m_pg.m_kk,   // Indices [num_active]
+                D,           // Correlation window size (typically 8)
+                P,           // Patch size (typically 3)
+                m_reshape_net_input,   // Pre-allocated output buffers
+                m_reshape_inp_input,
+                m_reshape_corr_input,
+                m_reshape_ii_input,
+                m_reshape_jj_input,
+                m_reshape_kk_input,
+                m_maxEdge,   // Use member variable instead of hardcoded constant
+                CORR_DIM
+            );
+        }
+#else
+        if (m_updateModel != nullptr) {
+            num_edges_to_process = m_updateModel->reshapeInput(
+                num_active,
+                m_pg.m_net,  // Pointer to 2D array [MAX_EDGES][384]
+                ctx.data(),  // Context data [num_active * 384]
+                corr,        // Correlation data [num_active * D * D * P * P * 2]
+                m_pg.m_ii,   // Indices [num_active]
+                m_pg.m_jj,   // Indices [num_active]
+                m_pg.m_kk,   // Indices [num_active]
+                D,           // Correlation window size (typically 8)
+                P,           // Patch size (typically 3)
+                m_reshape_net_input,   // Pre-allocated output buffers
+                m_reshape_inp_input,
+                m_reshape_corr_input,
+                m_reshape_ii_input,
+                m_reshape_jj_input,
+                m_reshape_kk_input,
+                m_maxEdge,   // Use member variable instead of hardcoded constant
+                CORR_DIM
+            );
+        }
+#endif
         
         // Check m_pg.m_net state after reshapeInput (to see if it was initialized)
         if (logger) {
@@ -974,19 +1136,46 @@ void DPVO::update()
         // Call update model inference synchronously
         DPVOUpdate_Prediction pred;
         if (logger) {
-            logger->info("DPVO::update: About to call m_updateModel->runInference");
+            logger->info("DPVO::update: About to call update model runInference");
             logger->info("DPVO::update: Input data ready - net_input size={}, inp_input size={}, corr_input size={}",
                          m_reshape_net_input.size(), m_reshape_inp_input.size(), m_reshape_corr_input.size());
         }
-        bool inference_success = m_updateModel->runInference(
-                m_reshape_net_input.data(),
-                m_reshape_inp_input.data(),
-                m_reshape_corr_input.data(),
-                m_reshape_ii_input.data(),
-                m_reshape_jj_input.data(),
-                m_reshape_kk_input.data(),
-                m_updateFrameCounter++,
-                pred);
+        bool inference_success = false;
+#ifdef USE_ONNX_RUNTIME
+        if (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) {
+            inference_success = m_updateModel_onnx->runInference(
+                    m_reshape_net_input.data(),
+                    m_reshape_inp_input.data(),
+                    m_reshape_corr_input.data(),
+                    m_reshape_ii_input.data(),
+                    m_reshape_jj_input.data(),
+                    m_reshape_kk_input.data(),
+                    m_updateFrameCounter++,
+                    pred);
+        } else if (m_updateModel != nullptr) {
+            inference_success = m_updateModel->runInference(
+                    m_reshape_net_input.data(),
+                    m_reshape_inp_input.data(),
+                    m_reshape_corr_input.data(),
+                    m_reshape_ii_input.data(),
+                    m_reshape_jj_input.data(),
+                    m_reshape_kk_input.data(),
+                    m_updateFrameCounter++,
+                    pred);
+        }
+#else
+        if (m_updateModel != nullptr) {
+            inference_success = m_updateModel->runInference(
+                    m_reshape_net_input.data(),
+                    m_reshape_inp_input.data(),
+                    m_reshape_corr_input.data(),
+                    m_reshape_ii_input.data(),
+                    m_reshape_jj_input.data(),
+                    m_reshape_kk_input.data(),
+                    m_updateFrameCounter++,
+                    pred);
+        }
+#endif
         
         if (logger) {
             logger->info("DPVO::update: runInference returned: {}", inference_success);
@@ -1011,7 +1200,7 @@ void DPVO::update()
                     delta[e * 2 + 0] = pred.dOutBuff[idx0];
                     delta[e * 2 + 1] = pred.dOutBuff[idx1];
                     
-                    // w_out layout: [1, 2, 384, 1] - try both channels to see which has data
+                    // w_out layout: [1, 2, m_maxEdge, 1] - try both channels to see which has data
                     // Channel 0 (same as delta x)
                     float w0 = pred.wOutBuff[idx0];
                     // Channel 1 (same as delta y)
@@ -1257,40 +1446,27 @@ void DPVO::update()
     try {
         bundleAdjustment(1e-4f, 100.0f, false, 1);
         
-        // Sync updated poses from sliding window to historical buffer
-        // CRITICAL: Use timestamps to map sliding window indices to global frame indices
-        // After keyframe() removes frames, sliding window indices don't directly map to global indices
-        // We use timestamps to find which global frame each sliding window index corresponds to
-        int synced_count = 0;
-        for (int sw_idx = 0; sw_idx < m_pg.m_n; sw_idx++) {
-            int64_t sw_timestamp = m_pg.m_tstamps[sw_idx];
-            
-            // Find the global frame index that matches this timestamp
-            int global_idx = -1;
-            for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
-                if (m_allTimestamps[g_idx] == sw_timestamp) {
-                    global_idx = g_idx;
-                    break;
+        // Sync optimized poses from sliding window (m_pg.m_poses) back to historical buffer (m_allPoses)
+        // Use timestamps to map sliding window indices to global frame indices
+        // This ensures the viewer shows the optimized poses, not just the initial estimates
+        if (!m_allTimestamps.empty() && m_pg.m_n > 0) {
+            for (int sw_idx = 0; sw_idx < m_pg.m_n; sw_idx++) {
+                int64_t sw_timestamp = m_pg.m_tstamps[sw_idx];
+                
+                // Find the global frame index that matches this timestamp
+                int global_idx = -1;
+                for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
+                    if (m_allTimestamps[g_idx] == sw_timestamp) {
+                        global_idx = g_idx;
+                        break;
+                    }
+                }
+                
+                // Update the corresponding global pose if we found a match
+                if (global_idx >= 0 && global_idx < static_cast<int>(m_allPoses.size())) {
+                    m_allPoses[global_idx] = m_pg.m_poses[sw_idx];
                 }
             }
-            
-            // Update the corresponding global pose if we found a match
-            if (global_idx >= 0 && global_idx < static_cast<int>(m_allPoses.size())) {
-                m_allPoses[global_idx] = m_pg.m_poses[sw_idx];
-                synced_count++;
-                if (logger && sw_idx < 3) {
-                    logger->debug("BA: Synced pose sw_idx={} (ts={}) -> global_idx={}", 
-                                  sw_idx, sw_timestamp, global_idx);
-                }
-            } else if (logger && sw_idx < 3) {
-                logger->warn("BA: Could not find global frame for sw_idx={} (ts={}), m_allTimestamps.size()={}", 
-                            sw_idx, sw_timestamp, m_allTimestamps.size());
-            }
-        }
-        
-        if (logger && synced_count < m_pg.m_n) {
-            logger->warn("BA: Only synced {}/{} poses from sliding window to historical buffer", 
-                        synced_count, m_pg.m_n);
         }
         
         if (logger) logger->info("DPVO::update: Bundle adjustment completed");

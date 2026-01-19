@@ -87,6 +87,10 @@ void AppConfigReader::read(std::string configPath)
         string intrinsic_fy      = "";
         string intrinsic_cx      = "";
         string intrinsic_cy      = "";
+        string distortion_k1     = "";
+        string distortion_k2     = "";
+        string distortion_p1     = "";
+        string distortion_p2     = "";
         int    frameWidth        = 320;
         int    frameHeight       = 320;
 
@@ -158,6 +162,22 @@ void AppConfigReader::read(std::string configPath)
         configReader->getValue("FnetModelPath", fnetModelPath);
         configReader->getValue("InetModelPath", inetModelPath);
         configReader->getValue("UpdateModelPath", updateModelPath);
+        
+        // Auto-detect ONNX Runtime mode if model paths end with .onnx
+        bool useOnnxRuntime = false;
+        string useOnnxRuntimeStr = "";
+        configReader->getValue("UseOnnxRuntime", useOnnxRuntimeStr);
+        if (!useOnnxRuntimeStr.empty() && (useOnnxRuntimeStr == "true" || useOnnxRuntimeStr == "1" || useOnnxRuntimeStr == "True")) {
+            useOnnxRuntime = true;
+        } else {
+            // Auto-detect: if any model path ends with .onnx, use ONNX Runtime
+            if ((!fnetModelPath.empty() && fnetModelPath.substr(fnetModelPath.length() - 5) == ".onnx") ||
+                (!inetModelPath.empty() && inetModelPath.substr(inetModelPath.length() - 5) == ".onnx") ||
+                (!updateModelPath.empty() && updateModelPath.substr(updateModelPath.length() - 5) == ".onnx")) {
+                useOnnxRuntime = true;
+                logger->info("Auto-detected ONNX Runtime mode (model paths contain .onnx extension)");
+            }
+        }
         configReader->getValue("ModelWidth", modelWidth);
         configReader->getValue("ModelHeight", modelHeight);
 
@@ -175,6 +195,10 @@ void AppConfigReader::read(std::string configPath)
         configReader->getValue("Intrinsic_fy", intrinsic_fy);
         configReader->getValue("Intrinsic_cx", intrinsic_cx);
         configReader->getValue("Intrinsic_cy", intrinsic_cy);
+        configReader->getValue("Distortion_k1", distortion_k1);
+        configReader->getValue("Distortion_k2", distortion_k2);
+        configReader->getValue("Distortion_p1", distortion_p1);
+        configReader->getValue("Distortion_p2", distortion_p2);
         configReader->getValue("FrameWidth", frameWidth);
         configReader->getValue("FrameHeight", frameHeight);
 
@@ -239,6 +263,8 @@ void AppConfigReader::read(std::string configPath)
             logger->info("FnetModelPath \t\t= {}",  fnetModelPath);
             logger->info("InetModelPath \t\t= {}",  inetModelPath);
             logger->info("UpdateModelPath \t= {}",  updateModelPath);
+            logger->info("UseOnnxRuntime \t\t= {} (auto-detected: {})", useOnnxRuntime, 
+                        (useOnnxRuntimeStr.empty() ? "yes" : "no"));
             logger->info("ModelWidth \t\t= {}",     modelWidth);
             logger->info("ModelHeight \t\t= {}",    modelHeight);
             
@@ -260,6 +286,10 @@ void AppConfigReader::read(std::string configPath)
             logger->info("Intrinsic_fy \t= {}",     intrinsic_fy);
             logger->info("Intrinsic_cx \t= {}",     intrinsic_cx);
             logger->info("Intrinsic_cy \t= {}",     intrinsic_cy);
+            logger->info("Distortion_k1 \t= {}",     distortion_k1);
+            logger->info("Distortion_k2 \t= {}",     distortion_k2);
+            logger->info("Distortion_p1 \t= {}",     distortion_p1);
+            logger->info("Distortion_p2 \t= {}",     distortion_p2);
             logger->info("FrameWidth \t\t= {}",     frameWidth);
             logger->info("FrameHeight \t\t= {}",    frameHeight);
 
@@ -338,6 +368,7 @@ void AppConfigReader::read(std::string configPath)
         m_config->fnetModelPath   = fnetModelPath;
         m_config->inetModelPath  = inetModelPath;
         m_config->updateModelPath = updateModelPath;
+        m_config->useOnnxRuntime = useOnnxRuntime;
         m_config->modelWidth     = modelWidth;
         m_config->modelHeight    = modelHeight;
 
@@ -379,6 +410,22 @@ void AppConfigReader::read(std::string configPath)
         if (intrinsic_cy.size() > 0)
         {
             m_config->stCameraConfig.intrinsic_cy = std::stof(intrinsic_cy);
+        }
+        if (distortion_k1.size() > 0)
+        {
+            m_config->stCameraConfig.distortion_k1 = std::stof(distortion_k1);
+        }
+        if (distortion_k2.size() > 0)
+        {
+            m_config->stCameraConfig.distortion_k2 = std::stof(distortion_k2);
+        }
+        if (distortion_p1.size() > 0)
+        {
+            m_config->stCameraConfig.distortion_p1 = std::stof(distortion_p1);
+        }
+        if (distortion_p2.size() > 0)
+        {
+            m_config->stCameraConfig.distortion_p2 = std::stof(distortion_p2);
         }
         m_config->frameWidth                  = frameWidth;
         m_config->frameHeight                 = frameHeight;

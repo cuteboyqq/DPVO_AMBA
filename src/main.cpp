@@ -1371,12 +1371,60 @@ void processDPVOApp(
 		// Initialize fnet and inet models first to get their actual input dimensions
 		// This ensures DPVO is initialized with the correct dimensions
 		// Note: These temporary instances will be destroyed, and new ones created in Patchifier
+		int ht = 0, wd = 0;
+		
+#ifdef USE_ONNX_RUNTIME
+		if (config->useOnnxRuntime) {
+			// Use ONNX Runtime models
+			FNetInferenceONNX fnet(config);
+			INetInferenceONNX inet(config);
+			
+			// Get model input dimensions (models resize internally, so we use their input size)
+			ht = fnet.getInputHeight();
+			wd = fnet.getInputWidth();
+			
+			// Validate that fnet and inet have same input dimensions
+			if (ht != inet.getInputHeight() || wd != inet.getInputWidth()) {
+				logger->error("FNet and INet have different input dimensions: FNet={}x{}, INet={}x{}", 
+					ht, wd, inet.getInputHeight(), inet.getInputWidth());
+				throw std::runtime_error("FNet and INet input dimension mismatch");
+			}
+			
+			logger->info("DPVO Config: BUFFER_SIZE={}, PATCHES_PER_FRAME={}, Model input size: {}x{} (from ONNX fnet/inet models)", 
+				dpvoCfg.BUFFER_SIZE, dpvoCfg.PATCHES_PER_FRAME, ht, wd);
+			logger->info("FNet output: {}x{}, INet output: {}x{}", 
+				fnet.getOutputHeight(), fnet.getOutputWidth(),
+				inet.getOutputHeight(), inet.getOutputWidth());
+		} else {
+			// Use AMBA EazyAI models
+			FNetInference fnet(config);
+			INetInference inet(config);
+			
+			// Get model input dimensions (models resize internally, so we use their input size)
+			ht = fnet.getInputHeight();
+			wd = fnet.getInputWidth();
+			
+			// Validate that fnet and inet have same input dimensions
+			if (ht != inet.getInputHeight() || wd != inet.getInputWidth()) {
+				logger->error("FNet and INet have different input dimensions: FNet={}x{}, INet={}x{}", 
+					ht, wd, inet.getInputHeight(), inet.getInputWidth());
+				throw std::runtime_error("FNet and INet input dimension mismatch");
+			}
+			
+			logger->info("DPVO Config: BUFFER_SIZE={}, PATCHES_PER_FRAME={}, Model input size: {}x{} (from AMBA fnet/inet models)", 
+				dpvoCfg.BUFFER_SIZE, dpvoCfg.PATCHES_PER_FRAME, ht, wd);
+			logger->info("FNet output: {}x{}, INet output: {}x{}", 
+				fnet.getOutputHeight(), fnet.getOutputWidth(),
+				inet.getOutputHeight(), inet.getOutputWidth());
+		}
+#else
+		// ONNX Runtime not available, use AMBA models
 		FNetInference fnet(config);
 		INetInference inet(config);
 		
 		// Get model input dimensions (models resize internally, so we use their input size)
-		int ht = fnet.getInputHeight();
-		int wd = fnet.getInputWidth();
+		ht = fnet.getInputHeight();
+		wd = fnet.getInputWidth();
 		
 		// Validate that fnet and inet have same input dimensions
 		if (ht != inet.getInputHeight() || wd != inet.getInputWidth()) {
@@ -1385,17 +1433,19 @@ void processDPVOApp(
 			throw std::runtime_error("FNet and INet input dimension mismatch");
 		}
 		
+		logger->info("DPVO Config: BUFFER_SIZE={}, PATCHES_PER_FRAME={}, Model input size: {}x{} (from AMBA fnet/inet models)", 
+			dpvoCfg.BUFFER_SIZE, dpvoCfg.PATCHES_PER_FRAME, ht, wd);
+		logger->info("FNet output: {}x{}, INet output: {}x{}", 
+			fnet.getOutputHeight(), fnet.getOutputWidth(),
+			inet.getOutputHeight(), inet.getOutputWidth());
+#endif
+		
 		// Validate dimensions to prevent bad_array_new_length
 		if (ht < 16 || wd < 16) {
 			logger->error("Invalid model input dimensions: {}x{}. Minimum size is 16x16", ht, wd);
 			throw std::runtime_error("Invalid model input dimensions for DPVO");
 		}
 		
-		logger->info("DPVO Config: BUFFER_SIZE={}, PATCHES_PER_FRAME={}, Model input size: {}x{} (from fnet/inet models)", 
-			dpvoCfg.BUFFER_SIZE, dpvoCfg.PATCHES_PER_FRAME, ht, wd);
-		logger->info("FNet output: {}x{}, INet output: {}x{}", 
-			fnet.getOutputHeight(), fnet.getOutputWidth(),
-			inet.getOutputHeight(), inet.getOutputWidth());
 		logger->info("Note: Actual frames are {}x{}, but models will resize to {}x{} internally", 
 			config->frameHeight, config->frameWidth, ht, wd);
 

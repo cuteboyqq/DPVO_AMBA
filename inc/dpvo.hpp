@@ -2,6 +2,9 @@
 #include "patch_graph.hpp"
 #include "patchify.hpp"  // Patchifier
 #include "update.hpp"    // DPVOUpdate
+#ifdef USE_ONNX_RUNTIME
+#include "update_onnx.hpp"  // DPVOUpdateONNX
+#endif
 #include "dla_config.hpp"
 #if defined(CV28) || defined(CV28_SIMULATOR)
 #include <eazyai.h>
@@ -33,7 +36,7 @@ struct DPVOConfig {
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
           BUFFER_SIZE(36),
-          PATCH_SIZE(3),
+          PATCH_SIZE(4),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
           MAX_EDGE_AGE(360),
@@ -185,6 +188,10 @@ private:
     Patchifier m_patchifier;
     
     // ---- DPVO Update Model (optional) ----
+#ifdef USE_ONNX_RUNTIME
+    std::unique_ptr<DPVOUpdateONNX> m_updateModel_onnx;
+    bool m_useOnnxUpdateModel = false;
+#endif
     std::unique_ptr<DPVOUpdate> m_updateModel;
     int m_updateFrameCounter = 0;
     

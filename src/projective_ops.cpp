@@ -220,7 +220,15 @@ void transformWithJacobians(
         float cx_j = intr_j[2];
         float cy_j = intr_j[3];
 
-        // Get patch center coordinates
+        // Get patch coordinates from stored patches
+        // CRITICAL: These are the INITIAL coordinates from patchify (random initialization)
+        // They were stored when the patch was first extracted from frame i
+        // Now we use them to reproject the patch to frame j (target frame)
+        //
+        // Flow:
+        //   1. Frame i: Random coordinates → Extract patches → Store in m_pg.m_patches[i]
+        //   2. Frame j: Read stored coordinates from frame i → Reproject to frame j → Use for correlation
+        //
         // Use source frame i and patch_idx to index patches
         int center_idx = (P / 2) * P + (P / 2);
         int patch_base_idx = ((i * M + patch_idx) * 3 + 0) * P * P + center_idx;

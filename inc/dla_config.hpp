@@ -42,6 +42,10 @@ typedef struct
     float intrinsic_fy;   // Camera intrinsic fy (focal length Y) in pixels - highest priority
     float intrinsic_cx;   // Camera intrinsic cx (principal point X) in pixels - highest priority
     float intrinsic_cy;   // Camera intrinsic cy (principal point Y) in pixels - highest priority
+    float distortion_k1;  // Radial distortion parameter k1 (e.g., 0.07)
+    float distortion_k2;  // Radial distortion parameter k2 (e.g., -0.08)
+    float distortion_p1;  // Tangential distortion parameter p1 (e.g., 0)
+    float distortion_p2;  // Tangential distortion parameter p2 (e.g., 0)
     float centrlOffset;    // Horizontal offset distance to car center in meter unit
 } CAMERA_Config_S;
 
@@ -110,6 +114,10 @@ typedef struct
     std::string fnetModelPath;      // Path to FNet model
     std::string inetModelPath;      // Path to INet model
     std::string updateModelPath;    // Path to DPVO Update model
+    
+    // DPVO Inference Backend
+    bool useOnnxRuntime;            // If true, use ONNX Runtime instead of AMBA EazyAI
+                                    // Set to true if model paths end with .onnx
 
     // Model Input Size
     int modelWidth;

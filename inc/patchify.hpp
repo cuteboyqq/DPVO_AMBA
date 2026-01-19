@@ -12,6 +12,10 @@
 // Forward declarations
 class FNetInference;
 class INetInference;
+#ifdef USE_ONNX_RUNTIME
+class FNetInferenceONNX;
+class INetInferenceONNX;
+#endif
 
 // Patchifier class
 class Patchifier {
@@ -46,7 +50,12 @@ private:
     int m_patch_size;
     int m_DIM;
     
-    // Model inference objects
+    // Model inference objects (AMBA or ONNX)
+#ifdef USE_ONNX_RUNTIME
+    std::unique_ptr<FNetInferenceONNX> m_fnet_onnx;
+    std::unique_ptr<INetInferenceONNX> m_inet_onnx;
+    bool m_useOnnxRuntime = false;
+#endif
     std::unique_ptr<FNetInference> m_fnet;
     std::unique_ptr<INetInference> m_inet;
     

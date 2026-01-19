@@ -1,6 +1,10 @@
 #include "patchify.hpp"
 #include "fnet.hpp"
 #include "inet.hpp"
+#ifdef USE_ONNX_RUNTIME
+#include "fnet_onnx.hpp"
+#include "inet_onnx.hpp"
+#endif
 #include "correlation_kernel.hpp"
 #include "dla_config.hpp"
 #include "logger.hpp"
@@ -15,6 +19,9 @@
 // =================================================================================================
 Patchifier::Patchifier(int patch_size, int DIM)
     : m_patch_size(patch_size), m_DIM(DIM), m_fnet(nullptr), m_inet(nullptr)
+#ifdef USE_ONNX_RUNTIME
+    , m_fnet_onnx(nullptr), m_inet_onnx(nullptr), m_useOnnxRuntime(false)
+#endif
 {
 }
 
@@ -46,14 +53,47 @@ void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
     spdlog::drop("inet");
 #endif
     
-    if (fnetConfig != nullptr)
-    {
+    // Check if ONNX Runtime should be used
+#ifdef USE_ONNX_RUNTIME
+    bool useOnnx = false;
+    if (fnetConfig != nullptr && fnetConfig->useOnnxRuntime) {
+        useOnnx = true;
+    } else if (inetConfig != nullptr && inetConfig->useOnnxRuntime) {
+        useOnnx = true;
+    }
+    
+    m_useOnnxRuntime = useOnnx;
+    
+    if (useOnnx) {
+        // Use ONNX Runtime models
+        if (fnetConfig != nullptr) {
+            m_fnet_onnx = std::make_unique<FNetInferenceONNX>(fnetConfig);
+            m_fnet = nullptr;  // Clear AMBA model
+        }
+        if (inetConfig != nullptr) {
+            m_inet_onnx = std::make_unique<INetInferenceONNX>(inetConfig);
+            m_inet = nullptr;  // Clear AMBA model
+        }
+    } else {
+        // Use AMBA EazyAI models
+        if (fnetConfig != nullptr) {
+            m_fnet = std::make_unique<FNetInference>(fnetConfig);
+            m_fnet_onnx = nullptr;  // Clear ONNX model
+        }
+        if (inetConfig != nullptr) {
+            m_inet = std::make_unique<INetInference>(inetConfig);
+            m_inet_onnx = nullptr;  // Clear ONNX model
+        }
+    }
+#else
+    // ONNX Runtime not available, use AMBA models
+    if (fnetConfig != nullptr) {
         m_fnet = std::make_unique<FNetInference>(fnetConfig);
     }
-    if (inetConfig != nullptr)
-    {
+    if (inetConfig != nullptr) {
         m_inet = std::make_unique<INetInference>(inetConfig);
     }
+#endif
 }
 
 // Forward pass: fill fmap, imap, gmap, patches, clr
@@ -90,6 +130,16 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     // ------------------------------------------------
     // Generate RANDOM coords (Python RANDOM mode) - full resolution
     // ------------------------------------------------
+    // CRITICAL: These random coordinates are used ONLY ONCE to initialize patches (landmarks)
+    // They define WHERE patches are extracted from the current frame
+    // 
+    // Later, in DPVO::update(), patches are tracked across frames using REPROJECTED coordinates:
+    //   - Stored patch coordinates (from this random initialization) are read from m_pg.m_patches[i][k]
+    //   - Reprojected to target frames using camera poses
+    //   - Correlation is computed at REPROJECTED locations (not random locations!)
+    //
+    // Why random? Ensures good spatial coverage of the image, avoids bias toward specific regions
+    // Each frame gets a fresh set of landmarks initialized at random locations
     m_last_coords.resize(M * 2);
     for (int m = 0; m < M; m++)
     {
@@ -149,7 +199,14 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     // ------------------------------------------------
     // imap sampling (radius = 0) - extract patches from m_imap_buffer
     // ------------------------------------------------
-    if (m_fnet != nullptr && m_inet != nullptr) {
+#ifdef USE_ONNX_RUNTIME
+    bool models_available = (m_useOnnxRuntime && m_fnet_onnx != nullptr && m_inet_onnx != nullptr) ||
+                             (!m_useOnnxRuntime && m_fnet != nullptr && m_inet != nullptr);
+#else
+    bool models_available = (m_fnet != nullptr && m_inet != nullptr);
+#endif
+    
+    if (models_available) {
         float imap_buffer_sample_min = *std::min_element(m_imap_buffer.begin(), 
                                                           m_imap_buffer.begin() + std::min(static_cast<size_t>(100), m_imap_buffer.size()));
         float imap_buffer_sample_max = *std::max_element(m_imap_buffer.begin(), 
@@ -256,6 +313,44 @@ void Patchifier::forward(
     }
     
     // Run inference using tensor directly
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime) {
+        // Use ONNX Runtime models
+        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet_onnx->runInference (tensor)");
+        if (m_fnet_onnx && !m_fnet_onnx->runInference(imgTensor, m_fmap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] fnet_onnx->runInference (tensor) failed");
+            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+        } else {
+            if (logger_patch) logger_patch->info("[Patchifier] fnet_onnx->runInference (tensor) successful");
+        }
+        
+        if (logger_patch) logger_patch->info("[Patchifier] About to call inet_onnx->runInference (tensor)");
+        if (m_inet_onnx && !m_inet_onnx->runInference(imgTensor, m_imap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] inet_onnx->runInference (tensor) failed");
+            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+        } else {
+            if (logger_patch) logger_patch->info("[Patchifier] inet_onnx->runInference (tensor) successful");
+        }
+    } else {
+        // Use AMBA EazyAI models
+        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+        if (m_fnet && !m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
+            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+        } else {
+            if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
+        }
+        
+        if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+        if (m_inet && !m_inet->runInference(imgTensor, m_imap_buffer.data())) {
+            if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
+            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+        } else {
+            if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+        }
+    }
+#else
+    // ONNX Runtime not available, use AMBA models
     if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
     if (!m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
         if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
@@ -271,6 +366,7 @@ void Patchifier::forward(
     } else {
         if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
     }
+#endif
     
     // Copy fmap buffer to output
     std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
@@ -293,6 +389,11 @@ void Patchifier::forward(
 
 int Patchifier::getOutputHeight() const
 {
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getOutputHeight();
+    }
+#endif
     if (m_fnet != nullptr) {
         return m_fnet->getOutputHeight();
     }
@@ -301,6 +402,11 @@ int Patchifier::getOutputHeight() const
 
 int Patchifier::getOutputWidth() const
 {
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getOutputWidth();
+    }
+#endif
     if (m_fnet != nullptr) {
         return m_fnet->getOutputWidth();
     }
