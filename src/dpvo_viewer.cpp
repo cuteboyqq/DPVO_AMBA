@@ -396,8 +396,8 @@ void DPVOViewer::drawPoses()
     glLineWidth(2.0f);
     
     // Pyramid parameters
-    const float pyramid_base_size = 0.05f;  // Size of pyramid base
-    const float pyramid_height = 0.1f;      // Distance from tip to base
+    const float pyramid_base_size = 0.01f;  // Size of pyramid base (reduced for better visibility)
+    const float pyramid_height = 0.02f;      // Distance from tip to base (reduced for better visibility)
     
     // Get pointer to transformation matrices (column-major, 16 floats per matrix)
     float* tptr = m_poseMatrices.data();
@@ -907,8 +907,8 @@ void DPVOViewer::drawPoses_fake()
         }
         
         // Pyramid parameters
-        const float pyramid_base_size = 0.05f;  // Size of pyramid base (adjust for visibility)
-        const float pyramid_height = 0.1f;      // Distance from tip to base
+        const float pyramid_base_size = 0.01f;  // Size of pyramid base (reduced for better visibility)
+        const float pyramid_height = 0.02f;      // Distance from tip to base (reduced for better visibility)
         
         // Camera position (tip of pyramid)
         Eigen::Vector3f tip(cam_x, cam_y, cam_z);

@@ -27,9 +27,20 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     // Basic setup: find number of pose variables
     // ---------------------------------------------------------
+    // CRITICAL FIX: Match Python BA exactly!
+    // Python: n = max(ii.max().item(), jj.max().item()) + 1
+    //   - ii = source frame index
+    //   - jj = target frame index
+    // In C++:
+    //   - m_pg.m_ii[e] = patch index mapping (NOT frame index!)
+    //   - m_pg.m_jj[e] = target frame index
+    //   - Source frame i is extracted from kk: i = kk[e] / M
+    // So we need: n = max(max(i from kk), max(jj)) + 1
     int n = 0;
     for (int e = 0; e < num_active; e++) {
-        n = std::max(n, std::max(m_pg.m_ii[e], m_pg.m_jj[e]) + 1);
+        int i = m_pg.m_kk[e] / M;  // source frame index (extracted from kk, matching reproject logic)
+        int j = m_pg.m_jj[e];      // target frame index
+        n = std::max(n, std::max(i, j) + 1);
     }
 
     // ---------------------------------------------------------
@@ -285,12 +296,21 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     // Step 5: Fix first pose (gauge freedom)
     // ---------------------------------------------------------
+    // CRITICAL FIX: Match Python BA exactly!
+    // Python: ii = ii - fixedp; jj = jj - fixedp
+    //   - ii = source frame index
+    //   - jj = target frame index
+    // In C++:
+    //   - m_pg.m_ii[e] = patch index mapping (NOT frame index!)
+    //   - Source frame i must be extracted from kk: i = kk[e] / M
+    //   - m_pg.m_jj[e] = target frame index
     std::vector<int> ii_new(num_active);
     std::vector<int> jj_new(num_active);
     
     for (int e = 0; e < num_active; e++) {
-        ii_new[e] = m_pg.m_ii[e] - fixedp;
-        jj_new[e] = m_pg.m_jj[e] - fixedp;
+        int i_source = m_pg.m_kk[e] / M;  // Extract source frame index from kk (matching reproject logic)
+        ii_new[e] = i_source - fixedp;     // Adjust source frame index for fixed poses
+        jj_new[e] = m_pg.m_jj[e] - fixedp; // Adjust target frame index for fixed poses
     }
     
     int n_adjusted = n - fixedp; // number of pose variables after fixing
