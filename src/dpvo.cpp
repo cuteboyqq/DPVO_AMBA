@@ -1993,13 +1993,22 @@ void DPVO::reproject(
         valid_ptr = valid_temp.data();
     }
 
-    // Call transformWithJacobians to perform the actual reprojection
-    // This function:
+    // ========================================================================
+    // CRITICAL: Call transformWithJacobians to perform the actual reprojection
+    // ========================================================================
+    // This is the core reprojection function that:
     //   1. Extracts patches from m_pg.m_patches using indices (ii, jj, kk)
     //   2. Inverse projects 2D pixels to 3D using inverse depth from patches
     //   3. Transforms 3D points from frame i to frame j using SE3 poses
     //   4. Projects 3D points to 2D in target frame using intrinsics
-    //   5. Computes Jacobians for bundle adjustment (if buffers provided)
+    //   5. Computes Jacobians for bundle adjustment (always computed, even if not used)
+    //
+    // NOTE: transformWithJacobians is ALWAYS called here, even when Jacobians are not
+    //       needed by the caller. Temporary buffers are allocated if Ji/Jj/Jz/valid
+    //       pointers are nullptr, ensuring the function always works correctly.
+    //
+    // This ensures consistent reprojection behavior throughout the codebase.
+    // ========================================================================
     pops::transformWithJacobians(
         m_pg.m_poses,         // SE3 poses [N] - camera poses for all frames
         patches_flat,         // Flattened patches [N*M*3*P*P] - 3D patches with inverse depth

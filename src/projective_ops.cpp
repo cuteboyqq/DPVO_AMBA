@@ -172,6 +172,48 @@ void transform(
 //   - Output coords: At 1/4 resolution (matching feature map resolution)
 //   - This matches Python behavior where intrinsics are divided by RES=4
 // -----------------------------------------------------------------------------
+// ============================================================================
+// transformWithJacobians: Reproject patches from source frame i to target frame j
+//                         and compute Jacobians for bundle adjustment
+// ============================================================================
+// 
+// ALGORITHM OVERVIEW:
+// -------------------
+// This function implements the core reprojection operation in DPVO:
+//   1. Read patch coordinates and inverse depth from source frame i
+//   2. Inverse project to get 3D point in normalized camera coordinates
+//   3. Transform 3D point from frame i to frame j using SE3 poses
+//   4. Project transformed 3D point to image coordinates in frame j
+//   5. Compute Jacobians w.r.t. poses (i, j) and inverse depth for optimization
+//
+// MATHEMATICAL FLOW:
+// ------------------
+// Step 1: Inverse Projection (2D → 3D normalized)
+//   Input:  (px, py) = pixel coordinates in frame i (at 1/4 resolution)
+//           pd = inverse depth (1/depth)
+//   Output: [X0, Y0, Z0=1, W0=pd] in normalized camera coordinates
+//   Formula: X0 = (px - cx) / fx, Y0 = (py - cy) / fy, Z0 = 1, W0 = pd
+//
+// Step 2: SE3 Transform (3D point transformation)
+//   Input:  Point [X0, Y0, Z0, W0] in frame i's camera coordinates
+//           Ti = pose of frame i (world-to-camera)
+//           Tj = pose of frame j (world-to-camera)
+//   Output: [X1, Y1, Z1, W1=W0] in frame j's camera coordinates
+//   Formula: Gij = Tj * Ti^-1  (transform from frame i to frame j)
+//            [X1, Y1, Z1] = Gij.R * [X0, Y0, Z0] + Gij.t * W0
+//            W1 = W0 (homogeneous coordinate unchanged)
+//
+// Step 3: Forward Projection (3D → 2D)
+//   Input:  [X1, Y1, Z1] in frame j's camera coordinates
+//   Output: (u, v) = pixel coordinates in frame j
+//   Formula: depth = 1/Z1, u = fx * (X1/Z1) + cx, v = fy * (Y1/Z1) + cy
+//
+// Step 4: Jacobian Computation
+//   Ji = Jacobian of (u,v) w.r.t. pose i (6 parameters: 3 translation + 3 rotation)
+//   Jj = Jacobian of (u,v) w.r.t. pose j (6 parameters)
+//   Jz = Jacobian of (u,v) w.r.t. inverse depth (1 parameter)
+//
+// ============================================================================
 void transformWithJacobians(
     const SE3* poses,
     const float* patches_flat,
@@ -183,12 +225,18 @@ void transformWithJacobians(
     int M,
     int P,
     float* coords_out,      // Output: [num_edges, 2, P, P] - Reprojected (u, v) at 1/4 resolution
-    float* Ji_out,          // [num_edges, 2, P, P, 6] flattened
-    float* Jj_out,          // [num_edges, 2, P, P, 6] flattened
-    float* Jz_out,          // [num_edges, 2, P, P, 1] flattened
-    float* valid_out)       // [num_edges, P, P] flattened
+    float* Ji_out,          // [num_edges, 2, P, P, 6] flattened - Jacobian w.r.t. pose i
+    float* Jj_out,          // [num_edges, 2, P, P, 6] flattened - Jacobian w.r.t. pose j
+    float* Jz_out,          // [num_edges, 2, P, P, 1] flattened - Jacobian w.r.t. inverse depth
+    float* valid_out)       // [num_edges, P, P] flattened - Validity mask (1=valid, 0=invalid)
 {
+    // ========================================================================
+    // MAIN LOOP: Process each edge (connection between patch and frame)
+    // ========================================================================
     for (int e = 0; e < num_edges; e++) {
+        // ====================================================================
+        // STEP 0: Extract frame and patch indices
+        // ====================================================================
         // C++ DPVO semantics (different from Python!):
         //   ii[e] = m_pg.m_index[frame][patch] (patch index mapping, NOT frame index)
         //   jj[e] = target frame index
@@ -200,27 +248,46 @@ void transformWithJacobians(
         //   kk = patch index (for patches[:,kk])
         //
         // CRITICAL: In C++, we extract source frame from kk, NOT from ii!
-        int j = jj[e];  // target frame index
+        int j = jj[e];  // target frame index (where we want to reproject to)
         int k = kk[e];  // global patch index (frame * M + patch_idx)
         
         // Extract source frame and patch from global patch index k
-        int i = k / M;  // source frame index (extracted from kk)
-        int patch_idx = k % M;  // patch index within frame
+        int i = k / M;  // source frame index (where patch was originally extracted)
+        int patch_idx = k % M;  // patch index within frame (0 to M-1)
         
-        // Transform from frame i to frame j
+        // ====================================================================
+        // STEP 1: Get poses and compute relative transform Gij
+        // ====================================================================
+        // Ti = pose of frame i (world-to-camera transformation)
+        // Tj = pose of frame j (world-to-camera transformation)
+        // Gij = transform from frame i's camera coordinates to frame j's camera coordinates
+        // 
+        // Mathematical derivation:
+        //   Point in world: P_world
+        //   Point in frame i: P_i = Ti * P_world  =>  P_world = Ti^-1 * P_i
+        //   Point in frame j: P_j = Tj * P_world = Tj * (Ti^-1 * P_i) = (Tj * Ti^-1) * P_i
+        //   Therefore: Gij = Tj * Ti^-1
         const SE3& Ti = poses[i];
         const SE3& Tj = poses[j];
         SE3 Gij = Tj * Ti.inverse();  // Transform from frame i to frame j
 
-        const float* intr_i = &intrinsics_flat[i * 4]; // fx,fy,cx,cy (source frame intrinsics)
-        const float* intr_j = &intrinsics_flat[j * 4];  // fx,fy,cx,cy (target frame intrinsics)
+        // ====================================================================
+        // STEP 2: Get camera intrinsics for both frames
+        // ====================================================================
+        // Intrinsics format: [fx, fy, cx, cy] (at 1/4 resolution, already scaled)
+        // fx, fy = focal lengths in pixels
+        // cx, cy = principal point (image center) in pixels
+        const float* intr_i = &intrinsics_flat[i * 4]; // Source frame intrinsics
+        const float* intr_j = &intrinsics_flat[j * 4];  // Target frame intrinsics
         
-        float fx_j = intr_j[0];
-        float fy_j = intr_j[1];
-        float cx_j = intr_j[2];
-        float cy_j = intr_j[3];
+        float fx_j = intr_j[0];  // Focal length X for target frame
+        float fy_j = intr_j[1];  // Focal length Y for target frame
+        float cx_j = intr_j[2];  // Principal point X for target frame
+        float cy_j = intr_j[3];  // Principal point Y for target frame
 
-        // Get patch coordinates from stored patches
+        // ====================================================================
+        // STEP 3: Read patch data from stored patches
+        // ====================================================================
         // CRITICAL: These are the INITIAL coordinates from patchify (random initialization)
         // They were stored when the patch was first extracted from frame i
         // Now we use them to reproject the patch to frame j (target frame)
@@ -229,8 +296,13 @@ void transformWithJacobians(
         //   1. Frame i: Random coordinates → Extract patches → Store in m_pg.m_patches[i]
         //   2. Frame j: Read stored coordinates from frame i → Reproject to frame j → Use for correlation
         //
+        // Patch storage format: [num_frames, num_patches, 3, P, P]
+        //   Channel 0: X coordinates (px values)
+        //   Channel 1: Y coordinates (py values)
+        //   Channel 2: Inverse depth (pd values)
+        //
         // Use source frame i and patch_idx to index patches
-        int center_idx = (P / 2) * P + (P / 2);
+        int center_idx = (P / 2) * P + (P / 2);  // Center pixel index in P×P patch
         int patch_base_idx = ((i * M + patch_idx) * 3 + 0) * P * P + center_idx;
         
         // Validate patch index bounds (safety check - reasonable bounds)
@@ -255,11 +327,16 @@ void transformWithJacobians(
             continue;  // Skip this edge
         }
         
-        float px = patches_flat[patch_base_idx];
-        float py = patches_flat[patch_base_idx + P * P];  // Channel 1 offset
-        float pd = patches_flat[patch_base_idx + 2 * P * P];  // Channel 2 offset
-        
-        // Validate patch data (check for NaN/Inf and reasonable depth)
+        // Read patch center coordinates and inverse depth
+        float px = patches_flat[patch_base_idx];                    // X coordinate at patch center
+        float py = patches_flat[patch_base_idx + P * P];            // Y coordinate at patch center (Channel 1 offset)
+        float pd = patches_flat[patch_base_idx + 2 * P * P];        // Inverse depth at patch center (Channel 2 offset)
+
+        // ====================================================================
+        // STEP 4: Validate patch data
+        // ====================================================================
+        // Check for NaN/Inf and reasonable depth values
+        // Invalid data indicates corrupted patches or frames that were removed
         if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pd) || pd <= 0.0f || pd > 100.0f) {
             // Invalid patch data - mark as invalid
             for (int y = 0; y < P; y++) {
@@ -281,29 +358,57 @@ void transformWithJacobians(
             continue;  // Skip this edge
         }
 
-        // Inverse projection at center
-        float X0 = (px - intr_i[2]) / intr_i[0];
-        float Y0 = (py - intr_i[3]) / intr_i[1];
-        float Z0 = 1.0f;
-        float W0 = pd; // inverse depth
+        // ====================================================================
+        // STEP 5: Inverse projection at patch center (for Jacobian computation)
+        // ====================================================================
+        // Convert pixel coordinates (px, py) to normalized camera coordinates
+        // This gives us a 3D point in the normalized image plane (Z=1)
+        //
+        // Formula:
+        //   X0 = (px - cx) / fx   (normalized X coordinate)
+        //   Y0 = (py - cy) / fy   (normalized Y coordinate)
+        //   Z0 = 1                 (normalized depth, arbitrary scale)
+        //   W0 = pd                (inverse depth, used for 3D reconstruction)
+        float X0 = (px - intr_i[2]) / intr_i[0];  // Normalized X
+        float Y0 = (py - intr_i[3]) / intr_i[1];  // Normalized Y
+        float Z0 = 1.0f;                           // Normalized Z (arbitrary scale)
+        float W0 = pd;                              // Inverse depth (1/actual_depth)
 
-        // Transform point: X1 = Gij * X0 (SE3 action on homogeneous coordinates)
-        // SE3 act4 formula: X1 = R * [X, Y, Z] + t * W
-        Eigen::Vector3f p0_vec(X0, Y0, Z0);
-        Eigen::Vector3f p1_vec = Gij.R() * p0_vec + Gij.t * W0;
+        // ====================================================================
+        // STEP 6: Transform 3D point from frame i to frame j
+        // ====================================================================
+        // Apply SE3 transformation: X1 = Gij * X0
+        // SE3 acts on homogeneous coordinates [X, Y, Z, W] as:
+        //   [X1, Y1, Z1] = R * [X0, Y0, Z0] + t * W0
+        //   W1 = W0 (homogeneous coordinate unchanged)
+        //
+        // This is NOT the same as: R * [X0/W0, Y0/W0, Z0/W0] + t
+        // The W coordinate (inverse depth) is used directly in the transformation!
+        Eigen::Vector3f p0_vec(X0, Y0, Z0);  // [X, Y, Z] part of homogeneous coordinates
+        Eigen::Vector3f p1_vec = Gij.R() * p0_vec + Gij.t * W0;  // Transform: R*[X,Y,Z] + t*W
         
-        // For Jacobian computation, we need the transformed point
-        float X1 = p1_vec.x();
-        float Y1 = p1_vec.y();
-        float Z1 = p1_vec.z();
-        float H1 = W0; // homogeneous coordinate (inverse depth)
+        // Extract transformed coordinates
+        float X1 = p1_vec.x();  // Transformed X in frame j
+        float Y1 = p1_vec.y();  // Transformed Y in frame j
+        float Z1 = p1_vec.z();  // Transformed Z in frame j (actual depth)
+        float H1 = W0;           // Homogeneous coordinate (inverse depth, unchanged)
 
-        // Project
-        float z = std::max(Z1, 0.1f);
-        float d = 1.0f / z;
+        // ====================================================================
+        // STEP 7: Forward projection (for Jacobian computation at center)
+        // ====================================================================
+        // Project 3D point [X1, Y1, Z1] back to 2D pixel coordinates [u, v]
+        //
+        // Formula:
+        //   depth = Z1 (actual depth in frame j)
+        //   u = fx * (X1 / Z1) + cx   (X pixel coordinate)
+        //   v = fy * (Y1 / Z1) + cy   (Y pixel coordinate)
+        //
+        // Clamp Z to prevent division by zero or negative depths
+        float z = std::max(Z1, 0.1f);  // Clamp depth to minimum 0.1
+        float d = 1.0f / z;             // Inverse depth in frame j
 
-        float u = fx_j * (d * X1) + cx_j;
-        float v = fy_j * (d * Y1) + cy_j;
+        float u = fx_j * (d * X1) + cx_j;  // X pixel coordinate
+        float v = fy_j * (d * Y1) + cy_j;  // Y pixel coordinate
 
         // Diagnostic logging setup
         auto logger = spdlog::get("dpvo");
@@ -389,18 +494,25 @@ void transformWithJacobians(
                                  X1_pix, Y1_pix, Z1_pix, H1_pix);
                 }
 
-                // Project
+                // ============================================================
+                // STEP 10: Forward projection for this pixel
+                // ============================================================
+                // Project 3D point [X1_pix, Y1_pix, Z1_pix] to 2D pixel coordinates
+                //
                 // Check if point is behind camera (Z < 0.1) - reject if so
+                // Points behind camera indicate incorrect poses or transform
                 bool is_valid = (Z1_pix >= 0.1f);
                 
                 float u_pix, v_pix;
                 if (is_valid) {
-                    float z_pix = Z1_pix;
-                    float d_pix = 1.0f / z_pix;
+                    // Compute depth and inverse depth
+                    float z_pix = Z1_pix;      // Actual depth in frame j
+                    float d_pix = 1.0f / z_pix; // Inverse depth
 
-                    // Compute projection
-                    float u_pix_computed = fx_j * (d_pix * X1_pix) + cx_j;
-                    float v_pix_computed = fy_j * (d_pix * Y1_pix) + cy_j;
+                    // Project to pixel coordinates using pinhole camera model
+                    // Formula: u = fx * (X/Z) + cx, v = fy * (Y/Z) + cy
+                    float u_pix_computed = fx_j * (d_pix * X1_pix) + cx_j;  // X pixel coordinate
+                    float v_pix_computed = fy_j * (d_pix * Y1_pix) + cy_j;  // Y pixel coordinate
                     
                     // Check if computed values are finite before bounds check
                     bool computed_is_finite = std::isfinite(u_pix_computed) && std::isfinite(v_pix_computed);
@@ -478,76 +590,143 @@ void transformWithJacobians(
             }
         }
 
-        // Compute Jacobians at patch center only
-        // Python computes at center: X1[...,p//2,p//2,:]
-        float X = X1;
-        float Y = Y1;
-        float Z = Z1;
-        float H = H1;
+        // ====================================================================
+        // STEP 11: Compute Jacobians at patch center
+        // ====================================================================
+        // Jacobians tell us how pixel coordinates (u, v) change when we perturb:
+        //   - Pose i (Ji): How does changing frame i's pose affect reprojection?
+        //   - Pose j (Jj): How does changing frame j's pose affect reprojection?
+        //   - Inverse depth (Jz): How does changing depth affect reprojection?
+        //
+        // These are used in bundle adjustment to compute gradients for optimization
+        //
+        // Use transformed point at patch center for Jacobian computation
+        float X = X1;  // Transformed X coordinate
+        float Y = Y1;  // Transformed Y coordinate
+        float Z = Z1;  // Transformed Z coordinate (depth)
+        float H = H1;  // Homogeneous coordinate (inverse depth)
 
-        // Depth check for Jacobian computation
+        // Depth check for Jacobian computation (avoid division by zero)
         float d_jac = 0.0f;
         if (std::abs(Z) > 0.2f) {
-            d_jac = 1.0f / Z;
+            d_jac = 1.0f / Z;  // Inverse depth for Jacobian
         }
 
-        // Ja: Jacobian of transformed point w.r.t. SE3 parameters [4, 6]
-        // For SE3: [H, o, o, o, Z, -Y] for first row, etc.
+        // ====================================================================
+        // STEP 11a: Ja = Jacobian of transformed point w.r.t. SE3 parameters
+        // ====================================================================
+        // Ja[4, 6]: How does [X1, Y1, Z1, W1] change when we perturb SE3 parameters?
+        // SE3 has 6 parameters: [tx, ty, tz, rx, ry, rz] (3 translation + 3 rotation)
+        //
+        // Formula from SE3 Lie algebra:
+        //   d[X1, Y1, Z1, W1] / d[tx, ty, tz, rx, ry, rz] = Ja
+        //
+        // Structure:
+        //   Row 0 (X): [H, 0, 0, 0, Z, -Y]  (derivative w.r.t. [tx, ty, tz, rx, ry, rz])
+        //   Row 1 (Y): [0, H, 0, -Z, 0, X]
+        //   Row 2 (Z): [0, 0, H, Y, -X, 0]
+        //   Row 3 (W): [0, 0, 0, 0, 0, 0]  (W is unchanged by SE3)
         Eigen::Matrix<float, 4, 6> Ja;
         Ja.setZero();
-        Ja(0, 0) = H;  Ja(0, 4) = Z;   Ja(0, 5) = -Y;
-        Ja(1, 1) = H;  Ja(1, 3) = -Z;  Ja(1, 5) = X;
-        Ja(2, 2) = H;  Ja(2, 3) = Y;   Ja(2, 4) = -X;
-        // Row 3 (homogeneous) is all zeros
+        Ja(0, 0) = H;  Ja(0, 4) = Z;   Ja(0, 5) = -Y;  // dX/d[tx, ty, tz, rx, ry, rz]
+        Ja(1, 1) = H;  Ja(1, 3) = -Z;  Ja(1, 5) = X;   // dY/d[tx, ty, tz, rx, ry, rz]
+        Ja(2, 2) = H;  Ja(2, 3) = Y;   Ja(2, 4) = -X;  // dZ/d[tx, ty, tz, rx, ry, rz]
+        // Row 3 (W) is all zeros (W is unchanged)
 
-        // Jp: Jacobian of projection w.r.t. 3D point [2, 4]
+        // ====================================================================
+        // STEP 11b: Jp = Jacobian of projection w.r.t. 3D point
+        // ====================================================================
+        // Jp[2, 4]: How do pixel coordinates (u, v) change when we perturb [X, Y, Z, W]?
+        //
+        // From projection formula: u = fx * (X/Z) + cx, v = fy * (Y/Z) + cy
+        //   du/dX = fx/Z = fx * d_jac
+        //   du/dZ = -fx * X / Z^2 = -fx * X * d_jac^2
+        //   dv/dY = fy/Z = fy * d_jac
+        //   dv/dZ = -fy * Y / Z^2 = -fy * Y * d_jac^2
+        //   du/dY = dv/dX = du/dW = dv/dW = 0
         Eigen::Matrix<float, 2, 4> Jp;
         Jp.setZero();
-        Jp(0, 0) = fx_j * d_jac;
-        Jp(0, 2) = -fx_j * X * d_jac * d_jac;
-        Jp(1, 1) = fy_j * d_jac;
-        Jp(1, 2) = -fy_j * Y * d_jac * d_jac;
+        Jp(0, 0) = fx_j * d_jac;                          // du/dX
+        Jp(0, 2) = -fx_j * X * d_jac * d_jac;            // du/dZ
+        Jp(1, 1) = fy_j * d_jac;                          // dv/dY
+        Jp(1, 2) = -fy_j * Y * d_jac * d_jac;            // dv/dZ
 
-        // Jj: Jacobian w.r.t. pose j = Jp @ Ja [2, 6]
+        // ====================================================================
+        // STEP 11c: Jj = Jacobian w.r.t. pose j
+        // ====================================================================
+        // Jj[2, 6]: How do pixel coordinates change when we perturb pose j?
+        // Computed by chain rule: Jj = Jp * Ja
+        //   Jj = (d[u,v]/d[X,Y,Z,W]) * (d[X,Y,Z,W]/d[pose_j_params])
         Eigen::Matrix<float, 2, 6> Jj = Jp * Ja;
 
-        // Ji: Jacobian w.r.t. pose i = -Gij.adjT(Jj) [2, 6]
+        // ====================================================================
+        // STEP 11d: Ji = Jacobian w.r.t. pose i
+        // ====================================================================
+        // Ji[2, 6]: How do pixel coordinates change when we perturb pose i?
+        // Since Gij = Tj * Ti^-1, changing Ti affects Gij through its inverse
+        // We use the adjoint transpose: Ji = -Gij.adjointT(Jj)
+        // The negative sign comes from the inverse in Gij = Tj * Ti^-1
         Eigen::Matrix<float, 2, 6> Ji = -Gij.adjointT(Jj);
 
-        // Jz: Jacobian w.r.t. inverse depth = Jp @ Gij.matrix()[...,:,3:] [2, 1]
-        // Gij.matrix()[...,:,3:] is the translation column [4, 1]
+        // ====================================================================
+        // STEP 11e: Jz = Jacobian w.r.t. inverse depth
+        // ====================================================================
+        // Jz[2, 1]: How do pixel coordinates change when we perturb inverse depth?
+        // Inverse depth affects the transformation through the W coordinate:
+        //   [X1, Y1, Z1] = R * [X0, Y0, Z0] + t * W0
+        // So d[X1, Y1, Z1]/dW0 = t (translation part of Gij)
+        //
+        // Then: Jz = Jp * [tx, ty, tz, 0]^T = Jp * translation_column_of_Gij
         Eigen::Matrix4f Gij_mat = Gij.matrix();
-        Eigen::Vector4f t_col = Gij_mat.col(3); // translation column
+        Eigen::Vector4f t_col = Gij_mat.col(3);  // Translation column [tx, ty, tz, 1]
         Eigen::Matrix<float, 2, 1> Jz = Jp * t_col;
 
-        // Store Jacobians for all patch pixels (currently using center values)
-        // TODO: Could compute per-pixel Jacobians if needed
+        // ====================================================================
+        // STEP 12: Store Jacobians for all patch pixels
+        // ====================================================================
+        // NOTE: Currently using center values for all pixels (approximation)
+        // TODO: Could compute per-pixel Jacobians if needed for higher accuracy
+        //
+        // Storage format:
+        //   Ji_out: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose i
+        //   Jj_out: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose j
+        //   Jz_out: [num_edges, 2, P, P, 1] - Jacobian w.r.t. inverse depth
+        //
+        // Dimension breakdown:
+        //   num_edges = number of edges (connections between patches and frames)
+        //   2 = [u, v] pixel coordinates
+        //   P, P = patch size (e.g., 3x3)
+        //   6 = SE3 parameters [tx, ty, tz, rx, ry, rz]
+        //   1 = inverse depth parameter
         for (int y = 0; y < P; y++) {
             for (int x = 0; x < P; x++) {
-                int idx = y * P + x;
-                int base = e * 2 * P * P * 6; // [num_edges, 2, P, P, 6]
+                int idx = y * P + x;  // Linear index within patch
+                int base = e * 2 * P * P * 6;  // Base index for this edge's Jacobians
                 
-                // Ji: [num_edges, 2, P, P, 6]
-                for (int c = 0; c < 2; c++) {
-                    for (int param = 0; param < 6; param++) {
+                // Store Ji: Jacobian w.r.t. pose i [2, 6]
+                // Format: [num_edges, 2, P, P, 6]
+                for (int c = 0; c < 2; c++) {  // c=0 for u, c=1 for v
+                    for (int param = 0; param < 6; param++) {  // 6 SE3 parameters
                         int ji_idx = base + c * P * P * 6 + idx * 6 + param;
-                        Ji_out[ji_idx] = Ji(c, param);
+                        Ji_out[ji_idx] = Ji(c, param);  // Copy from computed Jacobian
                     }
                 }
                 
-                // Jj: [num_edges, 2, P, P, 6]
-                for (int c = 0; c < 2; c++) {
-                    for (int param = 0; param < 6; param++) {
+                // Store Jj: Jacobian w.r.t. pose j [2, 6]
+                // Format: [num_edges, 2, P, P, 6]
+                for (int c = 0; c < 2; c++) {  // c=0 for u, c=1 for v
+                    for (int param = 0; param < 6; param++) {  // 6 SE3 parameters
                         int jj_idx = base + c * P * P * 6 + idx * 6 + param;
-                        Jj_out[jj_idx] = Jj(c, param);
+                        Jj_out[jj_idx] = Jj(c, param);  // Copy from computed Jacobian
                     }
                 }
                 
-                // Jz: [num_edges, 2, P, P, 1]
-                int jz_base = e * 2 * P * P * 1;
-                for (int c = 0; c < 2; c++) {
+                // Store Jz: Jacobian w.r.t. inverse depth [2, 1]
+                // Format: [num_edges, 2, P, P, 1]
+                int jz_base = e * 2 * P * P * 1;  // Base index for Jz (different size)
+                for (int c = 0; c < 2; c++) {  // c=0 for u, c=1 for v
                     int jz_idx = jz_base + c * P * P * 1 + idx * 1;
-                    Jz_out[jz_idx] = Jz(c, 0);
+                    Jz_out[jz_idx] = Jz(c, 0);  // Copy from computed Jacobian (only 1 parameter)
                 }
             }
         }
