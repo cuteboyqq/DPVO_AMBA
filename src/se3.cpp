@@ -1,4 +1,5 @@
 #include "se3.h"
+#include <cmath>
 
 // -----------------------------
 // Constructors
@@ -44,27 +45,81 @@ SE3 SE3::inverse() const {
 // -----------------------------
 // SE3 composition
 // -----------------------------
+// SE3 composition: T1 * T2 = (R1 * R2, R1 * t2 + t1)
+// where T1 = (R1, t1) and T2 = (R2, t2)
 SE3 SE3::operator*(const SE3& other) const {
     SE3 out;
     out.q = q * other.q;
-    out.t = t + q * other.R() * other.t;
+    out.t = t + R() * other.t;  // FIXED: Use R() (rotation matrix) not q (quaternion)
     return out;
 }
 
 // -----------------------------
-// Retract
+// Retract: retr(dx) = Exp(dx) * this
 // -----------------------------
+// Python: retr(self, a) = Exp(a) * X
+// This implements the exponential map for SE3, matching lietorch
 SE3 SE3::retr(const Eigen::Matrix<float,6,1>& dx) const {
-    Eigen::Vector3f dR = dx.head<3>();
-    Eigen::Vector3f dt = dx.tail<3>();
-
-    // Small-angle approx: R_new ≈ R * (I + [dR]_x)
-    // Note: This might not be perfectly orthogonal, so we normalize the quaternion in the constructor
-    Eigen::Matrix3f R_new = R() * (Eigen::Matrix3f::Identity() + skew(dR));
-    Eigen::Vector3f t_new = t + dt;
-
-    SE3 result(R_new, t_new);
-    // Double-check normalization (should already be done in constructor, but be safe)
+    Eigen::Vector3f dR = dx.head<3>();  // Rotation in Lie algebra so(3)
+    Eigen::Vector3f dt = dx.tail<3>();  // Translation update
+    
+    // Compute exponential map for rotation: Exp(dR) using Rodrigues' formula
+    // This matches Python lietorch implementation (not small-angle approximation!)
+    float theta = dR.norm();
+    Eigen::Matrix3f dR_skew = skew(dR);
+    
+    // Precompute sin/cos once for both rotation and translation parts
+    float sin_theta, cos_theta;
+    if (theta < 1e-6f) {
+        // Small angle: use Taylor expansion to avoid division by zero
+        sin_theta = theta;  // sin(θ) ≈ θ for small θ
+        cos_theta = 1.0f - 0.5f * theta * theta;  // cos(θ) ≈ 1 - θ²/2
+    } else {
+        sin_theta = std::sin(theta);
+        cos_theta = std::cos(theta);
+    }
+    
+    Eigen::Matrix3f dR_exp;  // Exp(dR) rotation matrix
+    if (theta < 1e-6f) {
+        // Small angle: use Taylor expansion to avoid division by zero
+        // Exp(dR) ≈ I + [dR]_× + (1/2)[dR]_×²
+        dR_exp = Eigen::Matrix3f::Identity() + dR_skew + 0.5f * dR_skew * dR_skew;
+    } else {
+        // Rodrigues' formula: Exp(dR) = I + sin(θ)/θ * [dR]_× + (1-cos(θ))/θ² * [dR]_×²
+        float sin_theta_over_theta = sin_theta / theta;
+        float one_minus_cos_over_theta2 = (1.0f - cos_theta) / (theta * theta);
+        
+        dR_exp = Eigen::Matrix3f::Identity() 
+                 + sin_theta_over_theta * dR_skew
+                 + one_minus_cos_over_theta2 * dR_skew * dR_skew;
+    }
+    
+    // Compute exponential map for translation part
+    // For SE3: Exp([dR, dt]) = [Exp(dR), V * dt]
+    // where V = I + (1-cos(θ))/θ² * [dR]_× + (θ - sin(θ))/θ³ * [dR]_×²
+    Eigen::Matrix3f V;
+    if (theta < 1e-6f) {
+        // Small angle: V ≈ I + (1/2)[dR]_×
+        V = Eigen::Matrix3f::Identity() + 0.5f * dR_skew;
+    } else {
+        float one_minus_cos_over_theta2 = (1.0f - cos_theta) / (theta * theta);
+        float theta_minus_sin_over_theta3 = (theta - sin_theta) / (theta * theta * theta);
+        
+        V = Eigen::Matrix3f::Identity()
+            + one_minus_cos_over_theta2 * dR_skew
+            + theta_minus_sin_over_theta3 * dR_skew * dR_skew;
+    }
+    
+    // Compute delta SE3: delta = Exp(dx)
+    Eigen::Matrix3f delta_R = dR_exp;
+    Eigen::Vector3f delta_t = V * dt;
+    
+    // Compose: result = delta * this = Exp(dx) * this
+    // This matches Python: retr(self, a) = Exp(a) * X
+    SE3 delta(delta_R, delta_t);
+    SE3 result = delta * (*this);
+    
+    // Ensure quaternion is normalized (numerical safety)
     result.q.normalize();
     return result;
 }

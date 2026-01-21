@@ -234,6 +234,11 @@ private:
     // This allows the viewer to show the full trajectory, not just the current optimization window
     std::vector<SE3> m_allPoses;
     
+    // Store all historical points and colors for visualization (not just sliding window)
+    // Points are stored per frame: m_allPoints[frame_idx * M + patch_idx]
+    std::vector<Vec3> m_allPoints;  // All historical 3D points
+    std::vector<uint8_t> m_allColors;  // All historical colors [frame_idx * M * 3 + patch_idx * 3 + channel]
+    
     // Map sliding window indices to global frame indices using timestamps
     // When keyframe() removes frames, we use timestamps to find which global frame each sliding window index corresponds to
     std::vector<int64_t> m_allTimestamps;  // Global timestamps for all frames

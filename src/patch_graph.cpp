@@ -65,14 +65,14 @@ void PatchGraph::reset() {
     std::memset(m_ii, 0, sizeof(m_ii));
     std::memset(m_jj, 0, sizeof(m_jj));
     std::memset(m_kk, 0, sizeof(m_kk));
-    std::memset(m_weight, 0, sizeof(m_weight));
+    std::memset(m_weight, 0, sizeof(m_weight));  // Initialize 2D array [MAX_EDGES][2]
     std::memset(m_target, 0, sizeof(m_target));
 
     // inactive edges
     std::memset(m_ii_inac, 0, sizeof(m_ii_inac));
     std::memset(m_jj_inac, 0, sizeof(m_jj_inac));
     std::memset(m_kk_inac, 0, sizeof(m_kk_inac));
-    std::memset(m_weight_inac, 0, sizeof(m_weight_inac));
+    std::memset(m_weight_inac, 0, sizeof(m_weight_inac));  // Initialize 2D array [MAX_EDGES][2]
     std::memset(m_target_inac, 0, sizeof(m_target_inac));
 }
 

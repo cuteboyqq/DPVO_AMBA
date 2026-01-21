@@ -102,7 +102,8 @@ void Patchifier::setModels(Config_S *fnetConfig, Config_S *inetConfig)
 // Helper function to extract patches after inference has been run
 void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap_W, int M,
                                                 float* fmap, float* imap, float* gmap,
-                                                float* patches, uint8_t* clr, const uint8_t* image_for_colors)
+                                                float* patches, uint8_t* clr, const uint8_t* image_for_colors,
+                                                int H_image, int W_image)
 {
     const int inet_output_channels = 384;
     
@@ -252,16 +253,26 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     // ------------------------------------------------
     // Color for visualization - full resolution
     // ------------------------------------------------
+    // CRITICAL: coords are at model input size (H, W), but image_for_colors is at full resolution
+    // Scale coordinates to full image size if H_image and W_image are provided
     if (image_for_colors != nullptr) {
+        int H_color = (H_image > 0) ? H_image : H;  // Use full image size if provided
+        int W_color = (W_image > 0) ? W_image : W;   // Use full image size if provided
+        float scale_x = static_cast<float>(W_color) / static_cast<float>(W);
+        float scale_y = static_cast<float>(H_color) / static_cast<float>(H);
+        
         for (int m = 0; m < M; m++)
         {
-            int x = static_cast<int>(coords[m * 2 + 0]);
-            int y = static_cast<int>(coords[m * 2 + 1]);
-            x = std::max(0, std::min(x, W - 1));
-            y = std::max(0, std::min(y, H - 1));
+            // Scale coordinates from model input size to full image size
+            float x_scaled = coords[m * 2 + 0] * scale_x;
+            float y_scaled = coords[m * 2 + 1] * scale_y;
+            int x = static_cast<int>(std::round(x_scaled));
+            int y = static_cast<int>(std::round(y_scaled));
+            x = std::max(0, std::min(x, W_color - 1));
+            y = std::max(0, std::min(y, H_color - 1));
             for (int c = 0; c < 3; c++) {
-                // Image is in [C, H, W] format (uint8_t)
-                clr[m * 3 + c] = image_for_colors[c * H * W + y * W + x];
+                // Image is in [C, H, W] format (uint8_t) at full resolution
+                clr[m * 3 + c] = image_for_colors[c * H_color * W_color + y * W_color + x];
             }
         }
     } else {
@@ -284,10 +295,36 @@ void Patchifier::forward(
         throw std::runtime_error("Patchifier::forward: imgTensor is nullptr");
     }
     
-    // Get dimensions from tensor
+    // Get dimensions from tensor (full image size)
     const size_t* shape = ea_tensor_shape(imgTensor);
-    int H = static_cast<int>(shape[EA_H]);
-    int W = static_cast<int>(shape[EA_W]);
+    int H_tensor = static_cast<int>(shape[EA_H]);  // Full image height (e.g., 1080)
+    int W_tensor = static_cast<int>(shape[EA_W]);  // Full image width (e.g., 1920)
+    
+    // Get logger early (needed for dimension logging)
+    auto logger_patch = spdlog::get("fnet");
+    if (!logger_patch) {
+        logger_patch = spdlog::get("inet");
+    }
+    
+    // CRITICAL: Use model INPUT dimensions for patch extraction, not tensor dimensions
+    // Models resize internally, so patches should be extracted at model input size
+    // This ensures coordinates are within feature map bounds after scaling
+    int H = getInputHeight();  // Model input height (e.g., 528)
+    int W = getInputWidth();   // Model input width (e.g., 960)
+    
+    if (H == 0 || W == 0) {
+        // Fallback to tensor dimensions if model input not available
+        H = H_tensor;
+        W = W_tensor;
+        if (logger_patch) {
+            logger_patch->warn("[Patchifier] Model input dimensions not available, using tensor dimensions {}x{}", H, W);
+        }
+    } else {
+        if (logger_patch) {
+            logger_patch->info("[Patchifier] Using model input dimensions {}x{} for patch extraction (tensor is {}x{})", 
+                              H, W, H_tensor, W_tensor);
+        }
+    }
     
     // Use tensor-based runInference (avoids conversion)
     const int M = patches_per_image;
@@ -305,11 +342,6 @@ void Patchifier::forward(
     }
     if (m_imap_buffer.size() != inet_output_channels * fmap_H * fmap_W) {
         m_imap_buffer.resize(inet_output_channels * fmap_H * fmap_W);
-    }
-    
-    auto logger_patch = spdlog::get("fnet");
-    if (!logger_patch) {
-        logger_patch = spdlog::get("inet");
     }
     
     // Run inference using tensor directly
@@ -372,18 +404,22 @@ void Patchifier::forward(
     std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
     
     // Extract image data for color extraction (if needed)
+    // NOTE: Use tensor dimensions for color extraction (full resolution)
+    // But patches are extracted at model input size (H, W) which may be smaller
     std::vector<uint8_t> image_data;
     const uint8_t* image_for_colors = nullptr;
     void* tensor_data = ea_tensor_data(imgTensor);
     if (tensor_data != nullptr) {
-        image_data.resize(H * W * 3);
+        image_data.resize(H_tensor * W_tensor * 3);
         const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
-        std::memcpy(image_data.data(), src, H * W * 3);
+        std::memcpy(image_data.data(), src, H_tensor * W_tensor * 3);
         image_for_colors = image_data.data();
     }
     
     // Extract patches using helper function (avoids duplicate inference)
-    extractPatchesAfterInference(H, W, fmap_H, fmap_W, M, fmap, imap, gmap, patches, clr, image_for_colors);
+    // Pass both model input size (H, W) for patch extraction and tensor size for color extraction
+    extractPatchesAfterInference(H, W, fmap_H, fmap_W, M, fmap, imap, gmap, patches, clr, 
+                                 image_for_colors, H_tensor, W_tensor);
 }
 #endif
 
@@ -409,6 +445,32 @@ int Patchifier::getOutputWidth() const
 #endif
     if (m_fnet != nullptr) {
         return m_fnet->getOutputWidth();
+    }
+    return 0;
+}
+
+int Patchifier::getInputHeight() const
+{
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getInputHeight();
+    }
+#endif
+    if (m_fnet != nullptr) {
+        return m_fnet->getInputHeight();
+    }
+    return 0;
+}
+
+int Patchifier::getInputWidth() const
+{
+#ifdef USE_ONNX_RUNTIME
+    if (m_useOnnxRuntime && m_fnet_onnx != nullptr) {
+        return m_fnet_onnx->getInputWidth();
+    }
+#endif
+    if (m_fnet != nullptr) {
+        return m_fnet->getInputWidth();
     }
     return 0;
 }

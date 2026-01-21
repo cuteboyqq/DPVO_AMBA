@@ -1364,8 +1364,8 @@ void processDPVOApp(
 		// Create DPVOConfig with default values
 		DPVOConfig dpvoCfg;
 		// Reduce BUFFER_SIZE to prevent memory issues (4096 is too large)
-		dpvoCfg.BUFFER_SIZE = 36;  // Use same as PatchGraph::BUFFER_SIZE
-		dpvoCfg.PATCHES_PER_FRAME = 8;  // Use same as PatchGraph::PATCHES_PER_FRAME
+		dpvoCfg.BUFFER_SIZE = 128;  // Use same as PatchGraph::BUFFER_SIZE
+		dpvoCfg.PATCHES_PER_FRAME = 4;  // Use same as PatchGraph::PATCHES_PER_FRAME
 		// You can customize other DPVOConfig values here if needed
 
 		// Initialize fnet and inet models first to get their actual input dimensions
@@ -1467,10 +1467,10 @@ void processDPVOApp(
 		// These will be automatically scaled by RES=4 when stored in PatchGraph
 		// User-provided intrinsics: fx=1660.0, fy=1660.0, cx=960.0, cy=540.0
 		// Resolution: 1920x1080
-		float camera_intrinsics[4] = {1660.0f, 1660.0f, 960.0f, 540.0f};
-		dpvo->setIntrinsics(camera_intrinsics);
-		logger->info("Set camera intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
-		             camera_intrinsics[0], camera_intrinsics[1], camera_intrinsics[2], camera_intrinsics[3]);
+		// float camera_intrinsics[4] = {1660.0f, 1660.0f, 960.0f, 540.0f};
+		// dpvo->setIntrinsics(camera_intrinsics);
+		// logger->info("Set camera intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
+		//              camera_intrinsics[0], camera_intrinsics[1], camera_intrinsics[2], camera_intrinsics[3]);
 
 		// Set fnet and inet models for Patchifier (will create new model instances)
 		// This will also start the processing thread (via _startThreads)

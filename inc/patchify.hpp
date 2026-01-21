@@ -40,13 +40,19 @@ public:
     // Returns 0,0 if models are not set
     int getOutputHeight() const;
     int getOutputWidth() const;
+    
+    // Get model input dimensions (for patch extraction)
+    // Returns 0,0 if models are not set
+    int getInputHeight() const;
+    int getInputWidth() const;
 
 private:
     // Helper function to extract patches after inference has been run
     // This avoids duplicate inference when tensor-based forward() calls uint8_t* forward()
     void extractPatchesAfterInference(int H, int W, int fmap_H, int fmap_W, int M,
                                       float* fmap, float* imap, float* gmap,
-                                      float* patches, uint8_t* clr, const uint8_t* image_for_colors = nullptr);
+                                      float* patches, uint8_t* clr, const uint8_t* image_for_colors = nullptr,
+                                      int H_image = 0, int W_image = 0);
     int m_patch_size;
     int m_DIM;
     

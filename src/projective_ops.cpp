@@ -448,6 +448,7 @@ void transformWithJacobians(
                                  intr_i[0], intr_i[1], intr_i[2], intr_i[3],
                                  intr_j[0], intr_j[1], intr_j[2], intr_j[3]);
                 }
+                
 
                 // Inverse projection: returns homogeneous coordinates [X, Y, Z, W]
                 // where X, Y are normalized coordinates, Z=1, W=inverse_depth
@@ -533,12 +534,51 @@ void transformWithJacobians(
                     }
 
                     // Check if projection is reasonable (within reasonable bounds for feature map)
-                    // Feature map is at 1/4 resolution, so bounds are roughly [0, fmap_W*4] and [0, fmap_H*4]
-                    // But we allow some margin for sub-pixel accuracy
-                    float max_u = fx_j * 20.0f + cx_j;  // Allow up to 20x normalized image width
-                    float max_v = fy_j * 20.0f + cy_j;  // Allow up to 20x normalized image height
+                    // Feature map is at 1/4 resolution, so coordinates should be in [0, fmap_W] x [0, fmap_H]
+                    // For typical values: fmap_W=240, fmap_H=132 (for 1920x1080 input)
+                    // Note: We don't have direct access to fmap dimensions here, so use intrinsics-based estimate
+                    // 
+                    // CRITICAL: The principal point (cx, cy) at 1/4 resolution should be approximately at the center
+                    // of the feature map. However, there can be slight mismatches:
+                    // - If cx=240 and fmap_W=240, then cx is at the right edge (not center!)
+                    // - If cy=135 and fmap_H=132, then cy is slightly below center
+                    //
+                    // Better estimate: Use fx/fy to estimate image dimensions, then scale to 1/4 res
+                    // For a pinhole camera: image_width ≈ fx * 2 (if FOV is reasonable), image_height ≈ fy * 2
+                    // At 1/4 resolution: fmap_W ≈ fx/2, fmap_H ≈ fy/2
+                    // But we have cx, cy which are already at 1/4 res, so:
+                    // - If principal point is at center: fmap_W ≈ 2*cx, fmap_H ≈ 2*cy
+                    // - But actual values show: fmap_W ≈ cx (not 2*cx!), fmap_H < cy
+                    //
+                    // Use bounds that match actual feature map dimensions
+                    // For cx=120, cy=66 and fmap_W=240, fmap_H=132:
+                    // - cx is at the center of fmap_W, so fmap_W ≈ 2*cx (e.g., 2*120 = 240)
+                    // - cy is at the center of fmap_H, so fmap_H ≈ 2*cy (e.g., 2*66 = 132)
+                    // 
+                    // IMPORTANT: During camera motion (especially rotation), features can move significantly
+                    // across the image. We need to allow larger bounds to accommodate this motion.
+                    // However, coordinates too far out of bounds indicate incorrect poses or numerical issues.
+                    //
+                    // Strategy: Use fx/fy to estimate maximum possible coordinate range
+                    // For pinhole camera: coordinates can range from -fx to +fx (or more) depending on FOV
+                    // At 1/4 resolution: max coordinate ≈ fx (if principal point is at center)
+                    // But we also need to account for features moving during rotation
+                    // 
+                    // CRITICAL: Bounds must match actual feature map dimensions
+                    // If reprojections are out of bounds, it indicates incorrect poses, not that bounds are too strict
+                    // Allowing invalid reprojections through will cause BA to diverge
+                    // Use reasonable bounds based on feature map size (2*cx, 2*cy) with small margin for sub-pixel accuracy
+                    float margin_u = 20.0f;  // Small margin for sub-pixel accuracy and numerical errors
+                    float margin_v = 20.0f;  // Small margin for sub-pixel accuracy and numerical errors
+                    // Use 2*cx and 2*cy as estimate for feature map dimensions (principal point at center)
+                    float max_u = 2.0f * cx_j + margin_u;  // Feature map width estimate: 2*cx + margin (e.g., 2*120 + 20 = 260)
+                    float max_v = 2.0f * cy_j + margin_v;  // Feature map height estimate: 2*cy + margin (e.g., 2*67.5 + 20 = 155)
+                    // Also check minimum bounds (allow small negative for sub-pixel accuracy)
+                    float min_u = -10.0f;
+                    float min_v = -10.0f;
                     
-                    bool out_of_bounds = (std::abs(u_pix_computed) > max_u || std::abs(v_pix_computed) > max_v);
+                    bool out_of_bounds = (u_pix_computed < min_u || u_pix_computed > max_u || 
+                                         v_pix_computed < min_v || v_pix_computed > max_v);
                     
                     if (out_of_bounds || !computed_is_finite) {
                         // Projection is way out of bounds or invalid - likely due to bad poses
