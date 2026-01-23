@@ -123,6 +123,16 @@ void DPVOUpdateONNX::_initModel()
             auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
             std::vector<int64_t> shape = output_tensor_info.GetShape();
             m_outputShapes.push_back(shape);
+            
+            // Log output shape
+            std::string shape_str = "[";
+            for (size_t j = 0; j < shape.size(); j++) {
+                if (j > 0) shape_str += ", ";
+                shape_str += std::to_string(shape[j]);
+            }
+            shape_str += "]";
+            logger->info("DPVOUpdateONNX: Output[{}] '{}' - expected shape: {}", 
+                         i, output_name.get(), shape_str);
         }
         
         logger->info("DPVOUpdateONNX: Model loaded successfully. Inputs: {}, Outputs: {}", 
@@ -239,6 +249,37 @@ bool DPVOUpdateONNX::runInference(float* netData, float* inpData, float* corrDat
             return false;
         }
         
+        // Verify output shapes match expected
+        for (size_t i = 0; i < output_tensors.size(); i++) {
+            auto shape_info = output_tensors[i].GetTensorTypeAndShapeInfo();
+            std::vector<int64_t> actual_shape = shape_info.GetShape();
+            std::vector<int64_t> expected_shape = m_outputShapes[i];
+            
+            if (logger && frameIdx % 100 == 0) {  // Log every 100 frames to reduce noise
+                std::string shape_str = "[";
+                for (size_t j = 0; j < actual_shape.size(); j++) {
+                    if (j > 0) shape_str += ", ";
+                    shape_str += std::to_string(actual_shape[j]);
+                }
+                shape_str += "]";
+                logger->info("DPVOUpdateONNX: Output[{}] '{}' actual shape: {}", 
+                            i, m_outputNames[i].c_str(), shape_str);
+            }
+            
+            // Verify shape matches expected
+            if (actual_shape.size() != expected_shape.size()) {
+                if (logger) logger->error("DPVOUpdateONNX: Output[{}] shape dimension mismatch: expected {} dims, got {} dims",
+                                         i, expected_shape.size(), actual_shape.size());
+                return false;
+            }
+            for (size_t j = 0; j < actual_shape.size(); j++) {
+                if (actual_shape[j] != expected_shape[j] && expected_shape[j] != -1) {  // -1 means dynamic dimension
+                    if (logger) logger->warn("DPVOUpdateONNX: Output[{}] shape[{}] mismatch: expected {}, got {}",
+                                            i, j, expected_shape[j], actual_shape[j]);
+                }
+            }
+        }
+        
         // Allocate output buffers
         pred.netOutBuff = new float[m_netOutBufferSize];
         pred.dOutBuff = new float[m_dOutBufferSize];
@@ -247,14 +288,32 @@ bool DPVOUpdateONNX::runInference(float* netData, float* inpData, float* corrDat
         // Extract outputs
         // Output 0: net_out [1, 384, 360, 1]
         float* net_out_data = output_tensors[0].GetTensorMutableData<float>();
+        size_t net_out_size = output_tensors[0].GetTensorTypeAndShapeInfo().GetElementCount();
+        if (net_out_size != m_netOutBufferSize) {
+            if (logger) logger->error("DPVOUpdateONNX: net_out size mismatch: expected {}, got {}", 
+                                     m_netOutBufferSize, net_out_size);
+            return false;
+        }
         std::memcpy(pred.netOutBuff, net_out_data, m_netOutBufferSize * sizeof(float));
         
         // Output 1: d_out [1, 2, 360, 1]
         float* d_out_data = output_tensors[1].GetTensorMutableData<float>();
+        size_t d_out_size = output_tensors[1].GetTensorTypeAndShapeInfo().GetElementCount();
+        if (d_out_size != m_dOutBufferSize) {
+            if (logger) logger->error("DPVOUpdateONNX: d_out size mismatch: expected {}, got {}", 
+                                     m_dOutBufferSize, d_out_size);
+            return false;
+        }
         std::memcpy(pred.dOutBuff, d_out_data, m_dOutBufferSize * sizeof(float));
         
         // Output 2: w_out [1, 2, 360, 1]
         float* w_out_data = output_tensors[2].GetTensorMutableData<float>();
+        size_t w_out_size = output_tensors[2].GetTensorTypeAndShapeInfo().GetElementCount();
+        if (w_out_size != m_wOutBufferSize) {
+            if (logger) logger->error("DPVOUpdateONNX: w_out size mismatch: expected {}, got {}", 
+                                     m_wOutBufferSize, w_out_size);
+            return false;
+        }
         std::memcpy(pred.wOutBuff, w_out_data, m_wOutBufferSize * sizeof(float));
         
         pred.isProcessed = true;
@@ -336,13 +395,14 @@ int DPVOUpdateONNX::reshapeInput(
     const int CORR_DIM
 )
 {
-    // Resize buffers to match model input size
-    net_input.resize(MODEL_EDGE_COUNT * 384);
-    inp_input.resize(MODEL_EDGE_COUNT * 384);
-    corr_input.resize(MODEL_EDGE_COUNT * CORR_DIM);
-    ii_input.resize(MODEL_EDGE_COUNT);
-    jj_input.resize(MODEL_EDGE_COUNT);
-    kk_input.resize(MODEL_EDGE_COUNT);
+    // Resize buffers to match model input size [1, DIM, H, 1]
+    // Total size: 1 * DIM * MODEL_EDGE_COUNT * 1 = DIM * MODEL_EDGE_COUNT
+    net_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1);
+    inp_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1);
+    corr_input.resize(1 * CORR_DIM * MODEL_EDGE_COUNT * 1);
+    ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1);
+    jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1);
+    kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1);
     
     // Zero out buffers
     std::fill(net_input.begin(), net_input.end(), 0.0f);
@@ -352,21 +412,42 @@ int DPVOUpdateONNX::reshapeInput(
     std::fill(jj_input.begin(), jj_input.end(), 0.0f);
     std::fill(kk_input.begin(), kk_input.end(), 0.0f);
     
-    // Copy active data
-    for (int i = 0; i < num_active && i < MODEL_EDGE_COUNT; i++) {
-        // Copy net state (384 features per edge)
-        std::memcpy(&net_input[i * 384], m_net[i], 384 * sizeof(float));
+    // Reshape from [H, DIM] to [1, DIM, H, 1] to match Python's permute(0,2,1).unsqueeze(-1)
+    // Python: net.permute(0, 2, 1).unsqueeze(-1) → [1, H, DIM] → [1, DIM, H, 1]
+    // Index formula for [1, DIM, H, 1]: idx = n * (DIM * H * 1) + c * (H * 1) + h * 1 + w
+    // For [1, 384, MODEL_EDGE_COUNT, 1]: idx = 0 + c * MODEL_EDGE_COUNT + h + 0
+    for (int e = 0; e < num_active && e < MODEL_EDGE_COUNT; e++) {
+        // Reshape net: [H, DIM] → [1, DIM, H, 1]
+        for (int d = 0; d < 384; d++) {
+            // [1, 384, MODEL_EDGE_COUNT, 1] layout: channel d, edge e
+            int idx = 0 * (384 * MODEL_EDGE_COUNT * 1) + 
+                      d * (MODEL_EDGE_COUNT * 1) + 
+                      e * 1 + 
+                      0;
+            net_input[idx] = m_net[e][d];
+            inp_input[idx] = ctx[e * 384 + d];
+        }
         
-        // Copy context (inp) - 384 features per edge
-        std::memcpy(&inp_input[i * 384], &ctx[i * 384], 384 * sizeof(float));
+        // Reshape correlation: [H, CORR_DIM] → [1, CORR_DIM, H, 1]
+        for (int c = 0; c < CORR_DIM; c++) {
+            int idx = 0 * (CORR_DIM * MODEL_EDGE_COUNT * 1) + 
+                      c * (MODEL_EDGE_COUNT * 1) + 
+                      e * 1 + 
+                      0;
+            corr_input[idx] = corr[e * CORR_DIM + c];
+        }
         
-        // Copy correlation (CORR_DIM features per edge)
-        std::memcpy(&corr_input[i * CORR_DIM], &corr[i * CORR_DIM], CORR_DIM * sizeof(float));
+        // Reshape indices: [H] → [1, 1, H, 1]
+        int idx_ii = 0 * (1 * MODEL_EDGE_COUNT * 1) + 
+                     0 * (MODEL_EDGE_COUNT * 1) + 
+                     e * 1 + 
+                     0;
+        int idx_jj = idx_ii;  // Same layout
+        int idx_kk = idx_ii;  // Same layout
         
-        // Copy indices (as float)
-        ii_input[i] = static_cast<float>(m_ii[i]);
-        jj_input[i] = static_cast<float>(m_jj[i]);
-        kk_input[i] = static_cast<float>(m_kk[i]);
+        ii_input[idx_ii] = static_cast<float>(m_ii[e]);
+        jj_input[idx_jj] = static_cast<float>(m_jj[e]);
+        kk_input[idx_kk] = static_cast<float>(m_kk[e]);
     }
     
     return num_active;

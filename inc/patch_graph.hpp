@@ -49,14 +49,14 @@ public:
     int m_ii[MAX_EDGES];
     int m_jj[MAX_EDGES];
     int m_kk[MAX_EDGES];
-    float m_weight[MAX_EDGES][2];  // [num_edges, 2] - weight[0] for x, weight[1] for y
+    float m_weight[MAX_EDGES][2];  // [num_edges, 2] - weight channels (w0 for x, w1 for y, matching Python [1, M, 2])
     float  m_target[MAX_EDGES];
 
     // ---- inactive edges ----
     int m_ii_inac[MAX_EDGES];
     int m_jj_inac[MAX_EDGES];
     int m_kk_inac[MAX_EDGES];
-    float m_weight_inac[MAX_EDGES][2];  // [num_edges, 2] - weight[0] for x, weight[1] for y
+    float m_weight_inac[MAX_EDGES][2];  // [num_edges, 2] - weight channels (w0 for x, w1 for y, matching Python [1, M, 2])
     float  m_target_inac[MAX_EDGES];
 
 public:

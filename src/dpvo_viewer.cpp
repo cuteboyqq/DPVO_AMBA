@@ -149,13 +149,26 @@ void DPVOViewer::updatePoints(const Vec3* points, const uint8_t* colors, int num
     num_points = std::min(num_points, m_maxPoints);
     
     // Filter out invalid points (zero coordinates or NaN/Inf)
+    // CRITICAL: Increase distance threshold to allow points from all frames to be visible
+    // Previous threshold of 1000.0f was too restrictive and filtered out points from later frames
+    const float MAX_POINT_DISTANCE = 100000000.0f;  // Increased from 1000.0f to allow far points
     int valid_count = 0;
+    int zero_count = 0;
+    int nan_inf_count = 0;
+    int out_of_bounds_count = 0;
+    
     for (int i = 0; i < num_points; i++) {
         const Vec3& p = points[i];
-        // Check if point is valid (not all zeros, not NaN/Inf)
-        bool is_valid = (p.x != 0.0f || p.y != 0.0f || p.z != 0.0f) &&
-                       std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) &&
-                       std::abs(p.x) < 1000.0f && std::abs(p.y) < 1000.0f && std::abs(p.z) < 1000.0f;
+        
+        // Check individual validity conditions for debugging
+        bool is_zero = (p.x == 0.0f && p.y == 0.0f && p.z == 0.0f);
+        bool is_finite = std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+        bool in_bounds = (std::abs(p.x) < MAX_POINT_DISTANCE && 
+                         std::abs(p.y) < MAX_POINT_DISTANCE && 
+                         std::abs(p.z) < MAX_POINT_DISTANCE);
+        
+        // Check if point is valid (not all zeros, not NaN/Inf, within bounds)
+        bool is_valid = !is_zero && is_finite && in_bounds;
         
         if (is_valid) {
             m_points[valid_count] = p;
@@ -169,10 +182,99 @@ void DPVOViewer::updatePoints(const Vec3* points, const uint8_t* colors, int num
                 m_colors[valid_count * 3 + 2] = 255;
             }
             valid_count++;
+        } else {
+            // Track why points were filtered out (for debugging)
+            if (is_zero) zero_count++;
+            if (!is_finite) nan_inf_count++;
+            if (!in_bounds) out_of_bounds_count++;
         }
     }
     
     m_numPoints = valid_count;
+    
+    // DIAGNOSTIC: Log filtering statistics more frequently and with frame breakdown
+    static int update_count = 0;
+    update_count++;
+    
+    // Log every update for first 5 updates, then every 10 updates
+    bool should_log = (update_count <= 5 || update_count % 10 == 0);
+    
+    if (should_log) {
+        // Count points per frame to see distribution
+        const int M = 4;  // PATCHES_PER_FRAME (hardcoded for now)
+        int num_frames = num_points / M;
+        std::vector<int> points_per_frame(num_frames, 0);
+        std::vector<int> valid_per_frame(num_frames, 0);
+        
+        // Count points per frame from INPUT array (before filtering)
+        for (int i = 0; i < num_points; i++) {
+            int frame_idx = i / M;
+            if (frame_idx < num_frames) {
+                points_per_frame[frame_idx]++;
+            }
+        }
+        
+        // Count valid points per frame from FILTERED OUTPUT array (after filtering)
+        // Note: valid_count is the number of points that passed filtering
+        // But we need to track which frames they came from
+        // Since filtering removes invalid points, we can't directly map filtered indices to frame indices
+        // Instead, we'll count from the input array which points passed filtering
+        std::vector<int> input_valid_per_frame(num_frames, 0);
+        int filtered_idx = 0;
+        for (int i = 0; i < num_points; i++) {
+            const Vec3& p = points[i];
+            bool is_zero = (p.x == 0.0f && p.y == 0.0f && p.z == 0.0f);
+            bool is_finite = std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+            bool in_bounds = (std::abs(p.x) < MAX_POINT_DISTANCE && 
+                             std::abs(p.y) < MAX_POINT_DISTANCE && 
+                             std::abs(p.z) < MAX_POINT_DISTANCE);
+            bool is_valid = !is_zero && is_finite && in_bounds;
+            
+            if (is_valid) {
+                int frame_idx = i / M;
+                if (frame_idx < num_frames) {
+                    input_valid_per_frame[frame_idx]++;
+                }
+                filtered_idx++;
+            }
+        }
+        
+        printf("[DPVOViewer] updatePoints: Received %d points, valid=%d, filtered: zero=%d, nan/inf=%d, out_of_bounds=%d\n",
+               num_points, valid_count, zero_count, nan_inf_count, out_of_bounds_count);
+        
+        // Check if far points are being filtered
+        int far_points_count = 0;
+        float max_distance = 0.0f;
+        for (int i = 0; i < num_points; i++) {
+            const Vec3& p = points[i];
+            float dist = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
+            if (dist > 100.0f) {  // Points more than 100 units away
+                far_points_count++;
+                max_distance = std::max(max_distance, dist);
+            }
+        }
+        printf("[DPVOViewer] updatePoints: Far points (>100 units): %d, max_distance=%.2f\n",
+               far_points_count, max_distance);
+        
+        printf("[DPVOViewer] updatePoints: Points per frame (first 10 frames, input array): ");
+        for (int f = 0; f < std::min(10, num_frames); f++) {
+            printf("Frame[%d]=%d/%d ", f, input_valid_per_frame[f], points_per_frame[f]);
+        }
+        printf("\n");
+        
+        // Also check frames 6-94 which should have zero points
+        if (num_frames > 10) {
+            printf("[DPVOViewer] updatePoints: Checking frames that should have zero points (6, 10, 20, 50, 90): ");
+            std::vector<int> check_frames = {6, 10, 20, 50, 90};
+            for (int f : check_frames) {
+                if (f < num_frames) {
+                    printf("Frame[%d]=%d/%d ", f, input_valid_per_frame[f], points_per_frame[f]);
+                }
+            }
+            printf("\n");
+        }
+        fflush(stdout);
+    }
 }
 
 void DPVOViewer::convertPosesToMatrices()
@@ -292,8 +394,10 @@ void DPVOViewer::convertPosesToMatrices()
         }
         
         // Also validate translation - check for reasonable values
+        // CRITICAL: Use same bounds as t_wc validation (100000.0f) to avoid filtering valid poses
+        // t_cw is camera position in world frame, which can be far from origin for long trajectories
         if (!std::isfinite(t_cw.x()) || !std::isfinite(t_cw.y()) || !std::isfinite(t_cw.z()) ||
-            std::abs(t_cw.x()) > 1000.0f || std::abs(t_cw.y()) > 1000.0f || std::abs(t_cw.z()) > 1000.0f) {
+            std::abs(t_cw.x()) > 100000.0f || std::abs(t_cw.y()) > 100000.0f || std::abs(t_cw.z()) > 100000.0f) {
             is_valid = false;
         }
         
@@ -310,6 +414,16 @@ void DPVOViewer::convertPosesToMatrices()
         mat[1]  = T_cw(0,1); mat[5]  = T_cw(1,1); mat[9]  = T_cw(2,1); mat[13] = T_cw(3,1);
         mat[2]  = T_cw(0,2); mat[6]  = T_cw(1,2); mat[10] = T_cw(2,2); mat[14] = T_cw(3,2);
         mat[3]  = T_cw(0,3); mat[7]  = T_cw(1,3); mat[11] = T_cw(2,3); mat[15] = T_cw(3,3);
+        
+        // DIAGNOSTIC: Log conversion for first 3 frames to verify correctness
+        static int convert_log_count = 0;
+        if (i < 3 && (convert_log_count++ % 10 == 0)) {
+            printf("[DPVOViewer] convertPosesToMatrices[%d]: T_wc.t=(%.3f, %.3f, %.3f), "
+                   "T_cw.t=(%.3f, %.3f, %.3f), mat[3]=%.3f, mat[7]=%.3f, mat[11]=%.3f\n",
+                   i, t_wc.x(), t_wc.y(), t_wc.z(), t_cw.x(), t_cw.y(), t_cw.z(),
+                   mat[3], mat[7], mat[11]);
+            fflush(stdout);
+        }
     }
 #endif
 }
@@ -444,13 +558,26 @@ void DPVOViewer::drawPoses()
         float cam_y = mat[7];
         float cam_z = mat[11];
         
+        // DIAGNOSTIC: Log extraction for first 3 frames to verify correctness
+        static int draw_log_count = 0;
+        if (i < 3 && (draw_log_count++ % 10 == 0)) {
+            printf("[DPVOViewer] drawPoses[%d]: cam_x=%.3f, cam_y=%.3f, cam_z=%.3f, "
+                   "mat[3]=%.3f, mat[7]=%.3f, mat[11]=%.3f\n",
+                   i, cam_x, cam_y, cam_z, mat[3], mat[7], mat[11]);
+            fflush(stdout);
+        }
+        
         // Extract rotation vectors from transformation matrix
+        // Matrix is stored in column-major format: mat[col*4 + row]
+        // Column 0 (X axis): mat[0], mat[4], mat[8]
+        // Column 1 (Y axis): mat[1], mat[5], mat[9]
+        // Column 2 (Z axis): mat[2], mat[6], mat[10]
         // Forward is -Z direction in camera frame (third column, negated)
-        Eigen::Vector3f forward(-mat[8], -mat[9], -mat[10]);
+        Eigen::Vector3f forward(-mat[2], -mat[6], -mat[10]);
         // Right is X direction (first column)
-        Eigen::Vector3f right(mat[0], mat[1], mat[2]);
+        Eigen::Vector3f right(mat[0], mat[4], mat[8]);
         // Up is Y direction (second column)
-        Eigen::Vector3f up(mat[4], mat[5], mat[6]);
+        Eigen::Vector3f up(mat[1], mat[5], mat[9]);
         
         // Normalize direction vectors
         forward.normalize();
@@ -605,18 +732,23 @@ void DPVOViewer::drawPoses_fake()
         float cam_z = mat[11];
         
         // Extract rotation vectors
-        Eigen::Vector3f forward = Eigen::Vector3f(-mat[8], -mat[9], -mat[10]);  // -Z direction in camera frame
-        Eigen::Vector3f right = Eigen::Vector3f(mat[0], mat[1], mat[2]);         // X direction
-        Eigen::Vector3f up = Eigen::Vector3f(mat[4], mat[5], mat[6]);            // Y direction
+        // Extract rotation vectors from transformation matrix (column-major format)
+        // Column 0 (X axis): mat[0], mat[4], mat[8]
+        // Column 1 (Y axis): mat[1], mat[5], mat[9]
+        // Column 2 (Z axis): mat[2], mat[6], mat[10]
+        Eigen::Vector3f forward = Eigen::Vector3f(-mat[2], -mat[6], -mat[10]);  // -Z direction in camera frame
+        Eigen::Vector3f right = Eigen::Vector3f(mat[0], mat[4], mat[8]);         // X direction
+        Eigen::Vector3f up = Eigen::Vector3f(mat[1], mat[5], mat[9]);            // Y direction
         
         // FAKE VALUES FOR TESTING: Always use values close to previous frame to create smooth trajectory
         // This ensures consecutive frames are close together, forming a line/snake pattern
         bool use_fake = false;
         
         // Check if current frame is invalid OR if we want to force fake values for testing
+        // CRITICAL: Use same bounds as t_wc validation (100000.0f) to avoid filtering valid poses
         bool is_invalid = (!matrix_valid || 
             !std::isfinite(cam_x) || !std::isfinite(cam_y) || !std::isfinite(cam_z) ||
-            std::abs(cam_x) > 1000.0f || std::abs(cam_y) > 1000.0f || std::abs(cam_z) > 1000.0f ||
+            std::abs(cam_x) > 100000.0f || std::abs(cam_y) > 100000.0f || std::abs(cam_z) > 100000.0f ||
             !std::isfinite(forward.x()) || !std::isfinite(forward.y()) || !std::isfinite(forward.z()) ||
             forward.norm() < 0.1f || right.norm() < 0.1f || up.norm() < 0.1f);
         
@@ -850,7 +982,8 @@ void DPVOViewer::drawPoses_fake()
         
         if (!use_fake) {
             // Validate position - check for reasonable values
-            bool out_of_bounds = (std::abs(cam_x) > 1000.0f || std::abs(cam_y) > 1000.0f || std::abs(cam_z) > 1000.0f);
+            // CRITICAL: Use same bounds as t_wc validation (100000.0f) to avoid filtering valid poses
+            bool out_of_bounds = (std::abs(cam_x) > 100000.0f || std::abs(cam_y) > 100000.0f || std::abs(cam_z) > 100000.0f);
             if (out_of_bounds) {
                 skipped_out_of_bounds++;
                 continue;
@@ -1021,10 +1154,12 @@ void DPVOViewer::run()
     
     // Setup 3D camera
     // Use a wider view frustum to accommodate larger trajectories
-    // Far plane set to 1000 to see poses that are far from origin
+    // Far plane set to 10000 to see poses and points that are far from origin
+    // Many points are computed at distances > 1000 (e.g., 1001, 513, etc.) due to incorrect poses
+    // Increasing far plane to 10000 allows these points to be visible
     m_camera = new pangolin::OpenGlRenderState(
         pangolin::ProjectionMatrix(m_imageWidth, m_imageHeight, 400, 400, 
-                                  m_imageWidth/2, m_imageHeight/2, 0.1, 1000),
+                                  m_imageWidth/2, m_imageHeight/2, 0.1, 10000),
         pangolin::ModelViewLookAt(0, -1, -1, 0, 0, 0, pangolin::AxisNegY));
     
     // 3D visualization view

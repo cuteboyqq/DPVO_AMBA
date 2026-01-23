@@ -42,7 +42,7 @@ struct DPVOConfig {
           MAX_EDGE_AGE(360),
           KEYFRAME_INDEX(4),
           KEYFRAME_THRESH(10),
-          PATCH_LIFETIME(6),
+          PATCH_LIFETIME(4), // 6 
           REMOVAL_WINDOW(8)
     {}
 };

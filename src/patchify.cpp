@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <stdexcept>
+#include <fstream>
 #include <spdlog/spdlog.h>
 
 // =================================================================================================
@@ -107,31 +108,18 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
 {
     const int inet_output_channels = 384;
     
-    printf("[Patchifier] About to create grid, H=%d, W=%d\n", H, W);
-    fflush(stdout);
-    
-    // ------------------------------------------------
-    // Create coordinate grid (like Python's coords_grid_with_index)
-    // ------------------------------------------------
-    std::vector<float> grid(3 * H * W);
-    printf("[Patchifier] Grid created, size=%zu\n", grid.size());
-    fflush(stdout);
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-            int idx = y * W + x;
-            grid[0 * H * W + idx] = static_cast<float>(x);
-            grid[1 * H * W + idx] = static_cast<float>(y);
-            grid[2 * H * W + idx] = 1.0f;
-        }
-    }
-
     printf("[Patchifier] About to create coords, M=%d\n", M);
     fflush(stdout);
     
     // ------------------------------------------------
-    // Generate RANDOM coords (Python RANDOM mode) - full resolution
+    // Generate RANDOM coords at FEATURE MAP resolution (matching Python)
     // ------------------------------------------------
-    // CRITICAL: These random coordinates are used ONLY ONCE to initialize patches (landmarks)
+    // CRITICAL: Python generates coordinates at feature map resolution (h, w from fmap.shape)
+    // Python: x = torch.randint(1, w-1, ...) where w is feature map width
+    //         y = torch.randint(1, h-1, ...) where h is feature map height
+    // These coordinates are used DIRECTLY for all patchify operations (no scaling)
+    //
+    // These random coordinates are used ONLY ONCE to initialize patches (landmarks)
     // They define WHERE patches are extracted from the current frame
     // 
     // Later, in DPVO::update(), patches are tracked across frames using REPROJECTED coordinates:
@@ -142,53 +130,23 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     // Why random? Ensures good spatial coverage of the image, avoids bias toward specific regions
     // Each frame gets a fresh set of landmarks initialized at random locations
     m_last_coords.resize(M * 2);
+    // Generate coordinates at FEATURE MAP resolution (matching Python)
     for (int m = 0; m < M; m++)
     {
-        m_last_coords[m * 2 + 0] = 1 + rand() % (W - 2);
-        m_last_coords[m * 2 + 1] = 1 + rand() % (H - 2);
+        m_last_coords[m * 2 + 0] = 1.0f + static_cast<float>(rand() % (fmap_W - 2));
+        m_last_coords[m * 2 + 1] = 1.0f + static_cast<float>(rand() % (fmap_H - 2));
     }
-    const float* coords = m_last_coords.data();
-    printf("[Patchifier] Coords created\n");
-    fflush(stdout);
-
-    printf("[Patchifier] About to call patchify_cpu_safe (patches)\n");
-    fflush(stdout);
-    
-    // ------------------------------------------------
-    // Patchify grid → patches (RGB) - full resolution
-    // ------------------------------------------------
-    patchify_cpu_safe(
-        grid.data(), coords,
-        M, 3, H, W,
-        m_patch_size / 2,
-        patches);
-    
-    printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
-    fflush(stdout);
-
-    printf("[Patchifier] About to create fmap_coords\n");
-    fflush(stdout);
-    
-    // ------------------------------------------------
-    // Patchify fmap → gmap - scale coords to feature map resolution
-    // ------------------------------------------------
-    std::vector<float> fmap_coords(M * 2);
-    float scale_x = static_cast<float>(fmap_W) / static_cast<float>(W);
-    float scale_y = static_cast<float>(fmap_H) / static_cast<float>(H);
-    for (int m = 0; m < M; m++)
-    {
-        float fx = coords[m * 2 + 0] * scale_x;
-        float fy = coords[m * 2 + 1] * scale_y;
-        fmap_coords[m * 2 + 0] = std::max(0.0f, std::min(static_cast<float>(fmap_W - 1), fx));
-        fmap_coords[m * 2 + 1] = std::max(0.0f, std::min(static_cast<float>(fmap_H - 1), fy));
-    }
-    printf("[Patchifier] fmap_coords created\n");
+    const float* coords = m_last_coords.data();  // coords are at feature map resolution
+    printf("[Patchifier] Coords created at feature map resolution: fmap_H=%d, fmap_W=%d\n", fmap_H, fmap_W);
     fflush(stdout);
 
     printf("[Patchifier] About to call patchify_cpu_safe (gmap)\n");
     fflush(stdout);
+    // ------------------------------------------------
+    // Patchify fmap → gmap (using coords directly at feature map resolution)
+    // ------------------------------------------------
     patchify_cpu_safe(
-        fmap, fmap_coords.data(),
+        fmap, coords,  // Use coords directly (already at feature map resolution)
         M, 128, fmap_H, fmap_W,
         m_patch_size / 2,
         gmap);
@@ -199,6 +157,7 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     fflush(stdout);
     // ------------------------------------------------
     // imap sampling (radius = 0) - extract patches from m_imap_buffer
+    // Use coords directly (already at feature map resolution)
     // ------------------------------------------------
 #ifdef USE_ONNX_RUNTIME
     bool models_available = (m_useOnnxRuntime && m_fnet_onnx != nullptr && m_inet_onnx != nullptr) ||
@@ -216,15 +175,15 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
                imap_buffer_sample_min, imap_buffer_sample_max, m_imap_buffer.size());
         fflush(stdout);
         
-        printf("[Patchifier] fmap_coords for imap extraction:\n");
+        printf("[Patchifier] coords for imap extraction (at feature map resolution):\n");
         for (int m = 0; m < std::min(M, 8); m++) {
             printf("[Patchifier]   Patch %d: x=%.2f, y=%.2f (fmap_H=%d, fmap_W=%d)\n", 
-                   m, fmap_coords[m*2+0], fmap_coords[m*2+1], fmap_H, fmap_W);
+                   m, coords[m*2+0], coords[m*2+1], fmap_H, fmap_W);
         }
         fflush(stdout);
         
         patchify_cpu_safe(
-            m_imap_buffer.data(), fmap_coords.data(),
+            m_imap_buffer.data(), coords,  // Use coords directly (already at feature map resolution)
             M, inet_output_channels, fmap_H, fmap_W,
             0,
             imap);
@@ -248,24 +207,108 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     printf("[Patchifier] patchify_cpu_safe (imap) completed\n");
     fflush(stdout);
 
+    printf("[Patchifier] About to call patchify_cpu_safe (patches)\n");
+    fflush(stdout);
+    
+    // ------------------------------------------------
+    // Patchify grid → patches (RGB)
+    // Python: patches = altcorr.patchify(grid[0], coords, P//2)
+    // where grid is created from disps with shape (b, n, h, w) where h, w are feature map dimensions
+    // So coords are at feature map resolution, and grid is also at feature map resolution
+    // ------------------------------------------------
+    // CRITICAL: Grid must be created at FEATURE MAP resolution to match Python
+    // Python: grid, _ = coords_grid_with_index(disps, device=fmap.device)
+    // where disps = torch.ones(b, n, h, w) and h, w are feature map dimensions
+    std::vector<float> grid_fmap(3 * fmap_H * fmap_W);
+    for (int y = 0; y < fmap_H; y++) {
+        for (int x = 0; x < fmap_W; x++) {
+            int idx = y * fmap_W + x;
+            grid_fmap[0 * fmap_H * fmap_W + idx] = static_cast<float>(x);
+            grid_fmap[1 * fmap_H * fmap_W + idx] = static_cast<float>(y);
+            grid_fmap[2 * fmap_H * fmap_W + idx] = 1.0f;
+        }
+    }
+    
+    patchify_cpu_safe(
+        grid_fmap.data(), coords,  // coords are at feature map resolution, grid is also at feature map resolution
+        M, 3, fmap_H, fmap_W,
+        m_patch_size / 2,
+        patches);
+    
+    printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
+    fflush(stdout);
+    
+    // Save patchify outputs for comparison with Python (frame 0 only)
+    static bool patchify_outputs_saved = false;
+    if (!patchify_outputs_saved) {
+        // Save coordinates
+        std::ofstream coords_file("cpp_coords_frame0.bin", std::ios::binary);
+        if (coords_file.is_open()) {
+            coords_file.write(reinterpret_cast<const char*>(coords), M * 2 * sizeof(float));
+            coords_file.close();
+            printf("[Patchifier] Saved coordinates to cpp_coords_frame0.bin: M=%d, size=%zu bytes\n", M, M * 2 * sizeof(float));
+            fflush(stdout);
+        }
+        
+        // Save gmap: [M, 128, P, P] = [4, 128, 3, 3]
+        std::ofstream gmap_file("cpp_gmap_frame0.bin", std::ios::binary);
+        if (gmap_file.is_open()) {
+            int gmap_size = M * 128 * m_patch_size * m_patch_size;
+            gmap_file.write(reinterpret_cast<const char*>(gmap), gmap_size * sizeof(float));
+            gmap_file.close();
+            printf("[Patchifier] Saved gmap to cpp_gmap_frame0.bin: shape=[%d, 128, %d, %d], size=%zu bytes\n",
+                   M, m_patch_size, m_patch_size, gmap_size * sizeof(float));
+            fflush(stdout);
+        }
+        
+        // Save imap: [M, 384, 1, 1] = [4, 384, 1, 1]
+        std::ofstream imap_file("cpp_imap_frame0.bin", std::ios::binary);
+        if (imap_file.is_open()) {
+            int imap_size = M * inet_output_channels * 1 * 1;
+            imap_file.write(reinterpret_cast<const char*>(imap), imap_size * sizeof(float));
+            imap_file.close();
+            printf("[Patchifier] Saved imap to cpp_imap_frame0.bin: shape=[%d, %d, 1, 1], size=%zu bytes\n",
+                   M, inet_output_channels, imap_size * sizeof(float));
+            fflush(stdout);
+        }
+        
+        // Save patches: [M, 3, P, P] = [4, 3, 3, 3]
+        std::ofstream patches_file("cpp_patches_frame0.bin", std::ios::binary);
+        if (patches_file.is_open()) {
+            int patches_size = M * 3 * m_patch_size * m_patch_size;
+            patches_file.write(reinterpret_cast<const char*>(patches), patches_size * sizeof(float));
+            patches_file.close();
+            printf("[Patchifier] Saved patches to cpp_patches_frame0.bin: shape=[%d, 3, %d, %d], size=%zu bytes\n",
+                   M, m_patch_size, m_patch_size, patches_size * sizeof(float));
+            fflush(stdout);
+        }
+        
+        patchify_outputs_saved = true;
+    }
+
     printf("[Patchifier] About to extract colors\n");
     fflush(stdout);
     // ------------------------------------------------
     // Color for visualization - full resolution
     // ------------------------------------------------
-    // CRITICAL: coords are at model input size (H, W), but image_for_colors is at full resolution
-    // Scale coordinates to full image size if H_image and W_image are provided
+    // CRITICAL: coords are at feature map resolution (fmap_H, fmap_W)
+    // but image_for_colors is at full resolution (H_image, W_image)
+    // Scale coordinates from feature map resolution to full image size
+    // Python: clr = altcorr.patchify(images[0], 4*(coords + 0.5), 0)
+    // where images[0] is at full resolution and coords are at feature map resolution
+    // The factor 4 scales from feature map to full resolution (RES=4)
     if (image_for_colors != nullptr) {
-        int H_color = (H_image > 0) ? H_image : H;  // Use full image size if provided
-        int W_color = (W_image > 0) ? W_image : W;   // Use full image size if provided
-        float scale_x = static_cast<float>(W_color) / static_cast<float>(W);
-        float scale_y = static_cast<float>(H_color) / static_cast<float>(H);
+        int H_color = (H_image > 0) ? H_image : fmap_H * 4;  // Scale from feature map to full resolution
+        int W_color = (W_image > 0) ? W_image : fmap_W * 4;   // Scale from feature map to full resolution
+        float scale_x = static_cast<float>(W_color) / static_cast<float>(fmap_W);
+        float scale_y = static_cast<float>(H_color) / static_cast<float>(fmap_H);
         
         for (int m = 0; m < M; m++)
         {
-            // Scale coordinates from model input size to full image size
-            float x_scaled = coords[m * 2 + 0] * scale_x;
-            float y_scaled = coords[m * 2 + 1] * scale_y;
+            // Scale coordinates from feature map resolution to full image size
+            // Python uses: 4*(coords + 0.5), so we match that
+            float x_scaled = (coords[m * 2 + 0] + 0.5f) * scale_x;
+            float y_scaled = (coords[m * 2 + 1] + 0.5f) * scale_y;
             int x = static_cast<int>(std::round(x_scaled));
             int y = static_cast<int>(std::round(y_scaled));
             x = std::max(0, std::min(x, W_color - 1));
@@ -349,19 +392,114 @@ void Patchifier::forward(
     if (m_useOnnxRuntime) {
         // Use ONNX Runtime models
         if (logger_patch) logger_patch->info("[Patchifier] About to call fnet_onnx->runInference (tensor)");
+        bool fnet_success = false;
         if (m_fnet_onnx && !m_fnet_onnx->runInference(imgTensor, m_fmap_buffer.data())) {
             if (logger_patch) logger_patch->error("[Patchifier] fnet_onnx->runInference (tensor) failed");
             std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
         } else {
+            fnet_success = true;
             if (logger_patch) logger_patch->info("[Patchifier] fnet_onnx->runInference (tensor) successful");
         }
         
         if (logger_patch) logger_patch->info("[Patchifier] About to call inet_onnx->runInference (tensor)");
+        bool inet_success = false;
         if (m_inet_onnx && !m_inet_onnx->runInference(imgTensor, m_imap_buffer.data())) {
             if (logger_patch) logger_patch->error("[Patchifier] inet_onnx->runInference (tensor) failed");
             std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
         } else {
+            inet_success = true;
             if (logger_patch) logger_patch->info("[Patchifier] inet_onnx->runInference (tensor) successful");
+        }
+        
+        // Save frame 0 and frame 1 outputs to binary files for comparison with Python
+        static int frame_counter = 0;
+        if (fnet_success && inet_success) {
+            frame_counter++;
+            
+            // Get output dimensions for logging
+            int fnet_C = 128;  // FNet output channels
+            int fnet_H = fmap_H;
+            int fnet_W = fmap_W;
+            int inet_C = inet_output_channels;  // INet output channels (384)
+            int inet_H = fmap_H;
+            int inet_W = fmap_W;
+            
+            // Save frame 0
+            if (frame_counter == 1) {
+                // Save fnet output
+                std::ofstream fnet_file("fnet_frame0.bin", std::ios::binary);
+                if (fnet_file.is_open()) {
+                    size_t fnet_size = m_fmap_buffer.size() * sizeof(float);
+                    fnet_file.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fnet_size);
+                    fnet_file.close();
+                    if (logger_patch) {
+                        logger_patch->info("[Patchifier] Saved fnet output to fnet_frame0.bin: "
+                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
+                                           fnet_C, fnet_H, fnet_W, fnet_size, m_fmap_buffer.size());
+                    }
+                    printf("[Patchifier] Saved fnet output to fnet_frame0.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
+                           fnet_C, fnet_H, fnet_W, fnet_size);
+                    fflush(stdout);
+                } else {
+                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open fnet_frame0.bin for writing");
+                }
+                
+                // Save inet output
+                std::ofstream inet_file("inet_frame0.bin", std::ios::binary);
+                if (inet_file.is_open()) {
+                    size_t inet_size = m_imap_buffer.size() * sizeof(float);
+                    inet_file.write(reinterpret_cast<const char*>(m_imap_buffer.data()), inet_size);
+                    inet_file.close();
+                    if (logger_patch) {
+                        logger_patch->info("[Patchifier] Saved inet output to inet_frame0.bin: "
+                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
+                                           inet_C, inet_H, inet_W, inet_size, m_imap_buffer.size());
+                    }
+                    printf("[Patchifier] Saved inet output to inet_frame0.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
+                           inet_C, inet_H, inet_W, inet_size);
+                    fflush(stdout);
+                } else {
+                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open inet_frame0.bin for writing");
+                }
+            }
+            // Save frame 1
+            else if (frame_counter == 2) {
+                // Save fnet output
+                std::ofstream fnet_file("fnet_frame1.bin", std::ios::binary);
+                if (fnet_file.is_open()) {
+                    size_t fnet_size = m_fmap_buffer.size() * sizeof(float);
+                    fnet_file.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fnet_size);
+                    fnet_file.close();
+                    if (logger_patch) {
+                        logger_patch->info("[Patchifier] Saved fnet output to fnet_frame1.bin: "
+                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
+                                           fnet_C, fnet_H, fnet_W, fnet_size, m_fmap_buffer.size());
+                    }
+                    printf("[Patchifier] Saved fnet output to fnet_frame1.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
+                           fnet_C, fnet_H, fnet_W, fnet_size);
+                    fflush(stdout);
+                } else {
+                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open fnet_frame1.bin for writing");
+                }
+                
+                // Save inet output
+                std::ofstream inet_file("inet_frame1.bin", std::ios::binary);
+                if (inet_file.is_open()) {
+                    size_t inet_size = m_imap_buffer.size() * sizeof(float);
+                    inet_file.write(reinterpret_cast<const char*>(m_imap_buffer.data()), inet_size);
+                    inet_file.close();
+                    if (logger_patch) {
+                        logger_patch->info("[Patchifier] Saved inet output to inet_frame1.bin: "
+                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
+                                           inet_C, inet_H, inet_W, inet_size, m_imap_buffer.size());
+                    }
+                    printf("[Patchifier] Saved inet output to inet_frame1.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
+                           inet_C, inet_H, inet_W, inet_size);
+                    fflush(stdout);
+                } else {
+                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open inet_frame1.bin for writing");
+                }
+            }
         }
     } else {
         // Use AMBA EazyAI models

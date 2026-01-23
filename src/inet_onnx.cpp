@@ -5,6 +5,8 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <cmath>
+#include <opencv2/opencv.hpp>
 
 // ONNX Runtime includes
 #ifdef USE_ONNX_RUNTIME
@@ -216,44 +218,43 @@ bool INetInferenceONNX::_loadInput(void* imgTensor, std::vector<float>& input_da
     // Resize input_data if needed
     input_data.resize(m_inputChannel * m_inputHeight * m_inputWidth);
     
-    // Convert from uint8_t [C, H, W] to float [C, H, W] normalized
-    // Normalization: 2 * (image / 255.0) - 0.5 = (2 * image - 127.5) / 255.0
+    // CRITICAL: Use OpenCV resize and cvtColor to exactly match Python DPVO preprocessing
+    // This ensures 100% identical results with Python DPVO
     const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
     
-    // Resize if dimensions don't match (using nearest neighbor)
-    if (H == m_inputHeight && W == m_inputWidth) {
-        // Direct copy when dimensions match
-        for (int c = 0; c < m_inputChannel; c++) {
-            for (int y = 0; y < H; y++) {
-                for (int x = 0; x < W; x++) {
-                    int src_idx = c * H * W + y * W + x;
-                    int dst_idx = c * m_inputHeight * m_inputWidth + y * m_inputWidth + x;
-                    float normalized = (2.0f * src[src_idx] - 127.5f) / 255.0f;
-                    input_data[dst_idx] = normalized;
-                }
+    // Convert from [C, H, W] BGR to cv::Mat [H, W, C] BGR format
+    cv::Mat img_bgr(H, W, CV_8UC3);
+    for (int c = 0; c < 3; c++) {
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int src_idx = c * H * W + y * W + x;
+                img_bgr.at<cv::Vec3b>(y, x)[c] = src[src_idx];
             }
         }
+    }
+    
+    // Resize using OpenCV INTER_LINEAR (exactly matches Python DPVO)
+    cv::Mat img_resized;
+    if (H == m_inputHeight && W == m_inputWidth) {
+        img_resized = img_bgr.clone();
     } else {
-        // Resize using nearest neighbor interpolation
-        float scale_x = static_cast<float>(W) / static_cast<float>(m_inputWidth);
-        float scale_y = static_cast<float>(H) / static_cast<float>(m_inputHeight);
-        
-        for (int c = 0; c < m_inputChannel; c++) {
-            for (int y = 0; y < m_inputHeight; y++) {
-                for (int x = 0; x < m_inputWidth; x++) {
-                    // Map destination coordinates to source coordinates
-                    int src_x = static_cast<int>(x * scale_x);
-                    int src_y = static_cast<int>(y * scale_y);
-                    
-                    // Clamp to valid range
-                    src_x = std::max(0, std::min(src_x, W - 1));
-                    src_y = std::max(0, std::min(src_y, H - 1));
-                    
-                    int src_idx = c * H * W + src_y * W + src_x;
-                    int dst_idx = c * m_inputHeight * m_inputWidth + y * m_inputWidth + x;
-                    float normalized = (2.0f * src[src_idx] - 127.5f) / 255.0f;
-                    input_data[dst_idx] = normalized;
-                }
+        cv::resize(img_bgr, img_resized, cv::Size(m_inputWidth, m_inputHeight), 0, 0, cv::INTER_LINEAR);
+    }
+    
+    // Convert BGR to RGB using OpenCV (matches Python DPVO)
+    cv::Mat img_rgb;
+    cv::cvtColor(img_resized, img_rgb, cv::COLOR_BGR2RGB);
+    
+    // Normalize: 2 * (image / 255.0) - 0.5 (matches Python DPVO)
+    // Convert to float and normalize
+    img_rgb.convertTo(img_rgb, CV_32F, 2.0f / 255.0f, -0.5f);
+    
+    // Convert from [H, W, C] to [C, H, W] format for ONNX input
+    for (int c = 0; c < m_inputChannel; c++) {
+        for (int y = 0; y < m_inputHeight; y++) {
+            for (int x = 0; x < m_inputWidth; x++) {
+                int dst_idx = c * m_inputHeight * m_inputWidth + y * m_inputWidth + x;
+                input_data[dst_idx] = img_rgb.at<cv::Vec3f>(y, x)[c];
             }
         }
     }

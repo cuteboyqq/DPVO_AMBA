@@ -59,9 +59,10 @@ SE3 SE3::operator*(const SE3& other) const {
 // -----------------------------
 // Python: retr(self, a) = Exp(a) * X
 // This implements the exponential map for SE3, matching lietorch
+// CRITICAL: Input order matches lietorch convention: [tau, phi] = [translation, rotation]
 SE3 SE3::retr(const Eigen::Matrix<float,6,1>& dx) const {
-    Eigen::Vector3f dR = dx.head<3>();  // Rotation in Lie algebra so(3)
-    Eigen::Vector3f dt = dx.tail<3>();  // Translation update
+    Eigen::Vector3f dt = dx.head<3>();  // Translation (tau) - first 3 elements
+    Eigen::Vector3f dR = dx.tail<3>();  // Rotation (phi) - last 3 elements
     
     // Compute exponential map for rotation: Exp(dR) using Rodrigues' formula
     // This matches Python lietorch implementation (not small-angle approximation!)
@@ -97,10 +98,19 @@ SE3 SE3::retr(const Eigen::Matrix<float,6,1>& dx) const {
     // Compute exponential map for translation part
     // For SE3: Exp([dR, dt]) = [Exp(dR), V * dt]
     // where V = I + (1-cos(θ))/θ² * [dR]_× + (θ - sin(θ))/θ³ * [dR]_×²
+    // This matches lietorch's left_jacobian formula exactly
     Eigen::Matrix3f V;
     if (theta < 1e-6f) {
-        // Small angle: V ≈ I + (1/2)[dR]_×
-        V = Eigen::Matrix3f::Identity() + 0.5f * dR_skew;
+        // Small angle: use Taylor expansion matching lietorch exactly
+        // lietorch: coef1 = 1/2 - theta²/24, coef2 = 1/6 - theta²/120
+        // V = I + coef1 * Phi + coef2 * Phi²
+        float theta2 = theta * theta;
+        float coef1 = 0.5f - (1.0f / 24.0f) * theta2;
+        float coef2 = (1.0f / 6.0f) - (1.0f / 120.0f) * theta2;
+        
+        V = Eigen::Matrix3f::Identity()
+            + coef1 * dR_skew
+            + coef2 * dR_skew * dR_skew;
     } else {
         float one_minus_cos_over_theta2 = (1.0f - cos_theta) / (theta * theta);
         float theta_minus_sin_over_theta3 = (theta - sin_theta) / (theta * theta * theta);

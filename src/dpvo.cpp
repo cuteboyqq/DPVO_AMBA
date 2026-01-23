@@ -310,6 +310,12 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
 #endif
     }
     
+    if (logger) {
+        logger->info("\033[32m========================================\033[0m");
+        logger->info("\033[32mSTEP 2: DPVO::runAfterPatchify() - Post-Patchify Processing\033[0m");
+        logger->info("\033[32m========================================\033[0m");
+    }
+    
     // -------------------------------------------------
     // 2. Bookkeeping
     // -------------------------------------------------
@@ -345,13 +351,19 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
         }
     }
     
-    // Scale intrinsics from full image size to model input size, then to feature map size (1/4)
-    // Full image -> Model input: scale by (model_W / W_full, model_H / H_full)
-    // Model input -> Feature map: scale by RES=4
-    // Combined: scale = (model_W / W_full) / RES for x, (model_H / H_full) / RES for y
+    // Scale intrinsics from input image size to model input size, then to feature map size (1/4)
+    // Python DPVO_onnx behavior:
+    //   - If images are resized before DPVO (e.g., 1920x1080 -> 960x540), intrinsics are scaled accordingly
+    //   - Example: intrinsics [1660, 1660, 960, 540] -> [830, 830, 480, 270] (divided by 2)
+    //   - Then in DPVO: intrinsics / RES (where RES=4) -> [207.5, 207.5, 120, 67.5]
+    // C++ behavior:
+    //   - Input image size: H x W (may be full resolution or already resized)
+    //   - Model input size: model_H x model_W (models resize internally)
+    //   - Scale intrinsics: (model_W / W) / RES for x, (model_H / H) / RES for y
+    //   - This matches Python if images are already resized to match model input size
     const float RES = 4.0f;
-    float scale_x = static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Full image width
-    float scale_y = static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Full image height
+    float scale_x = 0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
+    float scale_y = 0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
     
     float scaled_intrinsics[4];
     scaled_intrinsics[0] = intrinsics_to_use[0] * scale_x / RES;  // fx: scale to model input, then to feature map
@@ -362,12 +374,17 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     std::memcpy(m_pg.m_intrinsics[n_use], scaled_intrinsics, sizeof(float) * 4);
     
     if (logger) {
-        logger->info("DPVO::runAfterPatchify: Intrinsics - input: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}, "
-                     "model input: {}x{}, scale: ({:.4f}, {:.4f}), "
-                     "scaled (stored): fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
-                     intrinsics_to_use[0], intrinsics_to_use[1], intrinsics_to_use[2], intrinsics_to_use[3],
-                     model_W, model_H, scale_x, scale_y,
+        logger->info("DPVO::runAfterPatchify: Intrinsics scaling:");
+        logger->info("  Input image size: {}x{}", W, H);
+        logger->info("  Model input size: {}x{}", model_W, model_H);
+        logger->info("  Input intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
+                     intrinsics_to_use[0], intrinsics_to_use[1], intrinsics_to_use[2], intrinsics_to_use[3]);
+        logger->info("  Scale factors: scale_x={:.4f}, scale_y={:.4f} (model/input), RES={:.0f}",
+                     scale_x, scale_y, RES);
+        logger->info("  Scaled (stored) intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
                      scaled_intrinsics[0], scaled_intrinsics[1], scaled_intrinsics[2], scaled_intrinsics[3]);
+        logger->info("  Note: Python DPVO_onnx receives intrinsics scaled to match input image resolution");
+        logger->info("        If input images are resized (e.g., 1920x1080 -> 960x540), intrinsics should be scaled by 0.5");
     }
     
     if (logger) logger->info("DPVO::runAfterPatchify: Bookkeeping completed");
@@ -377,116 +394,18 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     // -------------------------------------------------
     if (logger) logger->info("DPVO::runAfterPatchify: Starting pose initialization");
     
-    // Initialize pose for this frame with motion model
+    // // Initialize pose for this frame with motion model
     if (n_use == 0) {
         // First frame: use identity pose (origin, no rotation)
         m_pg.m_poses[n_use] = SE3();
         if (logger) logger->info("DPVO::runAfterPatchify: Initialized first frame pose to identity");
-    } else if (n_use == 1) {
+    // } else if (n_use == 1) {
+    }else {
         // Second frame: copy first frame pose (no motion initially)
         m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
         if (logger) logger->info("DPVO::runAfterPatchify: Initialized second frame pose from first frame");
-    } else {
-        // Subsequent frames: predict pose based on motion model
-        // Estimate velocity from previous 2 frames
-        SE3 pose_prev = m_pg.m_poses[n_use - 1];
-        SE3 pose_prev2 = m_pg.m_poses[n_use - 2];
-        
-        // Compute relative motion: delta = pose_prev * pose_prev2.inverse()
-        SE3 delta = pose_prev * pose_prev2.inverse();
-        
-        // Compute rotation change in delta for logging
-        float delta_rot_angle = delta.q.angularDistance(Eigen::Quaternionf::Identity());
-        float delta_t_norm = delta.t.norm();
-        
-        // CRITICAL: Clamp motion model delta to prevent large jumps
-        // Large deltas indicate pose errors that will cause invalid reprojections
-        // Use conservative limits to prevent over-rotation accumulation
-        const float max_delta_t = 0.1f;  // Max translation per frame (10cm)
-        const float max_delta_rot = 0.035f;  // Max rotation per frame (~2 degrees, reduced from 2.9)
-        
-        if (delta_t_norm > max_delta_t) {
-            if (logger && (n_use < 10 || n_use == m_pg.m_n - 1)) {
-                logger->warn("DPVO::runAfterPatchify: Clamping large translation delta: {:.6f} > {:.2f}, scaling down",
-                            delta_t_norm, max_delta_t);
-            }
-            delta.t = delta.t * (max_delta_t / delta_t_norm);
-            delta_t_norm = max_delta_t;  // Update for logging
-        }
-        
-        if (delta_rot_angle > max_delta_rot) {
-            if (logger && (n_use < 10 || n_use == m_pg.m_n - 1)) {
-                logger->warn("DPVO::runAfterPatchify: Clamping large rotation delta: {:.6f} rad ({:.2f} deg) > {:.4f} rad, using SLERP",
-                            delta_rot_angle, delta_rot_angle * 180.0f / M_PI, max_delta_rot);
-            }
-            // Use SLERP to interpolate towards identity quaternion
-            float t = max_delta_rot / delta_rot_angle;  // Interpolation factor
-            delta.q = delta.q.slerp(t, Eigen::Quaternionf::Identity());
-            delta_rot_angle = max_delta_rot;  // Update for logging
-        }
-        
-        // Predict next pose: pose_new = pose_prev * delta
-        // This assumes constant velocity motion model (both translation and rotation)
-        m_pg.m_poses[n_use] = pose_prev * delta;
-        
-        // If motion is too small or zero, add small forward motion to prevent stagnation
-        if (delta_t_norm < 1e-6f && delta_rot_angle < 1e-6f) {
-            // No motion detected, add small forward motion in camera Z direction (negative Z)
-            // Camera forward is -Z in camera frame
-            Eigen::Vector3f forward_dir = -pose_prev.R().col(2);  // -Z axis in world frame
-            float forward_speed = 0.01f;  // Small forward motion per frame
-            m_pg.m_poses[n_use].t = pose_prev.t + forward_dir * forward_speed;
-            // Keep rotation prediction (already set above)
-        }
-        
-        if (logger && (n_use < 10 || n_use == m_pg.m_n - 1)) {
-            Eigen::Vector3f t = m_pg.m_poses[n_use].t;
-            Eigen::Vector3f t_prev = pose_prev.t;
-            Eigen::Vector3f motion = t - t_prev;
-            
-            // Compute rotation change between predicted pose and previous pose
-            Eigen::Quaternionf q = m_pg.m_poses[n_use].q;
-            Eigen::Quaternionf q_prev = pose_prev.q;
-            float rot_change = q_prev.angularDistance(q);
-            
-            // Extract rotation axis and angle for logging
-            Eigen::AngleAxisf angle_axis(q_prev.inverse() * q);
-            
-            logger->info("DPVO::runAfterPatchify: Initialized frame {} pose - "
-                         "t=({:.3f}, {:.3f}, {:.3f}), motion=({:.6f}, {:.6f}, {:.6f}), motion_norm={:.6f}, "
-                         "rot_change={:.6f} rad ({:.3f} deg), rot_axis=({:.3f}, {:.3f}, {:.3f}), "
-                         "delta_t_norm={:.6f}, delta_rot_angle={:.6f} rad ({:.3f} deg)",
-                         n_use, t.x(), t.y(), t.z(), 
-                         motion.x(), motion.y(), motion.z(), motion.norm(),
-                         rot_change, rot_change * 180.0f / M_PI,
-                         angle_axis.axis().x(), angle_axis.axis().y(), angle_axis.axis().z(),
-                         delta_t_norm, delta_rot_angle, delta_rot_angle * 180.0f / M_PI);
-        }
-    }
-    
-    // Validate pose: check if translation is reasonable (prevent divergence)
-    // CRITICAL: If poses become too wrong, they cause invalid reprojections (points behind camera)
-    // This creates a feedback loop where wrong poses → invalid edges → no BA updates → poses stay wrong
-    Eigen::Vector3f t = m_pg.m_poses[n_use].t;
-    float t_norm = t.norm();
-    
-    // More aggressive threshold: if pose is > 10 units from origin, it's likely wrong
-    // This prevents the feedback loop where wrong poses cause more wrong poses
-    const float max_pose_distance = 10.0f;
-    if (t_norm > max_pose_distance) {
-        if (logger) {
-            logger->warn("DPVO::runAfterPatchify: Pose translation too large (norm={:.2f} > {:.2f}), resetting to previous pose. "
-                         "This indicates pose divergence. t=({:.2f}, {:.2f}, {:.2f})",
-                         t_norm, max_pose_distance, t.x(), t.y(), t.z());
-        }
-        // Reset to previous pose instead of identity to maintain continuity
-        if (n_use > 0) {
-            m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
-        } else {
-            m_pg.m_poses[n_use] = SE3();
-        }
-    }
-    
+    } 
+
     // Store pose in historical buffer for visualization
     // Store immediately after initialization to ensure consecutive poses
     // Bundle adjustment will update these poses later via sync mechanism
@@ -567,50 +486,54 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
             continue;
         }
         
-        float px_center_full = patch_coords[i * 2 + 0];
-        float py_center_full = patch_coords[i * 2 + 1];
+        // CRITICAL: patch_coords are now at FEATURE MAP resolution (matching Python)
+        // Python: coords are generated at feature map resolution (h, w from fmap.shape)
+        // and stored directly in patches without scaling
+        float px_center_fmap = patch_coords[i * 2 + 0];
+        float py_center_fmap = patch_coords[i * 2 + 1];
         
-        if (px_center_full < 0 || px_center_full >= W || py_center_full < 0 || py_center_full >= H) {
-            if (logger) logger->warn("DPVO::runAfterPatchify: Patch[{}] has invalid coordinates: ({:.2f}, {:.2f}), image size=({}, {})",
-                                     i, px_center_full, py_center_full, W, H);
-            px_center_full = std::max(0.0f, std::min(px_center_full, static_cast<float>(W - 1)));
-            py_center_full = std::max(0.0f, std::min(py_center_full, static_cast<float>(H - 1)));
+        // Validate coordinates are within feature map bounds
+        int fmap_H = m_patchifier.getOutputHeight();
+        int fmap_W = m_patchifier.getOutputWidth();
+        if (px_center_fmap < 0 || px_center_fmap >= fmap_W || py_center_fmap < 0 || py_center_fmap >= fmap_H) {
+            if (logger) logger->warn("DPVO::runAfterPatchify: Patch[{}] has invalid coordinates: ({:.2f}, {:.2f}), fmap size=({}, {})",
+                                     i, px_center_fmap, py_center_fmap, fmap_W, fmap_H);
+            px_center_fmap = std::max(0.0f, std::min(px_center_fmap, static_cast<float>(fmap_W - 1)));
+            py_center_fmap = std::max(0.0f, std::min(py_center_fmap, static_cast<float>(fmap_H - 1)));
         }
         
         if (logger && i < 3) {
-            logger->info("DPVO::runAfterPatchify: Storing patch[{}]: center_full_res=({:.2f}, {:.2f})",
-                         i, px_center_full, py_center_full);
+            logger->info("DPVO::runAfterPatchify: Storing patch[{}]: center_fmap_res=({:.2f}, {:.2f})",
+                         i, px_center_fmap, py_center_fmap);
         }
         
-        // CRITICAL FIX: Store actual pixel coordinates for each pixel in the patch
+        // CRITICAL: Store actual pixel coordinates for each pixel in the patch
         // patches array from patchify_cpu_safe contains [M, 3, patch_D, patch_D]
         // Channel 0: x coordinates, Channel 1: y coordinates, Channel 2: RGB values
-        // We need to extract the center P×P region and scale coordinates by RES
+        // Patches are now at FEATURE MAP resolution (matching Python), so store directly without scaling
+        // Python: patches = altcorr.patchify(grid[0], coords, P//2) where grid and coords are at feature map resolution
         for (int y = 0; y < P; y++) {
             for (int x = 0; x < P; x++) {
-                // Extract pixel coordinates from patches array (at full resolution)
+                // Extract pixel coordinates from patches array (at feature map resolution)
                 // patches layout: [M, 3, patch_D, patch_D]
                 int patch_x_idx = (i * 3 + 0) * patch_D * patch_D + (center_offset + y) * patch_D + (center_offset + x);
                 int patch_y_idx = (i * 3 + 1) * patch_D * patch_D + (center_offset + y) * patch_D + (center_offset + x);
                 int patch_d_idx = (i * 3 + 2) * patch_D * patch_D + (center_offset + y) * patch_D + (center_offset + x);
                 
-                // Get pixel coordinates from patches (full resolution)
-                float px_pixel_full = patches[patch_x_idx];
-                float py_pixel_full = patches[patch_y_idx];
+                // Get pixel coordinates from patches (at feature map resolution)
+                float px_pixel_fmap = patches[patch_x_idx];
+                float py_pixel_fmap = patches[patch_y_idx];
                 
-                // Scale to 1/4 resolution (matching intrinsics)
-                float px_pixel_scaled = px_pixel_full / RES;
-                float py_pixel_scaled = py_pixel_full / RES;
-                
-                // Store pixel coordinates and inverse depth
-                m_pg.m_patches[n_use][i][0][y][x] = px_pixel_scaled;
-                m_pg.m_patches[n_use][i][1][y][x] = py_pixel_scaled;
+                // Store pixel coordinates directly (already at feature map resolution, matching Python)
+                // Python stores patches at feature map resolution without scaling
+                m_pg.m_patches[n_use][i][0][y][x] = px_pixel_fmap;
+                m_pg.m_patches[n_use][i][1][y][x] = py_pixel_fmap;
                 m_pg.m_patches[n_use][i][2][y][x] = patches[patch_d_idx];  // Inverse depth (from RGB channel, will be overwritten)
                 
                 // Diagnostic: Log first pixel coordinates for first patch
                 if (logger && i == 0 && y == 0 && x == 0) {
-                    logger->info("DPVO::runAfterPatchify: Patch[0] pixel[0][0] - full=({:.2f}, {:.2f}), scaled=({:.2f}, {:.2f})",
-                                 px_pixel_full, py_pixel_full, px_pixel_scaled, py_pixel_scaled);
+                    logger->info("DPVO::runAfterPatchify: Patch[0] pixel[0][0] - fmap_res=({:.2f}, {:.2f})",
+                                 px_pixel_fmap, py_pixel_fmap);
                 }
             }
         }
@@ -778,33 +701,9 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     } else if (m_pg.m_n >= 8) {
         if (logger) logger->info("DPVO::runAfterPatchify: Initializing with 12 update() calls");
         m_is_initialized = true;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 12; i++) {
             if (logger) logger->info("DPVO::runAfterPatchify: Initialization update() call {}/12", i+1);
             update();
-             // Update viewer after optimization
-        if (m_visualizationEnabled) {
-            updateViewer();
-            if (m_viewer != nullptr && image_for_viewer != nullptr) {
-                // Image is in [C, H, W] format (RGB), convert to [H, W, C] for viewer
-                std::vector<uint8_t> image_rgb(H * W * 3);
-                for (int c = 0; c < 3; c++) {
-                    for (int h = 0; h < H; h++) {
-                        for (int w = 0; w < W; w++) {
-                            int src_idx = c * H * W + h * W + w;
-                            int dst_idx = h * W * 3 + w * 3 + c;
-                            if (src_idx >= 0 && src_idx < H * W * 3 && 
-                                dst_idx >= 0 && dst_idx < H * W * 3) {
-                                image_rgb[dst_idx] = image_for_viewer[src_idx];
-                            }
-                        }
-                    }
-                }
-                m_viewer->updateImage(image_rgb.data(), W, H);
-                if (logger) {
-                    logger->info("Viewer: Updated image {}x{}", W, H);
-                }
-            }
-        }
         }
         if (logger) logger->info("DPVO::runAfterPatchify: Initialization completed");
     }
@@ -833,21 +732,31 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     
     auto logger = spdlog::get("dpvo");
     if (logger) {
-        logger->info("DPVO::run (tensor): H={}, W={}", H, W);
+        logger->info("\033[32m========================================\033[0m");
+        logger->info("\033[32mSTEP 1: DPVO::run() - Frame Processing\033[0m");
+        logger->info("\033[32m========================================\033[0m");
+        logger->info("DPVO::run (tensor): Input image size: H={}, W={}", H, W);
     }
     
     // Use intrinsics_in if provided, otherwise use stored m_intrinsics
     const float* intrinsics = (intrinsics_in != nullptr) ? intrinsics_in : m_intrinsics;
+    
+    if (logger && intrinsics != nullptr) {
+        logger->info("DPVO::run (tensor): Input intrinsics: fx={:.2f}, fy={:.2f}, cx={:.2f}, cy={:.2f}",
+                     intrinsics[0], intrinsics[1], intrinsics[2], intrinsics[3]);
+        logger->info("DPVO::run (tensor): Note - Intrinsics should match input image resolution");
+        logger->info("DPVO::run (tensor):       If images are resized before DPVO, intrinsics should be scaled accordingly");
+    }
     
     // Store timestamp
     m_currentTimestamp = timestamp;
     
     // Validate and get n (same logic as uint8_t* version)
     int n = 0;
-    if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 1000) {
+    if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 999999) {
         try {
             m_pg.reset();
-            if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 1000) {
+            if (m_pg.m_n < 0 || m_pg.m_n >= PatchGraph::N || m_pg.m_n > 999999) {
                 m_pg.m_n = 0;
                 m_pg.m_m = 0;
             }
@@ -960,12 +869,20 @@ void DPVO::update()
     if (num_active == 0)
         return;
 
+    auto logger = spdlog::get("dpvo");
+    if (logger) {
+        logger->info("\033[32m========================================\033[0m");
+        logger->info("\033[32mSTEP 3: DPVO::update() - Update Model + BA\033[0m");
+        logger->info("\033[32m========================================\033[0m");
+    }
+
     const int M = m_cfg.PATCHES_PER_FRAME;
     const int P = m_P;
 
     // -------------------------------------------------
     // 1. Reprojection
     // -------------------------------------------------
+    if (logger) logger->info("\033[32m--- Step 3.1: Reprojection ---\033[0m");
     std::vector<float> coords(num_active * 2 * P * P); // [num_active, 2, P, P]
     reproject(
         m_pg.m_ii, m_pg.m_jj, m_pg.m_kk,
@@ -976,6 +893,7 @@ void DPVO::update()
     // -------------------------------------------------
     // 2. Correlation
     // -------------------------------------------------
+    if (logger) logger->info("\033[32m--- Step 3.2: Correlation ---\033[0m");
     // CRITICAL: Pass full buffers (m_fmap1, m_fmap2), not single-frame pointers (m_cur_fmap1)
     // computeCorrelation needs to access multiple frames based on jj[e] indices
     // Correlation output shape: [num_active, D, D, P, P, 2] where D = 2*R + 2 = 8 (R=3)
@@ -983,7 +901,6 @@ void DPVO::update()
     const int D = 2 * R + 2;  // Correlation window diameter (D = 8)
     std::vector<float> corr(num_active * D * D * P * P * 2); // [num_active, D, D, P, P, 2] (channel last)
     
-    auto logger = spdlog::get("dpvo");
     if (logger) {
         logger->info("DPVO::update: Starting correlation, num_active={}, M={}, P={}, D={}, m_mem={}, m_pmem={}", 
                      num_active, M, P, D, m_mem, m_pmem);
@@ -1166,6 +1083,7 @@ void DPVO::update()
         
         // Reshape inputs using member function (reuses pre-allocated buffers)
         const int CORR_DIM = 882;
+        if (logger) logger->info("\033[32m--- Step 3.3: Update Model Input Reshaping ---\033[0m");
 #ifdef USE_ONNX_RUNTIME
         if (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) {
             num_edges_to_process = m_updateModel_onnx->reshapeInput(
@@ -1251,37 +1169,10 @@ void DPVO::update()
                          std::min(num_edges_to_process, 10), net_zero_count, net_nonzero_count, net_min, net_max);
         }
         
-        // Validate model inputs for NaN/Inf before inference
-        if (logger) {
-            int net_nan_count = 0;
-            int inp_nan_count = 0;
-            int corr_nan_count = 0;
-            
-            for (size_t i = 0; i < m_reshape_net_input.size(); i++) {
-                if (!std::isfinite(m_reshape_net_input[i])) {
-                    net_nan_count++;
-                }
-            }
-            for (size_t i = 0; i < m_reshape_inp_input.size(); i++) {
-                if (!std::isfinite(m_reshape_inp_input[i])) {
-                    inp_nan_count++;
-                }
-            }
-            for (size_t i = 0; i < m_reshape_corr_input.size(); i++) {
-                if (!std::isfinite(m_reshape_corr_input[i])) {
-                    corr_nan_count++;
-                }
-            }
-            
-            if (net_nan_count > 0 || inp_nan_count > 0 || corr_nan_count > 0) {
-                logger->warn("DPVO::update: Model inputs contain NaN/Inf - net: {}, inp: {}, corr: {}",
-                            net_nan_count, inp_nan_count, corr_nan_count);
-            }
-        }
-        
         // Call update model inference synchronously
         DPVOUpdate_Prediction pred;
         if (logger) {
+            logger->info("\033[32m--- Step 3.4: Update Model Inference ---\033[0m");
             logger->info("DPVO::update: About to call update model runInference");
             logger->info("DPVO::update: Input data ready - net_input size={}, inp_input size={}, corr_input size={}",
                          m_reshape_net_input.size(), m_reshape_inp_input.size(), m_reshape_corr_input.size());
@@ -1335,43 +1226,10 @@ void DPVO::update()
             // w_out contains weight: [1, 2, 384, 1] -> we'll use first channel
             
             if (pred.dOutBuff != nullptr && pred.wOutBuff != nullptr) {
-                // Extract delta from d_out: YAML layout [N, C, H, W] = [1, 2, m_maxEdge, 1]
+                // Extract outputs directly without validation (matching Python behavior)
+                // Python doesn't validate NaN/Inf - it relies on the framework to handle it
                 int zero_weight_count = 0;
-                int nan_delta_count = 0;
-                int nan_weight_count = 0;
                 
-                // First pass: Validate model outputs for NaN/Inf
-                for (int e = 0; e < num_edges_to_process; e++) {
-                    int idx0 = 0 * 2 * m_maxEdge * 1 + 0 * m_maxEdge * 1 + e * 1 + 0;
-                    int idx1 = 0 * 2 * m_maxEdge * 1 + 1 * m_maxEdge * 1 + e * 1 + 0;
-                    
-                    float dx_raw = pred.dOutBuff[idx0];
-                    float dy_raw = pred.dOutBuff[idx1];
-                    float w0_raw = pred.wOutBuff[idx0];
-                    float w1_raw = pred.wOutBuff[idx1];
-                    
-                    if (!std::isfinite(dx_raw) || !std::isfinite(dy_raw)) {
-                        nan_delta_count++;
-                        if (logger && nan_delta_count <= 5) {
-                            logger->warn("DPVO::update: Model output NaN/Inf delta for edge[{}]: dx={}, dy={}", 
-                                        e, dx_raw, dy_raw);
-                        }
-                    }
-                    if (!std::isfinite(w0_raw) || !std::isfinite(w1_raw)) {
-                        nan_weight_count++;
-                        if (logger && nan_weight_count <= 5) {
-                            logger->warn("DPVO::update: Model output NaN/Inf weight for edge[{}]: w0={}, w1={}", 
-                                        e, w0_raw, w1_raw);
-                        }
-                    }
-                }
-                
-                if (logger && (nan_delta_count > 0 || nan_weight_count > 0)) {
-                    logger->warn("DPVO::update: Model output validation - {} edges have NaN/Inf delta, {} edges have NaN/Inf weight",
-                                nan_delta_count, nan_weight_count);
-                }
-                
-                // Second pass: Extract and sanitize outputs
                 for (int e = 0; e < num_edges_to_process; e++) {
                     // d_out layout: [N, C, H, W] = [1, 2, m_maxEdge, 1]
                     // Index: n * C * H * W + c * H * W + h * W + w
@@ -1379,50 +1237,29 @@ void DPVO::update()
                     int idx0 = 0 * 2 * m_maxEdge * 1 + 0 * m_maxEdge * 1 + e * 1 + 0;
                     int idx1 = 0 * 2 * m_maxEdge * 1 + 1 * m_maxEdge * 1 + e * 1 + 0;
                     
-                    float dx_raw = pred.dOutBuff[idx0];
-                    float dy_raw = pred.dOutBuff[idx1];
+                    // Extract delta directly (no sanitization, matching Python)
+                    delta[e * 2 + 0] = pred.dOutBuff[idx0];
+                    delta[e * 2 + 1] = pred.dOutBuff[idx1];
                     
-                    // Sanitize delta: replace NaN/Inf with zero
-                    if (!std::isfinite(dx_raw)) {
-                        dx_raw = 0.0f;
-                    }
-                    if (!std::isfinite(dy_raw)) {
-                        dy_raw = 0.0f;
-                    }
-                    
-                    delta[e * 2 + 0] = dx_raw;
-                    delta[e * 2 + 1] = dy_raw;
-                    
+                    // Extract weights directly (no sanitization, matching Python)
                     // w_out layout: [1, 2, m_maxEdge, 1] - 2 channels (weight_x, weight_y)
-                    // Channel 0 (weight for x-direction, same as delta x)
-                    float w0 = pred.wOutBuff[idx0];
-                    // Channel 1 (weight for y-direction, same as delta y)
-                    float w1 = pred.wOutBuff[idx1];
+                    float w0 = pred.wOutBuff[idx0];  // Channel 0: weight for x-direction
+                    float w1 = pred.wOutBuff[idx1];  // Channel 1: weight for y-direction
                     
-                    // Sanitize weight: replace NaN/Inf with zero
-                    if (!std::isfinite(w0)) {
-                        w0 = 0.0f;
-                    }
-                    if (!std::isfinite(w1)) {
-                        w1 = 0.0f;
-                    }
+                    // Match Python: store both weight channels separately (matching Python [1, M, 2] format)
+                    weight[e * 2 + 0] = w0;  // Channel 0: weight for x-direction
+                    weight[e * 2 + 1] = w1;  // Channel 1: weight for y-direction
                     
-                    // Store per-dimension weights: w0 for x, w1 for y
-                    // BA will use these separately for x and y residuals
-                    weight[e * 2 + 0] = w0;  // weight for x-direction
-                    weight[e * 2 + 1] = w1;  // weight for y-direction
-                    
-                    if (weight[e * 2 + 0] <= 0.0f || weight[e * 2 + 1] <= 0.0f) {
+                    // Count edges where both weight channels are zero
+                    if (w0 <= 0.0f && w1 <= 0.0f) {
                         zero_weight_count++;
                     }
                     
-                    // Debug: Log first few weights to compare channels
+                    // Debug: Log first few weights
                     if (logger && e < 3) {
-                        float diff = std::abs(w0 - w1);
-                        float ratio = (w1 > 0.0f) ? (w0 / w1) : 0.0f;
-                        logger->debug("DPVO::update: Weight extraction for edge[{}]: w0={:.6f} (x), w1={:.6f} (y), "
-                                     "diff={:.6f}, ratio={:.3f}",
-                                     e, w0, w1, diff, ratio);
+                        logger->debug("DPVO::update: Weight extraction for edge[{}]: w0={:.6f}, w1={:.6f} "
+                                     "(matching Python [1, M, 2] format)",
+                                     e, w0, w1);
                     }
                 }
                 
@@ -1487,14 +1324,14 @@ void DPVO::update()
     // -------------------------------------------------
     // 5. Compute target positions
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::update: Computing target positions, num_active={}", num_active);
-    int invalid_target_count = 0;
+    if (logger) {
+        logger->info("\033[32m--- Step 3.5: Target Computation ---\033[0m");
+        logger->info("DPVO::update: Computing target positions, num_active={}", num_active);
+    }
+    // Compute target positions directly without validation (matching Python behavior)
+    // Python: target = coords[...,self.P//2,self.P//2] + delta.float()
+    // Python doesn't validate NaN/Inf - it relies on the framework to handle it
     for (int e = 0; e < num_active; e++) {
-        // Validate edge index
-        if (e < 0 || e >= num_active) {
-            if (logger && e < 10) logger->error("DPVO::update: Invalid edge index e={} in target positions, num_active={}", e, num_active);
-            continue;
-        }
         // Get center pixel coordinates (i0=1, j0=1 for P=3)
         int center_i0 = P / 2;  // 1 for P=3
         int center_j0 = P / 2;  // 1 for P=3
@@ -1505,58 +1342,17 @@ void DPVO::update()
         float cx = coords[coord_x_idx];
         float cy = coords[coord_y_idx];
         
-        // Validate coordinates (check for NaN/Inf)
-        if (!std::isfinite(cx) || !std::isfinite(cy)) {
-            if (logger && invalid_target_count < 5) {
-                logger->warn("DPVO::update: Invalid coords for edge[{}]: cx={}, cy={}", e, cx, cy);
-            }
-            invalid_target_count++;
-            // Use previous target or zero as fallback
-            if (e > 0) {
-                m_pg.m_target[e * 2 + 0] = m_pg.m_target[(e-1) * 2 + 0];
-                m_pg.m_target[e * 2 + 1] = m_pg.m_target[(e-1) * 2 + 1];
-            } else {
-                m_pg.m_target[e * 2 + 0] = 0.0f;
-                m_pg.m_target[e * 2 + 1] = 0.0f;
-            }
-            m_pg.m_weight[e][0] = 0.0f;  // Invalidate this edge (x)
-            m_pg.m_weight[e][1] = 0.0f;  // Invalidate this edge (y)
-            continue;
-        }
-        
-        // Validate delta (check for NaN/Inf)
+        // Extract delta directly (no validation, matching Python)
         float dx = delta[e * 2 + 0];
         float dy = delta[e * 2 + 1];
-        if (!std::isfinite(dx) || !std::isfinite(dy)) {
-            if (logger && invalid_target_count < 5) {
-                logger->warn("DPVO::update: Invalid delta for edge[{}]: dx={}, dy={}", e, dx, dy);
-            }
-            invalid_target_count++;
-            dx = 0.0f;
-            dy = 0.0f;
-        }
-
+        
+        // Compute target directly (matching Python: target = coords_center + delta)
         m_pg.m_target[e * 2 + 0] = cx + dx;
         m_pg.m_target[e * 2 + 1] = cy + dy;
-        m_pg.m_weight[e][0] = weight[e * 2 + 0];  // weight for x
-        m_pg.m_weight[e][1] = weight[e * 2 + 1];  // weight for y
         
-        // Final validation of target
-        if (!std::isfinite(m_pg.m_target[e * 2 + 0]) || !std::isfinite(m_pg.m_target[e * 2 + 1])) {
-            if (logger && invalid_target_count < 5) {
-                logger->warn("DPVO::update: Invalid target for edge[{}]: target=({}, {}), cx={}, cy={}, dx={}, dy={}", 
-                            e, m_pg.m_target[e * 2 + 0], m_pg.m_target[e * 2 + 1], cx, cy, dx, dy);
-            }
-            invalid_target_count++;
-            m_pg.m_target[e * 2 + 0] = cx;  // Fallback to coords only
-            m_pg.m_target[e * 2 + 1] = cy;
-            m_pg.m_weight[e][0] = 0.0f;  // Invalidate this edge (x)
-            m_pg.m_weight[e][1] = 0.0f;  // Invalidate this edge (y)
-        }
-    }
-    
-    if (logger && invalid_target_count > 0) {
-        logger->warn("DPVO::update: {} out of {} edges have invalid targets (NaN/Inf)", invalid_target_count, num_active);
+        // Store both weight channels separately (matching Python [1, M, 2] format)
+        m_pg.m_weight[e][0] = weight[e * 2 + 0];  // Channel 0: weight for x-direction
+        m_pg.m_weight[e][1] = weight[e * 2 + 1];  // Channel 1: weight for y-direction
     }
     
     // Count zero weights for logging
@@ -1564,13 +1360,14 @@ void DPVO::update()
     // Zero weights indicate the model has low confidence in those edges, so we respect that
     int zero_weight_count = 0;
     for (int e = 0; e < num_active; e++) {
-        if (m_pg.m_weight[e][0] <= 0.0f || m_pg.m_weight[e][1] <= 0.0f) {
+        // An edge is considered zero-weight if both channels are zero (matching Python behavior)
+        if (m_pg.m_weight[e][0] <= 0.0f && m_pg.m_weight[e][1] <= 0.0f) {
             zero_weight_count++;
         }
     }
     
     if (logger && zero_weight_count > 0) {
-        logger->info("DPVO::update: {} out of {} edges have zero weight. "
+        logger->info("DPVO::update: {} out of {} edges have zero weight (both channels). "
                     "BA will naturally skip these edges (they won't contribute to optimization).",
                     zero_weight_count, num_active);
     }
@@ -1580,22 +1377,31 @@ void DPVO::update()
     
     if (logger) {
         int nonzero_weights = 0;
-        float weight_sum = 0.0f;
+        float weight_sum_x = 0.0f;
+        float weight_sum_y = 0.0f;
         for (int e = 0; e < num_active; e++) {
-            float w_avg = (m_pg.m_weight[e][0] + m_pg.m_weight[e][1]) / 2.0f;
-            if (w_avg > 0.0f) {
+            float w0 = m_pg.m_weight[e][0];  // Channel 0: weight for x-direction
+            float w1 = m_pg.m_weight[e][1];  // Channel 1: weight for y-direction
+            if (w0 > 0.0f || w1 > 0.0f) {
                 nonzero_weights++;
-                weight_sum += w_avg;
+                weight_sum_x += w0;
+                weight_sum_y += w1;
             }
         }
-        logger->info("DPVO::update: Target positions computed. Weight stats: nonzero={}/{}, mean={:.6f}",
-                     nonzero_weights, num_active, nonzero_weights > 0 ? weight_sum / nonzero_weights : 0.0f);
+        logger->info("DPVO::update: Target positions computed. Weight stats: nonzero={}/{}, "
+                     "mean_x={:.6f}, mean_y={:.6f} (matching Python [1, M, 2] format)",
+                     nonzero_weights, num_active, 
+                     nonzero_weights > 0 ? weight_sum_x / nonzero_weights : 0.0f,
+                     nonzero_weights > 0 ? weight_sum_y / nonzero_weights : 0.0f);
     }
 
     // -------------------------------------------------
     // 6. Bundle Adjustment
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::update: Starting bundle adjustment");
+    if (logger) {
+        logger->info("\033[32m--- Step 3.6: Bundle Adjustment Call ---\033[0m");
+        logger->info("DPVO::update: Starting bundle adjustment");
+    }
     try {
         bundleAdjustment(1e-4f, 100.0f, false, 1);
         
@@ -1886,8 +1692,8 @@ void DPVO::removeFactors(const bool* mask, bool store) {
             pg.m_ii_inac[w]     = pg.m_ii[i];
             pg.m_jj_inac[w]     = pg.m_jj[i];
             pg.m_kk_inac[w]     = pg.m_kk[i];
-            pg.m_weight_inac[w][0] = pg.m_weight[i][0];  // Copy x weight
-            pg.m_weight_inac[w][1] = pg.m_weight[i][1];  // Copy y weight
+            pg.m_weight_inac[w][0] = pg.m_weight[i][0];  // Copy both weight channels
+            pg.m_weight_inac[w][1] = pg.m_weight[i][1];
             pg.m_target_inac[w]= pg.m_target[i];
             w++;
         }
@@ -1903,8 +1709,8 @@ void DPVO::removeFactors(const bool* mask, bool store) {
             pg.m_ii[write]     = pg.m_ii[read];
             pg.m_jj[write]     = pg.m_jj[read];
             pg.m_kk[write]     = pg.m_kk[read];
-            pg.m_weight[write][0] = pg.m_weight[read][0];  // Copy x weight
-            pg.m_weight[write][1] = pg.m_weight[read][1];  // Copy y weight
+            pg.m_weight[write][0] = pg.m_weight[read][0];  // Copy both weight channels
+            pg.m_weight[write][1] = pg.m_weight[read][1];
             pg.m_target[write] = pg.m_target[read];
             std::memcpy(pg.m_net[write],
                         pg.m_net[read],
@@ -2612,7 +2418,7 @@ void DPVO::enableVisualization(bool enable)
     if (enable && m_viewer == nullptr) {
         // Initialize viewer with current image dimensions
         try {
-            m_viewer = std::make_unique<DPVOViewer>(m_wd, m_ht, PatchGraph::N, PatchGraph::N * m_cfg.PATCHES_PER_FRAME);
+            m_viewer = std::make_unique<DPVOViewer>(m_wd, m_ht, PatchGraph::N, 9999999); // PatchGraph::N * m_cfg.PATCHES_PER_FRAME
             auto logger = spdlog::get("dpvo");
             if (logger) logger->info("DPVO: Visualization enabled");
         } catch (const std::exception& e) {
@@ -2648,15 +2454,42 @@ void DPVO::computePointCloud()
     const int P = m_P;
     
     auto logger = spdlog::get("dpvo");
+    if (logger) {
+        logger->info("\033[32m========================================\033[0m");
+        logger->info("\033[32mSTEP 4: computePointCloud() - Point Cloud Computation\033[0m");
+        logger->info("\033[32m========================================\033[0m");
+    }
     
-    // Expected coordinate ranges at scaled resolution
-    const float max_x = static_cast<float>(m_wd) / 4.0f;  // e.g., 1920/4 = 480
-    const float max_y = static_cast<float>(m_ht) / 4.0f;  // e.g., 1080/4 = 270
+    // CRITICAL: After patchify fix, coordinates are stored at FEATURE MAP resolution
+    // Get actual feature map dimensions from patchifier (model output dimensions)
+    int fmap_W = m_patchifier.getOutputWidth();   // e.g., 240 for model input 960x528
+    int fmap_H = m_patchifier.getOutputHeight();  // e.g., 132 for model input 960x528
+    
+    // Fallback to calculated dimensions if patchifier doesn't provide them
+    if (fmap_W == 0 || fmap_H == 0) {
+        // Calculate from model input dimensions (if available) or full image dimensions
+        int model_W = m_patchifier.getInputWidth();
+        int model_H = m_patchifier.getInputHeight();
+        if (model_W > 0 && model_H > 0) {
+            // Model output is at 1/4 resolution of model input (RES=4)
+            fmap_W = model_W / 4;  // e.g., 960/4 = 240
+            fmap_H = model_H / 4;  // e.g., 528/4 = 132
+        } else {
+            // Last resort: use full image dimensions / 4
+            fmap_W = m_wd / 4;
+            fmap_H = m_ht / 4;
+        }
+    }
+    
+    // Expected coordinate ranges at feature map resolution (matching patchify output)
+    const float max_x = static_cast<float>(fmap_W);  // e.g., 240
+    const float max_y = static_cast<float>(fmap_H);  // e.g., 132
     
     // RGB values (from old frames) are typically in range [-0.5, 1.5] after normalization
-    // Coordinates should be in range [0, max_x] and [0, max_y]
-    // So if px < 2.0 or py < 2.0, it's likely RGB, not coordinates
-    const float MIN_VALID_COORD = 2.0f;  // Minimum valid coordinate (RGB values are < 2.0)
+    // Coordinates should be in range [0, max_x] and [0, max_y] at feature map resolution
+    // So if px < 0.5 or py < 0.5, it's likely RGB, not coordinates
+    // But allow coordinates starting from 0 (patches can be at edge of image)
+    const float MIN_VALID_COORD = 0.0f;  // Allow coordinates starting from 0 (feature map resolution)
     
     // Ensure historical buffers are large enough
     // Points: m_allPoints[global_frame_idx * M + patch_idx]
@@ -2681,8 +2514,13 @@ void DPVO::computePointCloud()
     }
     
     // Compute points for all frames in sliding window
+    // CRITICAL: This only computes points for frames currently in the sliding window
+    // Frames that have left the sliding window will keep their previously computed points
+    // (unless they were never computed, in which case they remain zero)
     int points_computed_count = 0;
     int points_preserved_count = 0;
+    std::vector<int> frames_with_new_points;
+    std::vector<int> frames_with_preserved_points;
     for (int i = 0; i < n; i++) {
         // Find global frame index for this sliding window frame using timestamp
         int64_t sw_timestamp = m_pg.m_tstamps[i];
@@ -2715,10 +2553,18 @@ void DPVO::computePointCloud()
             float py = m_pg.m_patches[i][k][1][center_y][center_x];
             float pd = m_pg.m_patches[i][k][2][center_y][center_x];  // inverse depth
             
+            // DIAGNOSTIC: Log coordinate and depth values for frames that fail validation
+            static int coord_log_count = 0;
+            bool should_log_coords = (coord_log_count++ % 50 == 0) && (i < 3 || i == n - 1);
+            
             // Skip invalid points (zero or negative inverse depth)
             // CRITICAL: Only update sliding window buffer, don't overwrite historical points with zeros
             // Historical points should be preserved even when patches become invalid
             if (pd <= 0.0f || pd > 10.0f) {
+                if (should_log_coords && logger) {
+                    logger->warn("Point cloud [frame={}, patch={}]: Invalid depth pd={:.4f} (<=0 or >10), skipping",
+                                 i, k, pd);
+                }
                 m_pg.m_points[sw_idx].x = 0.0f;
                 m_pg.m_points[sw_idx].y = 0.0f;
                 m_pg.m_points[sw_idx].z = 0.0f;
@@ -2727,24 +2573,30 @@ void DPVO::computePointCloud()
             }
             
             // Detect if this frame has old RGB values instead of coordinates
-            // RGB values are typically < 2.0, coordinates should be >= 2.0 (at scaled resolution)
-            // Also check upper bound to catch corrupted values
-            bool has_valid_coords = (px >= MIN_VALID_COORD && px <= max_x + 10.0f &&
-                                     py >= MIN_VALID_COORD && py <= max_y + 10.0f);
+            // RGB values (from old frames) are typically in range [-0.5, 1.5] after normalization
+            // Coordinates are at feature map resolution, should be in range [0, max_x] and [0, max_y]
+            // Allow small margin for floating point coordinates and check for finite values
+            bool has_valid_coords = (px >= MIN_VALID_COORD && px <= max_x + 5.0f &&
+                                     py >= MIN_VALID_COORD && py <= max_y + 5.0f &&
+                                     std::isfinite(px) && std::isfinite(py));
             
             if (!has_valid_coords) {
-                // This frame likely has old RGB values instead of coordinates
+                // This frame likely has old RGB values instead of coordinates, or coordinates are NaN/Inf
                 // Skip this point - we can't compute valid 3D position without proper coordinates
-                if (logger && i < 2 && k < 2) {
-                    logger->debug("Point cloud: Skipping frame[{}] patch[{}] - invalid coordinates "
-                                 "(px={:.2f}, py={:.2f}), likely RGB values from old frame. "
-                                 "Expected coords in range: x=[{:.2f}, {:.2f}], y=[{:.2f}, {:.2f}]",
-                                 i, k, px, py, MIN_VALID_COORD, max_x, MIN_VALID_COORD, max_y);
+                // CRITICAL: Don't overwrite historical points with zeros - preserve previous valid values
+                // Only update sliding window buffer to zero
+                if (should_log_coords && logger) {
+                    logger->warn("Point cloud [frame={}, patch={}]: Invalid coordinates px={:.2f}, py={:.2f} "
+                                 "(expected range: x=[{:.2f}, {:.2f}], y=[{:.2f}, {:.2f}]), "
+                                 "is_finite={}, pd={:.4f}, skipping",
+                                 i, k, px, py, MIN_VALID_COORD, max_x + 5.0f, MIN_VALID_COORD, max_y + 5.0f,
+                                 std::isfinite(px) && std::isfinite(py), pd);
                 }
                 m_pg.m_points[sw_idx].x = 0.0f;
                 m_pg.m_points[sw_idx].y = 0.0f;
                 m_pg.m_points[sw_idx].z = 0.0f;
                 // Don't overwrite historical points - keep previous valid values
+                // This ensures points from earlier frames remain visible even after they leave the sliding window
                 continue;
             }
             
@@ -2798,8 +2650,18 @@ void DPVO::computePointCloud()
                 
                 if (had_valid_point) {
                     points_preserved_count++;
+                    // Track which frames had preserved points
+                    if (std::find(frames_with_preserved_points.begin(), frames_with_preserved_points.end(), global_idx) 
+                        == frames_with_preserved_points.end()) {
+                        frames_with_preserved_points.push_back(global_idx);
+                    }
                 } else {
                     points_computed_count++;
+                    // Track which frames got new points
+                    if (std::find(frames_with_new_points.begin(), frames_with_new_points.end(), global_idx) 
+                        == frames_with_new_points.end()) {
+                        frames_with_new_points.push_back(global_idx);
+                    }
                 }
             }
             
@@ -2814,27 +2676,101 @@ void DPVO::computePointCloud()
             if (logger && ((i == 0 && k < 3) || (i == n - 1 && k < 2))) {
                 Eigen::Vector3f t_wc = T_wc.t;
                 Eigen::Vector3f t_cw = T_cw.t;
-                bool is_identity = (T_wc.t.norm() < 1e-6 && 
-                                   (T_wc.R() - Eigen::Matrix3f::Identity()).norm() < 1e-6);
+                bool is_identity = (T_wc.t.norm() < 1e-6f && 
+                                   (T_wc.R() - Eigen::Matrix3f::Identity()).norm() < 1e-6f);
+                
+                // CRITICAL DIAGNOSTIC: Compare camera position with point position
+                // Camera position in world: T_cw.t (camera-to-world translation)
+                // Point position in world: p_world
+                // Distance between camera and point: ||p_world - T_cw.t||
+                Eigen::Vector3f camera_to_point = p_world - t_cw;
+                float distance_to_camera = camera_to_point.norm();
+                float point_depth_in_camera = p_camera.z();  // Z component in camera frame
+                
                 logger->info("Point cloud [frame={}, patch={}]: px={:.2f}, py={:.2f}, pd={:.4f}, "
                              "p_camera=({:.3f}, {:.3f}, {:.3f}), p_world=({:.3f}, {:.3f}, {:.3f}), "
-                             "T_wc.t=({:.3f}, {:.3f}, {:.3f}), T_cw.t=({:.3f}, {:.3f}, {:.3f}), is_identity={}, global_idx={}",
+                             "T_wc.t=({:.3f}, {:.3f}, {:.3f}), T_cw.t=({:.3f}, {:.3f}, {:.3f}), "
+                             "camera_to_point=({:.3f}, {:.3f}, {:.3f}), distance={:.3f}, depth_in_camera={:.3f}, "
+                             "is_identity={}, global_idx={}, fmap_W={}, fmap_H={}",
                              i, k, px, py, pd, 
                              p_camera.x(), p_camera.y(), p_camera.z(),
                              p_world.x(), p_world.y(), p_world.z(),
                              t_wc.x(), t_wc.y(), t_wc.z(),
                              t_cw.x(), t_cw.y(), t_cw.z(),
-                             is_identity, global_idx);
+                             camera_to_point.x(), camera_to_point.y(), camera_to_point.z(),
+                             distance_to_camera, point_depth_in_camera,
+                             is_identity, global_idx, fmap_W, fmap_H);
             }
         }
     }
     
     // Log summary of point computation
     if (logger) {
+        // Count frames with zero points computed
+        int frames_with_zero_points = 0;
+        std::vector<int> zero_frame_indices;
+        for (int i = 0; i < n; i++) {
+            int64_t sw_timestamp = m_pg.m_tstamps[i];
+            int global_idx = -1;
+            for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
+                if (m_allTimestamps[g_idx] == sw_timestamp) {
+                    global_idx = g_idx;
+                    break;
+                }
+            }
+            if (global_idx >= 0) {
+                int points_for_frame = 0;
+                for (int k = 0; k < M; k++) {
+                    int global_point_idx = global_idx * M + k;
+                    if (global_point_idx < static_cast<int>(m_allPoints.size())) {
+                        if (m_allPoints[global_point_idx].x != 0.0f || 
+                            m_allPoints[global_point_idx].y != 0.0f || 
+                            m_allPoints[global_point_idx].z != 0.0f) {
+                            points_for_frame++;
+                        }
+                    }
+                }
+                if (points_for_frame == 0) {
+                    frames_with_zero_points++;
+                    if (zero_frame_indices.size() < 10) {
+                        zero_frame_indices.push_back(global_idx);
+                    }
+                }
+            }
+        }
+        
         logger->info("Point cloud: Computed {} new points, preserved {} existing points, "
-                     "total frames in sliding window: {}, total historical frames: {}",
+                     "total frames in sliding window: {}, total historical frames: {}, "
+                     "frames with zero points: {}",
                      points_computed_count, points_preserved_count, n, 
-                     std::max(m_counter, static_cast<int>(m_allTimestamps.size())));
+                     std::max(m_counter, static_cast<int>(m_allTimestamps.size())),
+                     frames_with_zero_points);
+        if (!frames_with_new_points.empty()) {
+            std::string new_frames_str;
+            for (size_t idx = 0; idx < frames_with_new_points.size() && idx < 10; idx++) {
+                if (idx > 0) new_frames_str += ", ";
+                new_frames_str += std::to_string(frames_with_new_points[idx]);
+            }
+            logger->info("Point cloud: Frames with new points computed: {}", new_frames_str);
+        }
+        // if (!frames_with_preserved_points.empty() && frames_with_preserved_points.size() <= 10) {
+        if (!frames_with_preserved_points.empty()) {
+            std::string preserved_frames_str;
+            for (size_t idx = 0; idx < frames_with_preserved_points.size(); idx++) {
+                if (idx > 0) preserved_frames_str += ", ";
+                preserved_frames_str += std::to_string(frames_with_preserved_points[idx]);
+            }
+            logger->info("Point cloud: Frames with preserved points: {}", preserved_frames_str);
+        }
+        if (!zero_frame_indices.empty()) {
+            std::string zero_frames_str;
+            for (size_t idx = 0; idx < zero_frame_indices.size(); idx++) {
+                if (idx > 0) zero_frames_str += ", ";
+                zero_frames_str += std::to_string(zero_frame_indices[idx]);
+            }
+            logger->warn("Point cloud: Frames in sliding window with ZERO points: {} (these frames have invalid patches)",
+                        zero_frames_str);
+        }
     }
 }
 
@@ -2846,6 +2782,11 @@ void DPVO::updateViewer()
     
     try {
         auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->info("\033[32m========================================\033[0m");
+            logger->info("\033[32mSTEP 5: updateViewer() - Viewer Update\033[0m");
+            logger->info("\033[32m========================================\033[0m");
+        }
         
         // Update poses
         // CRITICAL: Use m_allPoses (all historical frames) instead of m_pg.m_poses (sliding window only)
@@ -2925,6 +2866,21 @@ void DPVO::updateViewer()
                 }
             }
             
+            // DIAGNOSTIC: Log poses being passed to viewer to verify they're correct
+            if (logger && num_historical_frames > 0) {
+                logger->info("Viewer update: About to pass {} poses to viewer. First 3 poses (T_wc):", num_historical_frames);
+                for (int i = 0; i < std::min(3, num_historical_frames); i++) {
+                    Eigen::Vector3f t_wc = m_allPoses[i].t;
+                    Eigen::Quaternionf q_wc = m_allPoses[i].q;
+                    SE3 T_cw = m_allPoses[i].inverse();
+                    Eigen::Vector3f t_cw = T_cw.t;
+                    logger->info("  Frame[{}]: T_wc.t=({:.3f}, {:.3f}, {:.3f}), T_cw.t=({:.3f}, {:.3f}, {:.3f}), "
+                                 "q_wc=({:.3f}, {:.3f}, {:.3f}, {:.3f})",
+                                 i, t_wc.x(), t_wc.y(), t_wc.z(), t_cw.x(), t_cw.y(), t_cw.z(),
+                                 q_wc.x(), q_wc.y(), q_wc.z(), q_wc.w());
+                }
+            }
+            
             m_viewer->updatePoses(m_allPoses.data(), num_historical_frames);
             if (logger && m_pg.m_n > 0) {
                 // Log first and last pose to track movement
@@ -2988,31 +2944,130 @@ void DPVO::updateViewer()
             // Count valid points (non-zero) per frame for debugging
             int valid_points_count = 0;
             std::vector<int> valid_points_per_frame(num_historical_frames, 0);
+            std::vector<int> zero_points_per_frame(num_historical_frames, 0);
+            std::vector<int> nan_inf_points_per_frame(num_historical_frames, 0);
+            
             for (int i = 0; i < num_points; i++) {
                 int frame_idx = i / m_cfg.PATCHES_PER_FRAME;
                 if (frame_idx < num_historical_frames) {
-                    if (m_allPoints[i].x != 0.0f || m_allPoints[i].y != 0.0f || m_allPoints[i].z != 0.0f) {
-                        if (std::isfinite(m_allPoints[i].x) && std::isfinite(m_allPoints[i].y) && std::isfinite(m_allPoints[i].z)) {
-                            valid_points_count++;
-                            valid_points_per_frame[frame_idx]++;
-                        }
+                    bool is_zero = (m_allPoints[i].x == 0.0f && m_allPoints[i].y == 0.0f && m_allPoints[i].z == 0.0f);
+                    bool is_finite = std::isfinite(m_allPoints[i].x) && std::isfinite(m_allPoints[i].y) && std::isfinite(m_allPoints[i].z);
+                    
+                    if (is_zero) {
+                        zero_points_per_frame[frame_idx]++;
+                    } else if (!is_finite) {
+                        nan_inf_points_per_frame[frame_idx]++;
+                    } else {
+                        valid_points_count++;
+                        valid_points_per_frame[frame_idx]++;
                     }
                 }
             }
             
-            // Log valid points per frame for first few and last few frames
+            // DIAGNOSTIC: Log sample of frames to see point distribution
+            static int viewer_log_count = 0;
+            if (logger && (viewer_log_count++ % 10 == 0)) {
+                logger->info("Viewer update: Point distribution sample (every 10 frames):");
+                for (int f = 0; f < num_historical_frames; f += 10) {
+                    logger->info("  Frame[{}]: valid={}, zero={}, nan/inf={}, total={}",
+                                 f, valid_points_per_frame[f], zero_points_per_frame[f], 
+                                 nan_inf_points_per_frame[f], m_cfg.PATCHES_PER_FRAME);
+                }
+            }
+            
+            // Log valid points per frame - sample frames throughout the sequence
             if (logger) {
-                int frames_to_log = std::min(5, num_historical_frames);
                 logger->info("Viewer update: num_points={} (from {} historical frames, {} patches per frame), valid_points={}",
                             num_points, num_historical_frames, m_cfg.PATCHES_PER_FRAME, valid_points_count);
+                
+                // Log first 5 frames
+                int frames_to_log = std::min(5, num_historical_frames);
                 logger->info("Viewer update: Valid points per frame (first {} frames):", frames_to_log);
                 for (int f = 0; f < frames_to_log; f++) {
                     logger->info("  Frame[{}]: {} valid points", f, valid_points_per_frame[f]);
                 }
+                
+                // Log middle frames (sample every 50 frames)
+                if (num_historical_frames > 20) {
+                    logger->info("Viewer update: Valid points per frame (middle frames, sampled every 50):");
+                    for (int f = 25; f < num_historical_frames - 25; f += 50) {
+                        if (f < num_historical_frames) {
+                            logger->info("  Frame[{}]: {} valid points", f, valid_points_per_frame[f]);
+                        }
+                    }
+                }
+                
+                // Log last 5 frames
                 if (num_historical_frames > frames_to_log) {
                     logger->info("Viewer update: Valid points per frame (last {} frames):", frames_to_log);
                     for (int f = num_historical_frames - frames_to_log; f < num_historical_frames; f++) {
                         logger->info("  Frame[{}]: {} valid points", f, valid_points_per_frame[f]);
+                    }
+                }
+                
+                // Count frames with zero valid points
+                int frames_with_zero_points = 0;
+                std::vector<int> zero_frame_indices;
+                for (int f = 0; f < num_historical_frames; f++) {
+                    if (valid_points_per_frame[f] == 0) {
+                        frames_with_zero_points++;
+                        if (zero_frame_indices.size() < 10) {
+                            zero_frame_indices.push_back(f);
+                        }
+                    }
+                }
+                logger->info("Viewer update: {} out of {} frames have zero valid points", 
+                            frames_with_zero_points, num_historical_frames);
+                if (!zero_frame_indices.empty()) {
+                    std::string zero_frames_str;
+                    for (size_t idx = 0; idx < zero_frame_indices.size(); idx++) {
+                        if (idx > 0) zero_frames_str += ", ";
+                        zero_frames_str += std::to_string(zero_frame_indices[idx]);
+                    }
+                    logger->info("Viewer update: Sample frames with zero points: {}", zero_frames_str);
+                }
+            }
+            
+            // DIAGNOSTIC: Log actual point values for sample frames to verify they're not all at origin
+            // Also check frames that should have zero points (frames 6-94 based on "preserved points" log)
+            if (logger && num_points >= 20) {
+                logger->info("Viewer update: Sample point values (first 3 frames, first patch each):");
+                for (int f = 0; f < std::min(3, num_historical_frames); f++) {
+                    int point_idx = f * m_cfg.PATCHES_PER_FRAME;
+                    if (point_idx < num_points) {
+                        logger->info("  Frame[{}] patch[0]: p=({:.3f}, {:.3f}, {:.3f})",
+                                     f, m_allPoints[point_idx].x, m_allPoints[point_idx].y, m_allPoints[point_idx].z);
+                    }
+                }
+                // Check frames that should have zero points (frames 6-94)
+                logger->info("Viewer update: Checking frames that should have zero points (frames 6, 10, 20, 50, 90):");
+                std::vector<int> check_frames = {6, 10, 20, 50, 90};
+                for (int f : check_frames) {
+                    if (f < num_historical_frames) {
+                        int point_idx = f * m_cfg.PATCHES_PER_FRAME;
+                        if (point_idx < num_points) {
+                            bool is_zero = (m_allPoints[point_idx].x == 0.0f && 
+                                          m_allPoints[point_idx].y == 0.0f && 
+                                          m_allPoints[point_idx].z == 0.0f);
+                            logger->info("  Frame[{}] patch[0]: p=({:.3f}, {:.3f}, {:.3f}), is_zero={}",
+                                         f, m_allPoints[point_idx].x, m_allPoints[point_idx].y, 
+                                         m_allPoints[point_idx].z, is_zero);
+                        }
+                    }
+                }
+                // Also log middle and last frames
+                if (num_historical_frames > 10) {
+                    int mid_frame = num_historical_frames / 2;
+                    int mid_point_idx = mid_frame * m_cfg.PATCHES_PER_FRAME;
+                    if (mid_point_idx < num_points) {
+                        logger->info("  Frame[{}] patch[0]: p=({:.3f}, {:.3f}, {:.3f})",
+                                     mid_frame, m_allPoints[mid_point_idx].x, m_allPoints[mid_point_idx].y, m_allPoints[mid_point_idx].z);
+                    }
+                    int last_frame = num_historical_frames - 1;
+                    int last_point_idx = last_frame * m_cfg.PATCHES_PER_FRAME;
+                    if (last_point_idx < num_points) {
+                        logger->info("  Frame[{}] patch[0]: p=({:.3f}, {:.3f}, {:.3f})",
+                                     last_frame, m_allPoints[last_point_idx].x, m_allPoints[last_point_idx].y, m_allPoints[last_point_idx].z);
                     }
                 }
             }

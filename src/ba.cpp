@@ -24,6 +24,13 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     const int num_active = m_pg.m_num_edges;
     if (num_active == 0) return;
 
+    auto logger = spdlog::get("dpvo");
+    if (logger) {
+        logger->info("\033[32m========================================\033[0m");
+        logger->info("\033[32mSTEP 3.1: bundleAdjustment() - Bundle Adjustment\033[0m");
+        logger->info("\033[32m========================================\033[0m");
+    }
+
     const int M = m_cfg.PATCHES_PER_FRAME;
     const int P = m_P;
     const int b = 1; // batch size = 1
@@ -74,7 +81,6 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     std::vector<float> r(num_active * 2); // [num_active, 2]
     std::vector<float> v(num_active, 1.0f); // validity mask
 
-    auto logger = spdlog::get("dpvo");
     float residual_sum = 0.0f;
     int valid_residuals = 0;
 
@@ -173,13 +179,17 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
 
     // Apply validity mask to residuals and weights
-    // weights_masked: [num_active, 2] - per-dimension weights (x and y)
+    // Match Python BA: use both weight channels separately (matching Python [1, M, 2] format)
+    // Python: weights shape [1, M, 2] -> [1, M, 2, 1] after unsqueeze, then multiply with Ji [1, M, 2, 6]
+    // Channel 0 (w0) applies to x-direction, Channel 1 (w1) applies to y-direction
     std::vector<float> weights_masked(num_active * 2);
     for (int e = 0; e < num_active; e++) {
         r[e * 2 + 0] *= v[e];
         r[e * 2 + 1] *= v[e];
-        weights_masked[e * 2 + 0] = m_pg.m_weight[e][0] * v[e];  // weight for x
-        weights_masked[e * 2 + 1] = m_pg.m_weight[e][1] * v[e];  // weight for y
+        float w0 = m_pg.m_weight[e][0] * v[e];  // Channel 0: weight for x-direction
+        float w1 = m_pg.m_weight[e][1] * v[e];  // Channel 1: weight for y-direction
+        weights_masked[e * 2 + 0] = w0;  // Weight for x-direction
+        weights_masked[e * 2 + 1] = w1;  // Weight for y-direction (matching Python)
     }
     
     // Extract Jacobians at patch center: [num_active, 2, 6] for Ji, Jj, [num_active, 2, 1] for Jz
@@ -219,10 +229,13 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     std::vector<Eigen::Matrix<float, 1, 2>> wJzT(num_active);
     
     for (int e = 0; e < num_active; e++) {
-        float w_x = weights_masked[e * 2 + 0];  // weight for x-direction
-        float w_y = weights_masked[e * 2 + 1];  // weight for y-direction
+        // Match Python BA: use both weight channels separately (matching Python [1, M, 2] format)
+        // Python: weights shape [1, M, 2] -> [1, M, 2, 1] after unsqueeze, then multiply with Ji [1, M, 2, 6]
+        // Channel 0 (w0) applies to x-direction, Channel 1 (w1) applies to y-direction
+        float w0 = weights_masked[e * 2 + 0];  // Channel 0: weight for x-direction
+        float w1 = weights_masked[e * 2 + 1];  // Channel 1: weight for y-direction
         
-        if (w_x < 1e-6f && w_y < 1e-6f) {
+        if (w0 < 1e-6f && w1 < 1e-6f) { // Skip if both weights are zero
             wJiT[e].setZero();
             wJjT[e].setZero();
             wJzT[e].setZero();
@@ -232,15 +245,15 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         // Ji_center: [num_active, 2, 6] -> transpose to [6, 2]
         // Jj_center: [num_active, 2, 6] -> transpose to [6, 2]
         // Jz_center: [num_active, 2, 1] -> transpose to [1, 2]
-        // Use per-dimension weights: w_x for j=0 (x), w_y for j=1 (y)
+        // Apply w0 to x-direction and w1 to y-direction (matching Python broadcasting)
         for (int i = 0; i < 6; i++) {
-            wJiT[e](i, 0) = w_x * Ji_center[e * 2 * 6 + 0 * 6 + i];  // x-direction
-            wJiT[e](i, 1) = w_y * Ji_center[e * 2 * 6 + 1 * 6 + i];  // y-direction
-            wJjT[e](i, 0) = w_x * Jj_center[e * 2 * 6 + 0 * 6 + i];  // x-direction
-            wJjT[e](i, 1) = w_y * Jj_center[e * 2 * 6 + 1 * 6 + i];  // y-direction
+            wJiT[e](i, 0) = w0 * Ji_center[e * 2 * 6 + 0 * 6 + i];  // x-direction: use w0
+            wJiT[e](i, 1) = w1 * Ji_center[e * 2 * 6 + 1 * 6 + i];  // y-direction: use w1
+            wJjT[e](i, 0) = w0 * Jj_center[e * 2 * 6 + 0 * 6 + i];  // x-direction: use w0
+            wJjT[e](i, 1) = w1 * Jj_center[e * 2 * 6 + 1 * 6 + i];  // y-direction: use w1
         }
-        wJzT[e](0, 0) = w_x * Jz_center[e * 2 * 1 + 0 * 1];  // x-direction
-        wJzT[e](0, 1) = w_y * Jz_center[e * 2 * 1 + 1 * 1];  // y-direction
+        wJzT[e](0, 0) = w0 * Jz_center[e * 2 * 1 + 0 * 1];  // x-direction: use w0
+        wJzT[e](0, 1) = w1 * Jz_center[e * 2 * 1 + 1 * 1];  // y-direction: use w1
     }
 
     // ---------------------------------------------------------
@@ -499,12 +512,12 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                     if (!std::isfinite(vj[e](idx, 0))) vj_has_nan = true;
                 }
                 if (vi_has_nan || vj_has_nan || !std::isfinite(w_vec[e])) {
-                    float w_avg = (m_pg.m_weight[e][0] + m_pg.m_weight[e][1]) / 2.0f;
+                    float w0 = m_pg.m_weight[e][0];  // Channel 0: weight for x-direction
+                    float w1 = m_pg.m_weight[e][1];  // Channel 1: weight for y-direction
                     logger->warn("BA: Edge[{}]: vi_has_nan={}, vj_has_nan={}, w_valid={}, "
-                                "r=({:.4f}, {:.4f}), weight=({:.4f}, {:.4f}, avg={:.4f})",
+                                "r=({:.4f}, {:.4f}), weight=({:.4f}, {:.4f})",
                                 e, vi_has_nan, vj_has_nan, std::isfinite(w_vec[e]),
-                                r[e * 2 + 0], r[e * 2 + 1], 
-                                m_pg.m_weight[e][0], m_pg.m_weight[e][1], w_avg);
+                                r[e * 2 + 0], r[e * 2 + 1], w0, w1);
                 }
             }
         }
@@ -524,9 +537,10 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             int sample_count = std::min(5, num_active);
             for (int e = 0; e < sample_count; e++) {
                 float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
-                float w_avg = (m_pg.m_weight[e][0] + m_pg.m_weight[e][1]) / 2.0f;
-                logger->warn("BA: Sample edge[{}]: residual_norm={:.6f}, weight=({:.6f}, {:.6f}, avg={:.6f}), valid={}", 
-                            e, r_norm, m_pg.m_weight[e][0], m_pg.m_weight[e][1], w_avg, v[e] > 0.5f ? 1 : 0);
+                float w0 = m_pg.m_weight[e][0];  // Channel 0: weight for x-direction
+                float w1 = m_pg.m_weight[e][1];  // Channel 1: weight for y-direction
+                logger->warn("BA: Sample edge[{}]: residual_norm={:.6f}, weight=({:.6f}, {:.6f}), valid={}", 
+                            e, r_norm, w0, w1, v[e] > 0.5f ? 1 : 0);
             }
         }
     }
@@ -573,13 +587,13 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             S_damped(i, i) += ep + lm * S_diag[i];
         }
         
-        // Python uses Cholesky solver, but we'll use LDLT for stability
-        // If Cholesky fails, it returns zeros
-        Eigen::LDLT<Eigen::MatrixXf> solver(S_damped);
+        // Python uses Cholesky solver (matches Python: CholeskySolver.apply)
+        // If Cholesky fails, it returns zeros (matches Python behavior)
+        Eigen::LLT<Eigen::MatrixXf> solver(S_damped);
         if (solver.info() != Eigen::Success) {
             // Python: if cholesky fails, return zeros
             if (logger) {
-                logger->warn("BA: LDLT solver failed with info={}", static_cast<int>(solver.info()));
+                logger->warn("BA: Cholesky solver failed with info={}", static_cast<int>(solver.info()));
             }
             dX = Eigen::VectorXf::Zero(6 * n_adjusted);
             dZ = Q.asDiagonal() * w_grad; // Still update structure even if pose solve fails
@@ -612,133 +626,19 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             int pose_idx = fixedp + idx;
             if (pose_idx >= 0 && pose_idx < n) {
                 Eigen::Matrix<float, 6, 1> dx_vec = dX.segment<6>(6 * idx);
-                Eigen::Vector3f t_before = m_pg.m_poses[pose_idx].t;
                 
-                // Debug: Log dX values for first few poses
-                if (logger && idx < 6) {
-                    logger->info("BA: Pose[{}] (adjusted_idx={}) dX segment (before negation): ({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})",
-                                 pose_idx, idx, dx_vec(0), dx_vec(1), dx_vec(2), dx_vec(3), dx_vec(4), dx_vec(5));
-                }
+                // Python BA directly passes dX to pose_retr without any validation or clamping
+                // Python: poses = pose_retr(poses, dX, fixedp + torch.arange(n))
+                // Python retr: Exp(a) * X (no negation, no clamping, no validation)
+                // So we match Python exactly by passing dX directly to retr
                 
-                // CRITICAL: Negate dX to move in direction opposite to gradient (standard optimization)
-                // In optimization, we minimize cost, so we move opposite to gradient: x_new = x - alpha * grad
-                // With retraction: x_new = retr(-alpha * grad) = Exp(-alpha * grad) * x
-                // But BA solves S * dX = y where y is the gradient, so dX points in gradient direction
-                // Therefore, we need to negate dX before retr to move in the correct direction
-                dx_vec = -dx_vec;
+                // CRITICAL FIX: Jacobians are [tx, ty, tz, rx, ry, rz] (translation first)
+                // retr() expects [tx, ty, tz, rx, ry, rz] (translation first)
+                // So NO REORDERING is needed - pass dx_vec directly!
+                // Previous reordering was WRONG and caused incorrect pose updates
                 
-                // Extract rotation and translation deltas AFTER negation
-                Eigen::Vector3f dR = dx_vec.head<3>();
-                Eigen::Vector3f dt = dx_vec.tail<3>();
-                float dR_norm = dR.norm();
-                float dt_norm = dt.norm();
-                
-                // Clamp rotation and translation separately to allow proper rotation updates
-                // Rotation: use conservative limit to prevent over-rotation (up to ~2 degrees per iteration)
-                // Smaller limit prevents accumulation of rotation errors that cause 360-degree spins
-                float max_rot_update = 0.035f;  // ~2 degrees in radians (reduced from 5 degrees)
-                if (dR_norm > max_rot_update) {
-                    dR = dR * (max_rot_update / dR_norm);
-                    dx_vec.head<3>() = dR;  // Update dx_vec with clamped rotation
-                    if (logger && idx < 3) {
-                        logger->warn("BA: Clamping large rotation update for pose[{}]: dR_norm={:.6f} rad ({:.2f} deg) > {:.4f} rad, scaling down",
-                                     pose_idx, dR_norm, dR_norm * 180.0f / M_PI, max_rot_update);
-                    }
-                }
-                
-                // Translation: clamp to prevent large jumps but allow reasonable motion
-                float max_trans_update = 0.1f;  // Max translation update per iteration
-                if (dt_norm > max_trans_update) {
-                    dt = dt * (max_trans_update / dt_norm);
-                    dx_vec.tail<3>() = dt;  // Update dx_vec with clamped translation
-                    if (logger && idx < 3) {
-                        logger->warn("BA: Clamping large translation update for pose[{}]: dt_norm={:.6f} > {:.2f}, scaling down",
-                                     pose_idx, dt_norm, max_trans_update);
-                    }
-                }
-                
-                // Final check: clamp entire update if still too large (safety check)
-                float dx_norm = dx_vec.norm();
-                if (dx_norm > 1.0f) {
-                    if (logger && idx < 3) {
-                        logger->warn("BA: Clamping very large combined pose update for pose[{}]: dx_norm={:.6f} > 1.0, scaling down",
-                                     pose_idx, dx_norm);
-                    }
-                    dx_vec = dx_vec * (1.0f / dx_norm);  // Normalize to unit length
-                    // Re-extract after final clamping
-                    dR = dx_vec.head<3>();
-                    dt = dx_vec.tail<3>();
-                }
-                
-                // Store rotation before update for comparison
-                Eigen::Quaternionf q_before = m_pg.m_poses[pose_idx].q;
-                
+                // Apply update directly (matches Python: no validation, no clamping, no reverting)
                 m_pg.m_poses[pose_idx] = m_pg.m_poses[pose_idx].retr(dx_vec);
-                Eigen::Vector3f t_after = m_pg.m_poses[pose_idx].t;
-                Eigen::Quaternionf q_after = m_pg.m_poses[pose_idx].q;
-                
-                // Compute rotation change: angle between quaternions
-                // angularDistance handles double cover correctly (uses abs(w) internally)
-                // However, we need to ensure both quaternions are in the same hemisphere
-                // to get the correct angular distance (not the complement)
-                float dot_product = q_before.dot(q_after);
-                float rot_change;
-                if (dot_product < 0.0f) {
-                    // Quaternions are in opposite hemispheres, flip one for correct angular distance
-                    Eigen::Quaternionf q_after_flipped = q_after;
-                    q_after_flipped.coeffs() *= -1.0f;
-                    rot_change = q_before.angularDistance(q_after_flipped);
-                } else {
-                    rot_change = q_before.angularDistance(q_after);
-                }
-                
-                // CRITICAL: Validate rotation change - prevent over-rotation
-                // If rotation change is too large (> 10 degrees), it indicates an error
-                // This prevents the 360-degree spin issue when camera rotates 90-180 degrees
-                const float max_rot_change = 0.175f;  // ~10 degrees in radians
-                if (rot_change > max_rot_change) {
-                    if (logger) {
-                        logger->warn("BA: Pose[{}] rotation change too large: {:.6f} rad ({:.2f} deg) > {:.4f} rad, reverting rotation update. "
-                                     "This prevents over-rotation (360-degree spins).",
-                                     pose_idx, rot_change, rot_change * 180.0f / M_PI, max_rot_change);
-                    }
-                    // Revert rotation but keep translation update
-                    m_pg.m_poses[pose_idx].q = q_before;
-                    // Recompute rotation change after revert
-                    rot_change = 0.0f;
-                }
-                
-                // Ensure quaternion is normalized (numerical safety)
-                m_pg.m_poses[pose_idx].q.normalize();
-                
-                // Validate updated pose: check if translation is reasonable
-                float t_norm = t_after.norm();
-                if (t_norm > 100.0f) {
-                    if (logger) {
-                        logger->warn("BA: Pose[{}] translation too large after update (norm={:.2f}), reverting update. "
-                                     "t_before=({:.2f}, {:.2f}, {:.2f}), t_after=({:.2f}, {:.2f}, {:.2f})",
-                                     pose_idx, t_norm,
-                                     t_before.x(), t_before.y(), t_before.z(),
-                                     t_after.x(), t_after.y(), t_after.z());
-                    }
-                    // Revert to previous pose if update caused divergence
-                    m_pg.m_poses[pose_idx].t = t_before;
-                    m_pg.m_poses[pose_idx].q = q_before;
-                }
-                
-                // Log pose updates for debugging (including rotation)
-                if (logger) {
-                    float t_change = (t_after - t_before).norm();
-                    if (idx < 5 || dx_norm > 1e-6f || t_change > 1e-6f || rot_change > 1e-6f) {
-                        logger->info("BA: Updated pose[{}]: dx_norm={:.6f}, t_change={:.6f}, rot_change={:.6f} rad ({:.3f} deg), "
-                                     "t_before=({:.6f}, {:.6f}, {:.6f}), t_after=({:.6f}, {:.6f}, {:.6f}), "
-                                     "dR=({:.6f}, {:.6f}, {:.6f}), dt=({:.6f}, {:.6f}, {:.6f})",
-                                     pose_idx, dx_norm, t_change, rot_change, rot_change * 180.0f / M_PI,
-                                     t_before.x(), t_before.y(), t_before.z(),
-                                     t_after.x(), t_after.y(), t_after.z(),
-                                     dR.x(), dR.y(), dR.z(), dt.x(), dt.y(), dt.z());
-                    }
-                }
             }
         }
     } else {
@@ -761,10 +661,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         float dZ_val = dZ[idx];
         
         // Update all pixels in the patch (Python scatter_sum adds to entire patch)
+        // Clamp inverse depth to reasonable range: [0.01, 10.0]
+        //   pd = 0.01 means depth = 100 (far but reasonable)
+        //   pd = 10.0 means depth = 0.1 (very close)
+        // Previous clamp [1e-3, 10.0] allowed pd=0.001 (depth=1000) which is too far
+        const float MIN_PD = 0.01f;   // Minimum inverse depth (maximum depth = 100)
+        const float MAX_PD = 10.0f;   // Maximum inverse depth (minimum depth = 0.1)
         for (int y = 0; y < P; y++) {
             for (int x = 0; x < P; x++) {
                 float& disp = m_pg.m_patches[frame_i][patch_idx][2][y][x];
-                disp = std::max(1e-3f, std::min(10.0f, disp + dZ_val));
+                disp = std::max(MIN_PD, std::min(MAX_PD, disp + dZ_val));
             }
         }
     }
