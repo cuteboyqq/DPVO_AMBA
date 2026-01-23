@@ -7,15 +7,39 @@ import numpy as np
 import onnxruntime as ort
 import sys
 from pathlib import Path
+from typing import Dict, Tuple, List
 
-def load_binary_file(filename, dtype=np.float32):
-    """Load binary file as numpy array"""
+def load_binary_file(filename: str, dtype: np.dtype = np.float32) -> np.ndarray:
+    """Load binary file as numpy array.
+    
+    Args:
+        filename: Path to the binary file to load.
+        dtype: NumPy data type for the array elements (default: np.float32).
+    
+    Returns:
+        NumPy array containing the data from the binary file.
+    
+    Note:
+        Reads the entire file into memory and converts it to a NumPy array.
+    """
     with open(filename, 'rb') as f:
         data = np.frombuffer(f.read(), dtype=dtype)
     return data
 
-def load_metadata():
-    """Load test metadata"""
+def load_metadata() -> Dict[str, int]:
+    """Load test metadata from test_metadata.txt file.
+    
+    Returns:
+        Dictionary containing test parameters:
+            - num_active: Number of active edges in the test
+            - MAX_EDGE: Maximum number of edges (model input dimension)
+            - DIM: Feature dimension (typically 384)
+            - CORR_DIM: Correlation dimension (typically 27)
+    
+    Note:
+        Expects metadata file format: key=value (one per line).
+        All values are parsed as integers.
+    """
     metadata = {}
     with open('test_metadata.txt', 'r') as f:
         for line in f:
@@ -23,8 +47,26 @@ def load_metadata():
             metadata[key] = int(value)
     return metadata
 
-def compare_outputs(cpp_output, py_output, name, shape, atol=1e-5):
-    """Compare C++ and Python outputs"""
+def compare_outputs(cpp_output: np.ndarray, py_output: np.ndarray, name: str, 
+                   shape: Tuple[int, ...], atol: float = 1e-5) -> bool:
+    """Compare C++ and Python outputs.
+    
+    Args:
+        cpp_output: C++ output array (flattened or reshaped).
+        py_output: Python output array (flattened or reshaped).
+        name: Name/description of the output being compared (for logging).
+        shape: Expected shape tuple for reshaping arrays (e.g., (1, DIM, MAX_EDGE, 1)).
+        atol: Absolute tolerance for comparison (default: 1e-5).
+    
+    Returns:
+        True if outputs match within tolerance, False otherwise.
+    
+    Note:
+        Reshapes both arrays to the specified shape before comparison.
+        Prints detailed statistics including max difference, mean difference,
+        and percentage of mismatched elements.
+        Shows first 5 mismatches if any are found.
+    """
     print(f"\n=== Comparing {name} ===")
     print(f"Shape: {shape}")
     print(f"C++ output shape: {cpp_output.shape}")
@@ -68,7 +110,88 @@ def compare_outputs(cpp_output, py_output, name, shape, atol=1e-5):
     
     return matches
 
-def main():
+def print_sample_net_out_values(net_out_cpp: np.ndarray, net_out_py: np.ndarray, 
+                                 DIM: int, MAX_EDGE: int, num_samples: int = 5) -> None:
+    """Print sample net_out values from C++ and Python outputs.
+    
+    Args:
+        net_out_cpp: C++ net_out array (flattened, shape: [DIM * MAX_EDGE]).
+        net_out_py: Python net_out array (NCHW format, shape: [1, DIM, MAX_EDGE, 1]).
+        DIM: Feature dimension (number of channels).
+        MAX_EDGE: Maximum number of edges (spatial dimension).
+        num_samples: Number of sample values to print per edge (default: 5).
+    
+    Note:
+        Prints values for the first few edges and channels to help debug differences.
+        Shows both C++ and Python values side by side for easy comparison.
+    """
+    print("\n" + "="*60)
+    print("SAMPLE NET_OUT VALUES (C++ vs Python)")
+    print("="*60)
+    
+    # Print values for first 3 edges, first num_samples channels
+    num_edges_to_show = min(3, MAX_EDGE)
+    
+    for edge_idx in range(num_edges_to_show):
+        print(f"\nEdge {edge_idx}:")
+        print(f"  {'Channel':<10} {'C++ Value':<15} {'Python Value':<15} {'Difference':<15}")
+        print(f"  {'-'*10} {'-'*15} {'-'*15} {'-'*15}")
+        
+        for channel_idx in range(min(num_samples, DIM)):
+            # C++ indexing: [channel * MAX_EDGE + edge]
+            idx_cpp = channel_idx * MAX_EDGE + edge_idx
+            
+            # Python indexing: [batch, channel, edge, spatial]
+            idx_py = (0, channel_idx, edge_idx, 0)
+            
+            cpp_val = net_out_cpp[idx_cpp]
+            py_val = net_out_py[idx_py]
+            diff = abs(cpp_val - py_val)
+            
+            print(f"  {channel_idx:<10} {cpp_val:<15.6f} {py_val:<15.6f} {diff:<15.6e}")
+    
+    # Print summary statistics for all values
+    print(f"\nSummary Statistics (all {DIM * MAX_EDGE} values):")
+    
+    # Reshape C++ to match Python for easier comparison
+    net_out_cpp_reshaped = net_out_cpp.reshape(DIM, MAX_EDGE)
+    net_out_py_reshaped = net_out_py[0, :, :, 0]  # Remove batch and spatial dims
+    
+    diff_all = np.abs(net_out_cpp_reshaped - net_out_py_reshaped)
+    print(f"  Max difference: {np.max(diff_all):.6e}")
+    print(f"  Mean difference: {np.mean(diff_all):.6e}")
+    print(f"  Std difference: {np.std(diff_all):.6e}")
+    
+    # Count mismatches
+    mismatches = np.sum(diff_all > 1e-5)
+    total = diff_all.size
+    print(f"  Mismatches (>1e-5): {mismatches}/{total} ({100*mismatches/total:.2f}%)")
+
+def main() -> int:
+    """Main function to compare C++ and Python ONNX update model inference outputs.
+    
+    Returns:
+        Exit code: 0 if all outputs match, 1 otherwise.
+    
+    Workflow:
+        1. Parse command line arguments (update model path)
+        2. Load test metadata (num_active, MAX_EDGE, DIM, CORR_DIM)
+        3. Load C++ generated inputs (net, inp, corr, ii, jj, kk)
+        4. Load ONNX model and prepare inputs
+        5. Run Python ONNX inference
+        6. Save Python outputs to binary files
+        7. Load C++ outputs from binary files
+        8. Compare all outputs (net_out, d_out, w_out)
+        9. Print sample values for debugging
+        10. Return exit code based on comparison results
+    
+    Note:
+        Expects C++ test program to have generated:
+        - test_metadata.txt (test parameters)
+        - test_net_input.bin, test_inp_input.bin, test_corr_input.bin
+        - test_ii_input.bin, test_jj_input.bin, test_kk_input.bin (indices)
+        - test_net_out_cpp.bin, test_d_out_cpp.bin, test_w_out_cpp.bin (C++ outputs)
+    """
     if len(sys.argv) < 2:
         print("Usage: python3 compare_update_onnx_outputs.py <update_model.onnx>")
         sys.exit(1)
@@ -191,22 +314,50 @@ def main():
         print("❌ OUTPUTS DO NOT MATCH! There may be an issue with C++ ONNX inference.")
     print("="*60)
     
-    # Print sample values for first few edges
-    print("\nSample values (first 3 edges, first 5 channels of net_out):")
-    print("Edge 0:")
-    for c in range(min(5, DIM)):
-        idx_cpp = c * MAX_EDGE + 0
-        idx_py = (0, c, 0, 0)
-        print(f"  Channel {c}: C++={net_out_cpp[idx_cpp]:.6f}, Python={net_out_py[idx_py]:.6f}")
+    # Print sample net_out values (detailed comparison)
+    print_sample_net_out_values(net_out_cpp, net_out_py, DIM, MAX_EDGE, num_samples=5)
     
-    print("\nSample delta values (first 3 edges):")
+    # Print sample delta values (first 3 edges)
+    print("\n" + "="*60)
+    print("SAMPLE DELTA VALUES (d_out) - First 3 edges")
+    print("="*60)
+    print(f"{'Edge':<10} {'C++ (x, y)':<25} {'Python (x, y)':<25} {'Difference':<25}")
+    print(f"{'-'*10} {'-'*25} {'-'*25} {'-'*25}")
     for e in range(min(3, num_active)):
         idx_cpp_x = 0 * MAX_EDGE + e
         idx_cpp_y = 1 * MAX_EDGE + e
         idx_py_x = (0, 0, e, 0)
         idx_py_y = (0, 1, e, 0)
-        print(f"  Edge {e}: C++=({d_out_cpp[idx_cpp_x]:.6f}, {d_out_cpp[idx_cpp_y]:.6f}), "
-              f"Python=({d_out_py[idx_py_x]:.6f}, {d_out_py[idx_py_y]:.6f})")
+        
+        cpp_x = d_out_cpp[idx_cpp_x]
+        cpp_y = d_out_cpp[idx_cpp_y]
+        py_x = d_out_py[idx_py_x]
+        py_y = d_out_py[idx_py_y]
+        diff_x = abs(cpp_x - py_x)
+        diff_y = abs(cpp_y - py_y)
+        
+        print(f"{e:<10} ({cpp_x:.6f}, {cpp_y:.6f}){'':<10} ({py_x:.6f}, {py_y:.6f}){'':<10} ({diff_x:.6e}, {diff_y:.6e})")
+    
+    # Print sample weight values (first 3 edges)
+    print("\n" + "="*60)
+    print("SAMPLE WEIGHT VALUES (w_out) - First 3 edges")
+    print("="*60)
+    print(f"{'Edge':<10} {'C++ (w0, w1)':<25} {'Python (w0, w1)':<25} {'Difference':<25}")
+    print(f"{'-'*10} {'-'*25} {'-'*25} {'-'*25}")
+    for e in range(min(3, num_active)):
+        idx_cpp_w0 = 0 * MAX_EDGE + e
+        idx_cpp_w1 = 1 * MAX_EDGE + e
+        idx_py_w0 = (0, 0, e, 0)
+        idx_py_w1 = (0, 1, e, 0)
+        
+        cpp_w0 = w_out_cpp[idx_cpp_w0]
+        cpp_w1 = w_out_cpp[idx_cpp_w1]
+        py_w0 = w_out_py[idx_py_w0]
+        py_w1 = w_out_py[idx_py_w1]
+        diff_w0 = abs(cpp_w0 - py_w0)
+        diff_w1 = abs(cpp_w1 - py_w1)
+        
+        print(f"{e:<10} ({cpp_w0:.6f}, {cpp_w1:.6f}){'':<10} ({py_w0:.6f}, {py_w1:.6f}){'':<10} ({diff_w0:.6e}, {diff_w1:.6e})")
     
     return 0 if all_match else 1
 
