@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+Compare C++ and Python patchify outputs using the same fnet/inet inputs.
+
+This script:
+1. Loads C++ fnet/inet outputs (from .bin files)
+2. Runs Python patchify on them
+3. Loads C++ patchify outputs (if available)
+4. Compares the results
+"""
+
+import numpy as np
+import torch
+import sys
+import os
+
+# Add DPVO_onnx to path
+sys.path.insert(0, '/home/ali/Projects/GitHub_Code/clean_code/DPVO_onnx')
+
+from dpvo.altcorr import correlation as altcorr
+
+def load_binary_file(filename, dtype=np.float32):
+    """Load binary file as numpy array"""
+    if not os.path.exists(filename):
+        print(f"❌ File not found: {filename}")
+        return None
+    
+    with open(filename, 'rb') as f:
+        data = np.fromfile(f, dtype=dtype)
+    
+    print(f"✅ Loaded {filename}: shape={data.shape}, dtype={data.dtype}, "
+          f"min={data.min():.6f}, max={data.max():.6f}, mean={data.mean():.6f}")
+    return data
+
+def reshape_fnet(fnet_data, C=128, H=132, W=240):
+    """Reshape fnet from flat array to [C, H, W]"""
+    expected_size = C * H * W
+    if fnet_data.size != expected_size:
+        print(f"⚠️  Warning: fnet size {fnet_data.size} != expected {expected_size}")
+        # Try to infer dimensions
+        total = fnet_data.size
+        if total % C == 0:
+            spatial = total // C
+            # Try to find H, W that match
+            for h in range(100, 200):
+                for w in range(200, 300):
+                    if h * w == spatial:
+                        H, W = h, w
+                        print(f"   Inferred dimensions: C={C}, H={H}, W={W}")
+                        break
+                if h * w == spatial:
+                    break
+    
+    # Reshape to [C, H, W] (CHW format)
+    fnet = fnet_data.reshape(C, H, W)
+    return fnet, H, W
+
+def reshape_inet(inet_data, C=384, H=132, W=240):
+    """Reshape inet from flat array to [C, H, W]"""
+    expected_size = C * H * W
+    if inet_data.size != expected_size:
+        print(f"⚠️  Warning: inet size {inet_data.size} != expected {expected_size}")
+        # Try to infer dimensions
+        total = inet_data.size
+        if total % C == 0:
+            spatial = total // C
+            for h in range(100, 200):
+                for w in range(200, 300):
+                    if h * w == spatial:
+                        H, W = h, w
+                        print(f"   Inferred dimensions: C={C}, H={H}, W={W}")
+                        break
+                if h * w == spatial:
+                    break
+    
+    # Reshape to [C, H, W] (CHW format)
+    inet = inet_data.reshape(C, H, W)
+    return inet, H, W
+
+def python_patchify(fmap, imap, coords, P=3, radius=1):
+    """
+    Run Python patchify on fmap and imap using given coordinates.
+    
+    Args:
+        fmap: [C, H, W] feature map (128 channels)
+        imap: [C, H, W] input map (384 channels)
+        coords: [M, 2] coordinates at feature map resolution
+        P: patch size (default 3)
+        radius: patch radius (default 1, which gives P=2*radius+1=3)
+    
+    Returns:
+        gmap: [M, 128, P, P] patches from fmap
+        imap_patches: [M, 384, 1, 1] patches from imap (radius=0)
+        patches: [M, 3, P, P] coordinate patches
+    """
+    # Import Python implementation directly
+    from dpvo.altcorr.correlation_kernel import patchify_python_forward
+    
+    # Convert to torch tensors
+    device = torch.device('cpu')
+    fmap_t = torch.from_numpy(fmap).to(device).unsqueeze(0)  # [1, C, H, W]
+    imap_t = torch.from_numpy(imap).to(device).unsqueeze(0)  # [1, C, H, W]
+    coords_t = torch.from_numpy(coords).to(device).unsqueeze(0)  # [1, M, 2] - add batch dimension
+    
+    M = coords_t.shape[1]
+    
+    # CRITICAL: C++ uses D = 2*radius + 1 (nearest neighbor), Python uses D = 2*radius + 2 (then bilinear)
+    # For fair comparison, we need to match C++ exactly: use nearest neighbor with D = 2*radius + 1
+    # C++: D = (radius == 0) ? 1 : (2 * radius + 1) = 3 for radius=1
+    # C++ extracts patches directly using floor(coords) + offset, no bilinear
+    
+    # Implement C++-style patchify: nearest neighbor with D = 2*radius + 1
+    B, C, H, W = fmap_t.shape
+    M = coords_t.shape[1]
+    D = 2 * radius + 1  # Match C++: D = 3 for radius=1
+    
+    gmap_t = torch.zeros(B, M, C, D, D, device=device)
+    
+    # Extract patches using nearest neighbor (matching C++)
+    for b in range(B):
+        for m in range(M):
+            coord_x = coords_t[b, m, 0].item()
+            coord_y = coords_t[b, m, 1].item()
+            cx = int(torch.floor(coords_t[b, m, 0]).item())
+            cy = int(torch.floor(coords_t[b, m, 1]).item())
+            
+            for c in range(C):
+                for ii in range(D):
+                    y = cy + ii - radius
+                    y = max(0, min(y, H - 1))  # Clamp to bounds
+                    for jj in range(D):
+                        x = cx + jj - radius
+                        x = max(0, min(x, W - 1))  # Clamp to bounds
+                        
+                        # C++ indexing: src_idx = c * H * W + y * W + x
+                        src_val = fmap_t[b, c, y, x]
+                        gmap_t[b, m, c, ii, jj] = src_val
+    
+    gmap = gmap_t[0].numpy()  # [M, 128, P, P]
+    
+    # Python: imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
+    # C++: radius=0, D = 1 (single pixel extraction)
+    B_imap, C_imap, H_imap, W_imap = imap_t.shape
+    D_imap = 1  # radius=0 -> D=1
+    
+    imap_patches_t = torch.zeros(B_imap, M, C_imap, D_imap, D_imap, device=device)
+    
+    # Extract single pixel using nearest neighbor (matching C++)
+    for b in range(B_imap):
+        for m in range(M):
+            coord_x = coords_t[b, m, 0].item()
+            coord_y = coords_t[b, m, 1].item()
+            cx = int(torch.floor(coords_t[b, m, 0]).item())
+            cy = int(torch.floor(coords_t[b, m, 1]).item())
+            
+            # Clamp to bounds
+            x = max(0, min(cx, W_imap - 1))
+            y = max(0, min(cy, H_imap - 1))
+            
+            for c in range(C_imap):
+                # C++ indexing: src_idx = c * H * W + y * W + x
+                src_val = imap_t[b, c, y, x]
+                imap_patches_t[b, m, c, 0, 0] = src_val
+    
+    imap_patches = imap_patches_t[0].numpy()  # [M, 384, 1, 1]
+    
+    # Python: patches = altcorr.patchify(grid[0], coords, P//2)
+    # where grid is created from coords_grid_with_index
+    # Create grid: [1, 3, H, W] with x, y, d coordinates (add batch dimension)
+    H, W = fmap.shape[1], fmap.shape[2]
+    grid = np.zeros((1, 3, H, W), dtype=np.float32)
+    for y in range(H):
+        for x in range(W):
+            grid[0, 0, y, x] = float(x)  # x coordinate
+            grid[0, 1, y, x] = float(y)  # y coordinate
+            grid[0, 2, y, x] = 1.0       # d (disparity/inverse depth)
+    
+    grid_t = torch.from_numpy(grid).to(device)  # [1, 3, H, W]
+    
+    # Extract patches using nearest neighbor (matching C++)
+    patches_t = torch.zeros(1, M, 3, D, D, device=device)
+    
+    for b in range(1):
+        for m in range(M):
+            coord_x = coords_t[b, m, 0].item()
+            coord_y = coords_t[b, m, 1].item()
+            cx = int(torch.floor(coords_t[b, m, 0]).item())
+            cy = int(torch.floor(coords_t[b, m, 1]).item())
+            
+            for c in range(3):
+                for ii in range(D):
+                    y = cy + ii - radius
+                    y = max(0, min(y, H - 1))  # Clamp to bounds
+                    for jj in range(D):
+                        x = cx + jj - radius
+                        x = max(0, min(x, W - 1))  # Clamp to bounds
+                        
+                        # C++ indexing: src_idx = c * H * W + y * W + x
+                        src_val = grid_t[b, c, y, x]
+                        patches_t[b, m, c, ii, jj] = src_val
+    
+    patches = patches_t[0].numpy()  # [M, 3, P, P]
+    
+    return gmap, imap_patches, patches
+
+def print_sample_values(arr, name, max_samples=20):
+    """Print sample values from an array"""
+    arr = np.asarray(arr)
+    print(f"\n📋 {name} Sample Values:")
+    
+    if arr.size == 0:
+        print("   (empty array)")
+        return
+    
+    # Flatten for sampling
+    arr_flat = arr.flatten()
+    num_samples = min(max_samples, arr_flat.size)
+    
+    # Sample evenly across the array
+    if arr_flat.size <= max_samples:
+        indices = range(arr_flat.size)
+    else:
+        step = arr_flat.size // max_samples
+        indices = range(0, arr_flat.size, step)[:max_samples]
+    
+    print(f"   Shape: {arr.shape}, Total elements: {arr.size}")
+    print(f"   Sample {num_samples} values:")
+    for i, idx in enumerate(indices):
+        orig_idx = np.unravel_index(idx, arr.shape)
+        print(f"      [{', '.join(map(str, orig_idx))}] = {arr_flat[idx]:.6f}")
+    
+    # Print statistics
+    print(f"   Stats: min={arr.min():.6f}, max={arr.max():.6f}, mean={arr.mean():.6f}, std={arr.std():.6f}")
+
+def compare_arrays(arr1, arr2, name, tolerance=1e-5, show_samples=True):
+    """Compare two arrays and print statistics"""
+    arr1 = np.asarray(arr1)
+    arr2 = np.asarray(arr2)
+    
+    if arr1.shape != arr2.shape:
+        print(f"❌ {name}: Shape mismatch - {arr1.shape} vs {arr2.shape}")
+        return False
+    
+    diff = np.abs(arr1 - arr2)
+    max_diff = np.max(diff)
+    mean_diff = np.mean(diff)
+    
+    # Count differences
+    num_diff = np.sum(diff > tolerance)
+    total = arr1.size
+    pct_diff = 100.0 * num_diff / total
+    
+    print(f"\n📊 {name} Comparison:")
+    print(f"   Shape: {arr1.shape}")
+    print(f"   Max difference: {max_diff:.6f}")
+    print(f"   Mean difference: {mean_diff:.6f}")
+    print(f"   Elements differing > {tolerance}: {num_diff}/{total} ({pct_diff:.2f}%)")
+    
+    if show_samples:
+        # Show sample values from both arrays
+        print_sample_values(arr1, f"C++ {name}", max_samples=10)
+        print_sample_values(arr2, f"Python {name}", max_samples=10)
+        
+        # Show sample differences
+        print(f"\n📋 Sample Differences (C++ - Python):")
+        flat_diff = diff.flatten()
+        num_samples = min(10, flat_diff.size)
+        if flat_diff.size <= num_samples:
+            indices = range(flat_diff.size)
+        else:
+            step = flat_diff.size // num_samples
+            indices = range(0, flat_diff.size, step)[:num_samples]
+        
+        for idx in indices:
+            orig_idx = np.unravel_index(idx, arr1.shape)
+            cpp_val = arr1.flatten()[idx]
+            py_val = arr2.flatten()[idx]
+            diff_val = flat_diff[idx]
+            print(f"      [{', '.join(map(str, orig_idx))}]: C++={cpp_val:.6f}, Python={py_val:.6f}, diff={diff_val:.6f}")
+    
+    if max_diff < tolerance:
+        print(f"   ✅ MATCH (max diff < {tolerance})")
+        return True
+    elif pct_diff < 1.0:
+        print(f"   ⚠️  Mostly matches ({100-pct_diff:.2f}% identical)")
+        return True
+    else:
+        print(f"   ❌ MISMATCH")
+        # Print max difference location
+        if arr1.size > 0:
+            flat_idx = np.argmax(diff)
+            idx = np.unravel_index(flat_idx, arr1.shape)
+            print(f"   Max diff at {idx}: C++={arr1[idx]:.6f}, Python={arr2[idx]:.6f}, diff={diff[idx]:.6f}")
+        return False
+
+def load_inputs(frame_idx):
+    """Load fnet and inet input files"""
+    fnet_bin = f"fnet_frame{frame_idx}.bin"
+    inet_bin = f"inet_frame{frame_idx}.bin"
+    
+    print(f"\n📁 Loading inputs for frame {frame_idx}...")
+    print(f"   FNet: {fnet_bin}")
+    print(f"   INet: {inet_bin}")
+    
+    fnet_data = load_binary_file(fnet_bin)
+    inet_data = load_binary_file(inet_bin)
+    
+    if fnet_data is None or inet_data is None:
+        return None, None
+    
+    # Reshape to [C, H, W]
+    fnet, fmap_H, fmap_W = reshape_fnet(fnet_data, C=128)
+    inet, imap_H, imap_W = reshape_inet(inet_data, C=384)
+    
+    print(f"\n📐 Dimensions:")
+    print(f"   FMap: [128, {fmap_H}, {fmap_W}]")
+    print(f"   IMap: [384, {imap_H}, {imap_W}]")
+    
+    if fmap_H != imap_H or fmap_W != imap_W:
+        print(f"⚠️  Warning: Feature map dimensions don't match!")
+        return None, None
+    
+    return fnet, inet
+
+def load_or_generate_coordinates(frame_idx, fmap_H, fmap_W, M=4):
+    """Load C++ coordinates if available, otherwise generate new ones"""
+    cpp_coords_bin = f"cpp_coords_frame{frame_idx}.bin"
+    
+    if os.path.exists(cpp_coords_bin):
+        print(f"\n📁 Loading C++ coordinates from {cpp_coords_bin}...")
+        coords_data = load_binary_file(cpp_coords_bin)
+        if coords_data is not None and coords_data.size == M * 2:
+            coords = coords_data.reshape(M, 2)
+            print(f"✅ Using C++ coordinates (same as C++ patchify)")
+            print(f"\n🎯 Using C++ coordinates (at feature map resolution):")
+            for m in range(M):
+                print(f"   Patch {m}: ({coords[m, 0]:.2f}, {coords[m, 1]:.2f})")
+            return coords
+        else:
+            print(f"⚠️  C++ coordinates file has wrong size, generating new coordinates")
+    
+    # Generate coordinates (matching C++ random generation)
+    np.random.seed(42)  # Use fixed seed for reproducibility
+    coords = np.zeros((M, 2), dtype=np.float32)
+    for m in range(M):
+        coords[m, 0] = 1.0 + float(np.random.randint(0, fmap_W - 2))  # x
+        coords[m, 1] = 1.0 + float(np.random.randint(0, fmap_H - 2))  # y
+    
+    print(f"\n🎯 Generated {M} random coordinates (at feature map resolution):")
+    for m in range(M):
+        print(f"   Patch {m}: ({coords[m, 0]:.2f}, {coords[m, 1]:.2f})")
+    
+    return coords
+
+def save_python_outputs(frame_idx, py_gmap, py_imap_patches, py_patches, coords):
+    """Save Python patchify outputs to binary files"""
+    py_gmap.tofile(f"python_gmap_frame{frame_idx}.bin")
+    py_imap_patches.tofile(f"python_imap_frame{frame_idx}.bin")
+    py_patches.tofile(f"python_patches_frame{frame_idx}.bin")
+    coords.tofile(f"python_coords_frame{frame_idx}.bin")
+    
+    print(f"\n💾 Saved Python outputs:")
+    print(f"   python_gmap_frame{frame_idx}.bin")
+    print(f"   python_imap_frame{frame_idx}.bin")
+    print(f"   python_patches_frame{frame_idx}.bin")
+    print(f"   python_coords_frame{frame_idx}.bin")
+
+def load_cpp_outputs(frame_idx, M=4, P=3):
+    """Load and reshape C++ patchify outputs"""
+    cpp_gmap_bin = f"cpp_gmap_frame{frame_idx}.bin"
+    cpp_imap_bin = f"cpp_imap_frame{frame_idx}.bin"
+    cpp_patches_bin = f"cpp_patches_frame{frame_idx}.bin"
+    
+    if not os.path.exists(cpp_gmap_bin):
+        return None, None, None
+    
+    print(f"\n📁 Loading C++ outputs...")
+    cpp_gmap_data = load_binary_file(cpp_gmap_bin)
+    cpp_imap_data = load_binary_file(cpp_imap_bin)
+    cpp_patches_data = load_binary_file(cpp_patches_bin)
+    
+    if cpp_gmap_data is None:
+        return None, None, None
+    
+    # Reshape C++ outputs
+    expected_gmap_size = M * 128 * P * P
+    expected_imap_size = M * 384 * 1 * 1
+    expected_patches_size = M * 3 * P * P
+    
+    cpp_gmap = None
+    cpp_imap = None
+    cpp_patches = None
+    
+    if cpp_gmap_data.size == expected_gmap_size:
+        cpp_gmap = cpp_gmap_data.reshape(M, 128, P, P)
+    else:
+        print(f"⚠️  Warning: C++ gmap size {cpp_gmap_data.size} != expected {expected_gmap_size}")
+    
+    if cpp_imap_data.size == expected_imap_size:
+        cpp_imap = cpp_imap_data.reshape(M, 384, 1, 1)
+    else:
+        print(f"⚠️  Warning: C++ imap size {cpp_imap_data.size} != expected {expected_imap_size}")
+    
+    if cpp_patches_data.size == expected_patches_size:
+        cpp_patches = cpp_patches_data.reshape(M, 3, P, P)
+    else:
+        print(f"⚠️  Warning: C++ patches size {cpp_patches_data.size} != expected {expected_patches_size}")
+    
+    return cpp_gmap, cpp_imap, cpp_patches
+
+def print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches):
+    """Print detailed values for the first patch"""
+    print(f"\n🔍 First Patch (patch 0) Detailed Values:")
+    
+    # GMap details
+    print(f"\n   GMAP - First channel (channel 0):")
+    print(f"   C++   gmap[0, 0, :, :] =")
+    for y in range(min(3, cpp_gmap.shape[2])):
+        print(f"      [{', '.join(f'{cpp_gmap[0, 0, y, x]:.6f}' for x in range(min(3, cpp_gmap.shape[3])))}]")
+    print(f"   Python gmap[0, 0, :, :] =")
+    for y in range(min(3, py_gmap.shape[2])):
+        print(f"      [{', '.join(f'{py_gmap[0, 0, y, x]:.6f}' for x in range(min(3, py_gmap.shape[3])))}]")
+    
+    # IMap details
+    print(f"\n   IMAP - First 10 channels:")
+    print(f"   C++   imap[0, :10, 0, 0] =")
+    print(f"      [{', '.join(f'{cpp_imap[0, c, 0, 0]:.6f}' for c in range(min(10, cpp_imap.shape[1])))}]")
+    print(f"   Python imap[0, :10, 0, 0] =")
+    print(f"      [{', '.join(f'{py_imap[0, c, 0, 0]:.6f}' for c in range(min(10, py_imap.shape[1])))}]")
+    
+    # Patches details
+    print(f"\n   PATCHES - All 3 channels (x, y, d):")
+    print(f"   C++ patches[0, :, :, :]:")
+    for c in range(3):
+        print(f"      Channel {c}:")
+        for y in range(min(3, cpp_patches.shape[2])):
+            print(f"         [{', '.join(f'{cpp_patches[0, c, y, x]:.2f}' for x in range(min(3, cpp_patches.shape[3])))}]")
+    print(f"   Python patches[0, :, :, :]:")
+    for c in range(3):
+        print(f"      Channel {c}:")
+        for y in range(min(3, py_patches.shape[2])):
+            print(f"         [{', '.join(f'{py_patches[0, c, y, x]:.2f}' for x in range(min(3, py_patches.shape[3])))}]")
+
+def run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches):
+    """Run detailed comparisons between C++ and Python outputs"""
+    print(f"\n🔍 Comparing C++ vs Python outputs...")
+    
+    print(f"\n{'='*80}")
+    print(f"GMAP COMPARISON (patches from fmap)")
+    print(f"{'='*80}")
+    print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches)
+    compare_arrays(cpp_gmap, py_gmap, "gmap", tolerance=1e-4, show_samples=True)
+    
+    print(f"\n{'='*80}")
+    print(f"IMAP COMPARISON (patches from inet)")
+    print(f"{'='*80}")
+    compare_arrays(cpp_imap, py_imap, "imap", tolerance=1e-4, show_samples=True)
+    
+    print(f"\n{'='*80}")
+    print(f"PATCHES COMPARISON (coordinate patches)")
+    print(f"{'='*80}")
+    compare_arrays(cpp_patches, py_patches, "patches", tolerance=1e-4, show_samples=True)
+
+def main():
+    print("=" * 80)
+    print("PATCHIFY COMPARISON: C++ vs Python")
+    print("=" * 80)
+    
+    # Parse command line arguments
+    frame_idx = 0
+    if len(sys.argv) > 1:
+        frame_idx = int(sys.argv[1])
+    
+    # Constants
+    M = 4  # Number of patches
+    P = 3  # Patch size
+    radius = P // 2  # radius = 1
+    
+    # Step 1: Load inputs
+    fnet, inet = load_inputs(frame_idx)
+    if fnet is None or inet is None:
+        print("❌ Failed to load input files")
+        return 1
+    
+    fmap_H, fmap_W = fnet.shape[1], fnet.shape[2]
+    
+    # Step 2: Load or generate coordinates
+    coords = load_or_generate_coordinates(frame_idx, fmap_H, fmap_W, M)
+    
+    # Step 3: Run Python patchify
+    print(f"\n🐍 Running Python patchify...")
+    py_gmap, py_imap_patches, py_patches = python_patchify(fnet, inet, coords, P=P, radius=radius)
+    
+    print(f"   Python gmap shape: {py_gmap.shape}")
+    print(f"   Python imap_patches shape: {py_imap_patches.shape}")
+    print(f"   Python patches shape: {py_patches.shape}")
+    
+    # Step 4: Save Python outputs
+    save_python_outputs(frame_idx, py_gmap, py_imap_patches, py_patches, coords)
+    
+    # Step 5: Load C++ outputs and compare
+    cpp_gmap, cpp_imap, cpp_patches = load_cpp_outputs(frame_idx, M, P)
+    
+    if cpp_gmap is not None and cpp_imap is not None and cpp_patches is not None:
+        run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap_patches, cpp_patches, py_patches)
+    else:
+        print(f"\n⚠️  C++ outputs not found. To compare:")
+        print(f"   1. Run C++ code to generate cpp_*_frame{frame_idx}.bin files")
+        print(f"   2. Re-run this script")
+    
+    print(f"\n✅ Python patchify completed!")
+    print(f"   Use the saved .bin files to compare with C++ outputs")
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
