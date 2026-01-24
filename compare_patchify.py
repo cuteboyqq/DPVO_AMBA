@@ -18,6 +18,7 @@ import os
 sys.path.insert(0, '/home/ali/Projects/GitHub_Code/clean_code/DPVO_onnx')
 
 from dpvo.altcorr import correlation as altcorr
+from dpvo.utils import coords_grid_with_index
 
 def load_binary_file(filename, dtype=np.float32):
     """Load binary file as numpy array"""
@@ -80,126 +81,74 @@ def reshape_inet(inet_data, C=384, H=132, W=240):
 def python_patchify(fmap, imap, coords, P=3, radius=1):
     """
     Run Python patchify on fmap and imap using given coordinates.
+    Uses the original Python altcorr.patchify function from DPVO_onnx.
     
     Args:
-        fmap: [C, H, W] feature map (128 channels)
-        imap: [C, H, W] input map (384 channels)
-        coords: [M, 2] coordinates at feature map resolution
+        fmap: [C, H, W] feature map (128 channels) - numpy array
+        imap: [C, H, W] input map (384 channels) - numpy array
+        coords: [M, 2] coordinates at feature map resolution - numpy array
         P: patch size (default 3)
-        radius: patch radius (default 1, which gives P=2*radius+1=3)
+        radius: patch radius (default 1, which gives P//2 = 1 for gmap/patches)
     
     Returns:
         gmap: [M, 128, P, P] patches from fmap
         imap_patches: [M, 384, 1, 1] patches from imap (radius=0)
         patches: [M, 3, P, P] coordinate patches
     """
-    # Import Python implementation directly
-    from dpvo.altcorr.correlation_kernel import patchify_python_forward
-    
     # Convert to torch tensors
-    device = torch.device('cpu')
-    fmap_t = torch.from_numpy(fmap).to(device).unsqueeze(0)  # [1, C, H, W]
-    imap_t = torch.from_numpy(imap).to(device).unsqueeze(0)  # [1, C, H, W]
-    coords_t = torch.from_numpy(coords).to(device).unsqueeze(0)  # [1, M, 2] - add batch dimension
+    # Python DPVO uses CUDA, so we need CUDA device for altcorr.patchify
+    # (it uses CUDA kernels, not CPU fallback)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Convert numpy arrays to torch tensors
+    # Python Patchifier: fmap shape is [b, n, c, h, w] where b=1, n=1 (batch=1, num_images=1)
+    # fmap[0] removes batch dimension: [n, c, h, w] = [1, c, h, w] (still 4D!)
+    # Our fmap: [C, H, W] -> need [1, C, H, W] to match Python's fmap[0] shape
+    fmap_t = torch.from_numpy(fmap).to(device).unsqueeze(0)  # [1, C, H, W] - matches Python fmap[0]
+    imap_t = torch.from_numpy(imap).to(device).unsqueeze(0)  # [1, C, H, W] - matches Python imap[0]
+    
+    # coords: [M, 2] -> [1, M, 2] (matching Python: coords shape is [n, M, 2] where n=1)
+    coords_t = torch.from_numpy(coords).to(device).unsqueeze(0)  # [1, M, 2]
+    
+    b = 1  # batch size
+    n = 1  # number of images (frame count)
     M = coords_t.shape[1]
     
-    # CRITICAL: C++ uses D = 2*radius + 1 (nearest neighbor), Python uses D = 2*radius + 2 (then bilinear)
-    # For fair comparison, we need to match C++ exactly: use nearest neighbor with D = 2*radius + 1
-    # C++: D = (radius == 0) ? 1 : (2 * radius + 1) = 3 for radius=1
-    # C++ extracts patches directly using floor(coords) + offset, no bilinear
+    # Use original Python altcorr.patchify (matches net.py Patchifier.forward exactly)
+    # Python Patchifier.forward:
+    #   fmap shape: [b, n, c, h, w] = [1, 1, 128, 132, 240]
+    #   fmap[0] shape: [n, c, h, w] = [1, 128, 132, 240] (4D!)
+    #   coords shape: [n, M, 2] = [1, M, 2]
+    #   imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
+    #   gmap = altcorr.patchify(fmap[0], coords, P//2).view(b, -1, 128, P, P)
+    #   patches = altcorr.patchify(grid[0], coords, P//2).view(b, -1, 3, P, P)
     
-    # Implement C++-style patchify: nearest neighbor with D = 2*radius + 1
-    B, C, H, W = fmap_t.shape
-    M = coords_t.shape[1]
-    D = 2 * radius + 1  # Match C++: D = 3 for radius=1
+    # Extract imap patches (radius=0)
+    # imap_t: [1, 384, H, W] matches Python imap[0]: [1, 384, H, W]
+    # coords_t: [1, M, 2] matches Python coords: [1, M, 2]
+    imap_patches_t = altcorr.patchify(imap_t, coords_t, 0)  # Returns [1, M, 384, 1, 1]
+    imap_patches = imap_patches_t.view(b, -1, 384, 1, 1)[0].cpu().numpy()  # [M, 384, 1, 1]
     
-    gmap_t = torch.zeros(B, M, C, D, D, device=device)
+    # Extract gmap patches (radius=P//2 = 1 for P=3)
+    # fmap_t: [1, 128, H, W] matches Python fmap[0]: [1, 128, H, W]
+    # coords_t: [1, M, 2] matches Python coords: [1, M, 2]
+    gmap_t = altcorr.patchify(fmap_t, coords_t, P//2)  # Returns [1, M, 128, P, P]
+    gmap = gmap_t.view(b, -1, 128, P, P)[0].cpu().numpy()  # [M, 128, P, P]
     
-    # Extract patches using nearest neighbor (matching C++)
-    for b in range(B):
-        for m in range(M):
-            coord_x = coords_t[b, m, 0].item()
-            coord_y = coords_t[b, m, 1].item()
-            cx = int(torch.floor(coords_t[b, m, 0]).item())
-            cy = int(torch.floor(coords_t[b, m, 1]).item())
-            
-            for c in range(C):
-                for ii in range(D):
-                    y = cy + ii - radius
-                    y = max(0, min(y, H - 1))  # Clamp to bounds
-                    for jj in range(D):
-                        x = cx + jj - radius
-                        x = max(0, min(x, W - 1))  # Clamp to bounds
-                        
-                        # C++ indexing: src_idx = c * H * W + y * W + x
-                        src_val = fmap_t[b, c, y, x]
-                        gmap_t[b, m, c, ii, jj] = src_val
-    
-    gmap = gmap_t[0].numpy()  # [M, 128, P, P]
-    
-    # Python: imap = altcorr.patchify(imap[0], coords, 0).view(b, -1, DIM, 1, 1)
-    # C++: radius=0, D = 1 (single pixel extraction)
-    B_imap, C_imap, H_imap, W_imap = imap_t.shape
-    D_imap = 1  # radius=0 -> D=1
-    
-    imap_patches_t = torch.zeros(B_imap, M, C_imap, D_imap, D_imap, device=device)
-    
-    # Extract single pixel using nearest neighbor (matching C++)
-    for b in range(B_imap):
-        for m in range(M):
-            coord_x = coords_t[b, m, 0].item()
-            coord_y = coords_t[b, m, 1].item()
-            cx = int(torch.floor(coords_t[b, m, 0]).item())
-            cy = int(torch.floor(coords_t[b, m, 1]).item())
-            
-            # Clamp to bounds
-            x = max(0, min(cx, W_imap - 1))
-            y = max(0, min(cy, H_imap - 1))
-            
-            for c in range(C_imap):
-                # C++ indexing: src_idx = c * H * W + y * W + x
-                src_val = imap_t[b, c, y, x]
-                imap_patches_t[b, m, c, 0, 0] = src_val
-    
-    imap_patches = imap_patches_t[0].numpy()  # [M, 384, 1, 1]
-    
-    # Python: patches = altcorr.patchify(grid[0], coords, P//2)
-    # where grid is created from coords_grid_with_index
-    # Create grid: [1, 3, H, W] with x, y, d coordinates (add batch dimension)
+    # Create grid using coords_grid_with_index (matching net.py exactly)
+    # Python: disps = torch.ones(b, n, h, w, device="cuda") = torch.ones(1, 1, h, w)
+    #         grid, _ = coords_grid_with_index(disps, device=fmap.device)
+    #         coords_grid_with_index returns: coords shape [b, n, 3, h, w] = [1, 1, 3, h, w]
+    #         grid[0] removes batch dimension: [n, 3, h, w] = [1, 3, h, w] (4D!)
     H, W = fmap.shape[1], fmap.shape[2]
-    grid = np.zeros((1, 3, H, W), dtype=np.float32)
-    for y in range(H):
-        for x in range(W):
-            grid[0, 0, y, x] = float(x)  # x coordinate
-            grid[0, 1, y, x] = float(y)  # y coordinate
-            grid[0, 2, y, x] = 1.0       # d (disparity/inverse depth)
+    disps = torch.ones(b, n, H, W, device=device)  # [1, 1, H, W] - matching Python: b=1, n=1
+    grid, _ = coords_grid_with_index(disps, device=device)  # [1, 1, 3, H, W] (from torch.stack([x, y, d], dim=2))
     
-    grid_t = torch.from_numpy(grid).to(device)  # [1, 3, H, W]
-    
-    # Extract patches using nearest neighbor (matching C++)
-    patches_t = torch.zeros(1, M, 3, D, D, device=device)
-    
-    for b in range(1):
-        for m in range(M):
-            coord_x = coords_t[b, m, 0].item()
-            coord_y = coords_t[b, m, 1].item()
-            cx = int(torch.floor(coords_t[b, m, 0]).item())
-            cy = int(torch.floor(coords_t[b, m, 1]).item())
-            
-            for c in range(3):
-                for ii in range(D):
-                    y = cy + ii - radius
-                    y = max(0, min(y, H - 1))  # Clamp to bounds
-                    for jj in range(D):
-                        x = cx + jj - radius
-                        x = max(0, min(x, W - 1))  # Clamp to bounds
-                        
-                        # C++ indexing: src_idx = c * H * W + y * W + x
-                        src_val = grid_t[b, c, y, x]
-                        patches_t[b, m, c, ii, jj] = src_val
-    
-    patches = patches_t[0].numpy()  # [M, 3, P, P]
+    # Extract patches (radius=P//2 = 1 for P=3)
+    # grid shape: [1, 1, 3, H, W]
+    # grid[0] removes batch dimension: [1, 3, H, W] (4D) - matches Python!
+    patches_t = altcorr.patchify(grid[0], coords_t, P//2)  # grid[0] is [1, 3, H, W] (4D)
+    patches = patches_t.view(b, -1, 3, P, P)[0].cpu().numpy()  # [M, 3, P, P]
     
     return gmap, imap_patches, patches
 
