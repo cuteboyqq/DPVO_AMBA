@@ -151,7 +151,8 @@ void processDPVOInput(
 	global_param_t* G_param,
 	DPVO* dpvo,
 	int modelH,
-	int modelW);
+	int modelW,
+	Config_S* config);
 void processDPVOApp(
 	const std::string& inputPath,
 	const InputType& inputType,

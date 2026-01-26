@@ -23,6 +23,12 @@ struct SE3 {
     // Retract: apply small update dx ∈ R^6
     SE3 retr(const Eigen::Matrix<float,6,1>& dx) const;
 
+    // Logarithm map: SE3 → se3 (6-vector [tau, phi])
+    Eigen::Matrix<float,6,1> log() const;
+
+    // Exponential map: se3 (6-vector [tau, phi]) → SE3
+    static SE3 Exp(const Eigen::Matrix<float,6,1>& tau_phi);
+
     // Skew-symmetric matrix
     static Eigen::Matrix3f skew(const Eigen::Vector3f& v);
     

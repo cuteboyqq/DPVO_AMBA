@@ -16,6 +16,7 @@
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <cmath>
+#include <fstream>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -394,16 +395,73 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     // -------------------------------------------------
     if (logger) logger->info("DPVO::runAfterPatchify: Starting pose initialization");
     
-    // // Initialize pose for this frame with motion model
+    // Python: Uses DAMPED_LINEAR motion model when n > 1
+    // Python: P1 = SE3(poses[n-1]), P2 = SE3(poses[n-2])
+    //         fac = (c-b) / (b-a) where a,b,c are last 3 timestamps
+    //         xi = MOTION_DAMPING * fac * (P1 * P2.inv()).log()
+    //         new_pose = SE3.exp(xi) * P1
+    const float MOTION_DAMPING = 0.5f;  // Match Python config
+    
     if (n_use == 0) {
         // First frame: use identity pose (origin, no rotation)
         m_pg.m_poses[n_use] = SE3();
         if (logger) logger->info("DPVO::runAfterPatchify: Initialized first frame pose to identity");
-    // } else if (n_use == 1) {
-    }else {
+    } else if (n_use == 1) {
         // Second frame: copy first frame pose (no motion initially)
         m_pg.m_poses[n_use] = m_pg.m_poses[n_use - 1];
         if (logger) logger->info("DPVO::runAfterPatchify: Initialized second frame pose from first frame");
+    } else {
+        // Third frame and beyond: use damped linear motion model
+        SE3 P1 = m_pg.m_poses[n_use - 1];  // Previous pose
+        SE3 P2 = m_pg.m_poses[n_use - 2];  // Pose before previous
+        
+        // Compute time scaling factor: fac = (c-b) / (b-a)
+        // Python: *_, a,b,c = [1]*3 + self.tlist
+        //         fac = (c-b) / (b-a)
+        float fac = 1.0f;  // Default to 1.0 if timestamps not available
+        if (m_tlist.size() >= 3) {
+            // Get last 3 timestamps: a, b, c
+            int64_t a = (m_tlist.size() >= 3) ? m_tlist[m_tlist.size() - 3] : timestamp;
+            int64_t b = (m_tlist.size() >= 2) ? m_tlist[m_tlist.size() - 2] : timestamp;
+            int64_t c = timestamp;
+            
+            int64_t dt1 = b - a;  // Time between frame n-2 and n-1
+            int64_t dt2 = c - b;  // Time between frame n-1 and n
+            
+            if (dt1 > 0) {
+                fac = static_cast<float>(dt2) / static_cast<float>(dt1);
+            }
+        }
+        
+        // Compute relative motion: (P1 * P2.inv()).log()
+        SE3 P1_P2inv = P1 * P2.inverse();
+        Eigen::Matrix<float,6,1> xi_raw = P1_P2inv.log();
+        Eigen::Matrix<float,6,1> xi = MOTION_DAMPING * fac * xi_raw;
+        
+        // Predict new pose: SE3.exp(xi) * P1
+        SE3 new_pose = SE3::Exp(xi) * P1;
+        m_pg.m_poses[n_use] = new_pose;
+        
+        if (logger) {
+            Eigen::Vector3f P1_t = P1.t;
+            Eigen::Vector3f P2_t = P2.t;
+            Eigen::Vector3f new_t = new_pose.t;
+            Eigen::Vector3f xi_t = xi.head<3>();
+            Eigen::Vector3f xi_r = xi.tail<3>();
+            logger->info("DPVO::runAfterPatchify: Motion model for frame {} - P1.t=({:.3f}, {:.3f}, {:.3f}), P2.t=({:.3f}, {:.3f}, {:.3f}), "
+                        "xi_raw.t=({:.4f}, {:.4f}, {:.4f}), xi_raw.r=({:.4f}, {:.4f}, {:.4f}), "
+                        "xi.t=({:.4f}, {:.4f}, {:.4f}), xi.r=({:.4f}, {:.4f}, {:.4f}), "
+                        "new_pose.t=({:.3f}, {:.3f}, {:.3f}), fac={:.4f}, damping={:.2f}",
+                        n_use,
+                        P1_t.x(), P1_t.y(), P1_t.z(),
+                        P2_t.x(), P2_t.y(), P2_t.z(),
+                        xi_raw.head<3>().x(), xi_raw.head<3>().y(), xi_raw.head<3>().z(),
+                        xi_raw.tail<3>().x(), xi_raw.tail<3>().y(), xi_raw.tail<3>().z(),
+                        xi_t.x(), xi_t.y(), xi_t.z(),
+                        xi_r.x(), xi_r.y(), xi_r.z(),
+                        new_t.x(), new_t.y(), new_t.z(),
+                        fac, MOTION_DAMPING);
+        }
     } 
 
     // Store pose in historical buffer for visualization
@@ -444,11 +502,13 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
             if (logger) logger->info("DPVO::runAfterPatchify: Using median depth from last 3 frames: {}", depth_value);
         }
     } else {
+        // Python: patches[:,:,2] = torch.rand_like(patches[:,:,2,0,0,None,None])
+        // torch.rand_like generates values in [0, 1) (uniform distribution)
         static std::random_device rd;
         static std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dis(0.1f, 1.0f);
+        std::uniform_real_distribution<float> dis(0.0f, 1.0f);  // Match Python: [0, 1)
         depth_value = dis(gen);
-        if (logger) logger->info("DPVO::runAfterPatchify: Using random depth initialization: {}", depth_value);
+        if (logger) logger->info("DPVO::runAfterPatchify: Using random depth initialization: {} (Python uses [0, 1))", depth_value);
     }
     
     // Initialize all patches with the computed depth value
@@ -1402,8 +1462,204 @@ void DPVO::update()
         logger->info("\033[32m--- Step 3.6: Bundle Adjustment Call ---\033[0m");
         logger->info("DPVO::update: Starting bundle adjustment");
     }
+    
+    // Save BA inputs for comparison (first two update() calls)
+    // update() is first called when m_pg.m_n >= 8, so m_counter == 0 or 1 will never be true
+    // Use a static counter to track update() calls instead
+    static int update_call_count = 0;
+    update_call_count++;
+    // Only save for the first update() call to avoid file overwriting issues
+    // The first call happens when m_pg.m_n >= 8 (after initialization)
+    bool save_ba_inputs = (update_call_count == 1);
+    
+    if (save_ba_inputs) {
+        if (logger) {
+            logger->info("DPVO::update: Saving BA inputs for update() call #{} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
+                        update_call_count, m_counter, m_pg.m_n);
+        }
+        
+        const int N = m_pg.m_n;
+        const int M = m_cfg.PATCHES_PER_FRAME;
+        const int P = m_P;
+        
+        // Save poses [N, 7] format: [tx, ty, tz, qx, qy, qz, qw]
+        std::string poses_filename = "ba_poses.bin";
+        std::ofstream poses_file(poses_filename, std::ios::binary);
+        if (poses_file.is_open()) {
+            for (int i = 0; i < N; i++) {
+                Eigen::Vector3f t = m_pg.m_poses[i].t;
+                Eigen::Quaternionf q = m_pg.m_poses[i].q;
+                float pose_data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+                poses_file.write(reinterpret_cast<const char*>(pose_data), sizeof(float) * 7);
+            }
+            poses_file.close();
+            if (logger) logger->info("DPVO::update: Saved {} poses to {}", N, poses_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", poses_filename);
+        }
+        
+        // Save patches [N*M, 3, P, P]
+        std::string patches_filename = "ba_patches.bin";
+        std::ofstream patches_file(patches_filename, std::ios::binary);
+        if (patches_file.is_open()) {
+            for (int i = 0; i < N; i++) {
+                for (int j = 0; j < M; j++) {
+                    for (int c = 0; c < 3; c++) {
+                        for (int y = 0; y < P; y++) {
+                            for (int x = 0; x < P; x++) {
+                                float val = m_pg.m_patches[i][j][c][y][x];
+                                patches_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                            }
+                        }
+                    }
+                }
+            }
+            patches_file.close();
+            if (logger) logger->info("DPVO::update: Saved patches [{}*{}, 3, {}, {}] to {}", N, M, P, P, patches_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", patches_filename);
+        }
+        
+        // Save intrinsics [N, 4] format: [fx, fy, cx, cy]
+        std::string intrinsics_filename = "ba_intrinsics.bin";
+        std::ofstream intrinsics_file(intrinsics_filename, std::ios::binary);
+        if (intrinsics_file.is_open()) {
+            for (int i = 0; i < N; i++) {
+                intrinsics_file.write(reinterpret_cast<const char*>(m_pg.m_intrinsics[i]), sizeof(float) * 4);
+            }
+            intrinsics_file.close();
+            if (logger) logger->info("DPVO::update: Saved {} intrinsics to {}", N, intrinsics_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", intrinsics_filename);
+        }
+        
+        // Save indices [num_active] (int32)
+        // CRITICAL: m_pg.m_ii stores patch index mapping, NOT frame index!
+        // Python BA expects ii = source frame index, which we extract from kk: i = kk[e] / M
+        std::string ii_filename = "ba_ii.bin";
+        std::string jj_filename = "ba_jj.bin";
+        std::string kk_filename = "ba_kk.bin";
+        std::ofstream ii_file(ii_filename, std::ios::binary);
+        std::ofstream jj_file(jj_filename, std::ios::binary);
+        std::ofstream kk_file(kk_filename, std::ios::binary);
+        
+        if (ii_file.is_open() && jj_file.is_open() && kk_file.is_open()) {
+            for (int e = 0; e < num_active; e++) {
+                // Extract source frame index from kk (matching BA logic)
+                int i_source = m_pg.m_kk[e] / M;  // Source frame index
+                int32_t ii_val = static_cast<int32_t>(i_source);  // Frame index, not patch index!
+                int32_t jj_val = static_cast<int32_t>(m_pg.m_jj[e]);  // Target frame index
+                int32_t kk_val = static_cast<int32_t>(m_pg.m_kk[e]);  // Global patch index
+                ii_file.write(reinterpret_cast<const char*>(&ii_val), sizeof(int32_t));
+                jj_file.write(reinterpret_cast<const char*>(&jj_val), sizeof(int32_t));
+                kk_file.write(reinterpret_cast<const char*>(&kk_val), sizeof(int32_t));
+            }
+            ii_file.close();
+            jj_file.close();
+            kk_file.close();
+            if (logger) logger->info("DPVO::update: Saved {} indices to {}, {}, {} (ii=frame_index from kk/M, jj=frame_index, kk=patch_index)", 
+                                    num_active, ii_filename, jj_filename, kk_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open index files for writing");
+        }
+        
+        // Save reprojected coordinates at patch center [num_active, 2]
+        // We already have coords from reproject() call above
+        std::string coords_filename = "ba_reprojected_coords.bin";
+        std::ofstream coords_file(coords_filename, std::ios::binary);
+        if (coords_file.is_open()) {
+            int center_idx = (P / 2) * P + (P / 2);
+            for (int e = 0; e < num_active; e++) {
+                float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
+                float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
+                coords_file.write(reinterpret_cast<const char*>(&cx), sizeof(float));
+                coords_file.write(reinterpret_cast<const char*>(&cy), sizeof(float));
+            }
+            coords_file.close();
+            if (logger) logger->info("DPVO::update: Saved {} reprojected coordinates to {}", num_active, coords_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", coords_filename);
+        }
+        
+        // Save targets [num_active, 2] (reprojected_coords + delta from update model)
+        std::string targets_filename = "ba_targets.bin";
+        std::ofstream targets_file(targets_filename, std::ios::binary);
+        if (targets_file.is_open()) {
+            for (int e = 0; e < num_active; e++) {
+                float target_x = m_pg.m_target[e * 2 + 0];
+                float target_y = m_pg.m_target[e * 2 + 1];
+                targets_file.write(reinterpret_cast<const char*>(&target_x), sizeof(float));
+                targets_file.write(reinterpret_cast<const char*>(&target_y), sizeof(float));
+            }
+            targets_file.close();
+            if (logger) logger->info("DPVO::update: Saved {} targets to {}", num_active, targets_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", targets_filename);
+        }
+        
+        // Save weights [num_active, 2] (from update model)
+        std::string weights_filename = "ba_weights.bin";
+        std::ofstream weights_file(weights_filename, std::ios::binary);
+        if (weights_file.is_open()) {
+            for (int e = 0; e < num_active; e++) {
+                float w0 = m_pg.m_weight[e][0];
+                float w1 = m_pg.m_weight[e][1];
+                weights_file.write(reinterpret_cast<const char*>(&w0), sizeof(float));
+                weights_file.write(reinterpret_cast<const char*>(&w1), sizeof(float));
+            }
+            weights_file.close();
+            if (logger) logger->info("DPVO::update: Saved {} weights to {}", num_active, weights_filename);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", weights_filename);
+        }
+        
+        // Save metadata
+        std::string metadata_filename = "test_metadata.txt";
+        std::ofstream meta_file(metadata_filename);
+        if (meta_file.is_open()) {
+            const int CORR_DIM = 882;  // 2*49*P*P = 2*49*3*3 = 882 for P=3
+            const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
+            meta_file << "num_active=" << num_active << "\n";
+            meta_file << "MAX_EDGE=" << MAX_EDGE << "\n";
+            meta_file << "DIM=" << m_DIM << "\n";
+            meta_file << "CORR_DIM=" << CORR_DIM << "\n";
+            meta_file << "M=" << M << "\n";
+            meta_file << "P=" << P << "\n";
+            meta_file << "N=" << N << "\n";
+            meta_file.close();
+            if (logger) logger->info("DPVO::update: Saved metadata to {}: num_active={}, MAX_EDGE={}, DIM={}, CORR_DIM={}, M={}, P={}, N={}", 
+                                    metadata_filename, num_active, MAX_EDGE, m_DIM, CORR_DIM, M, P, N);
+        } else {
+            if (logger) logger->error("DPVO::update: Failed to open {} for writing", metadata_filename);
+        }
+    }
+    
     try {
         bundleAdjustment(1e-4f, 100.0f, false, 1);
+        
+        // Save BA outputs (updated poses) for first update() call
+        if (save_ba_inputs) {
+            if (logger) {
+                logger->info("DPVO::update: Saving BA outputs for update() call #{} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
+                            update_call_count, m_counter, m_pg.m_n);
+            }
+            
+            const int N = m_pg.m_n;
+            std::string poses_out_filename = "ba_poses_cpp.bin";
+            std::ofstream poses_out_file(poses_out_filename, std::ios::binary);
+            if (poses_out_file.is_open()) {
+                for (int i = 0; i < N; i++) {
+                    Eigen::Vector3f t = m_pg.m_poses[i].t;
+                    Eigen::Quaternionf q = m_pg.m_poses[i].q;
+                    float pose_data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+                    poses_out_file.write(reinterpret_cast<const char*>(pose_data), sizeof(float) * 7);
+                }
+                poses_out_file.close();
+                if (logger) logger->info("DPVO::update: Saved {} updated poses to {}", N, poses_out_filename);
+            } else {
+                if (logger) logger->error("DPVO::update: Failed to open {} for writing", poses_out_filename);
+            }
+        }
         
         // Sync optimized poses from sliding window (m_pg.m_poses) back to historical buffer (m_allPoses)
         // Use timestamps to map sliding window indices to global frame indices
@@ -1500,12 +1756,24 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // Phase B1: remove edges touching frame k
         // ---------------------------------------------------------
+        // CRITICAL FIX: m_ii[e] is NOT a frame index! It's a patch index mapping.
+        // We need to extract the source frame from kk: i_source = kk[e] / M
+        // Python: to_remove = (active_ii > k) | (active_jj == k)
+        //   where active_ii is the source frame index extracted from kk
         bool remove[MAX_EDGES] = {false};
 
         int num_active = m_pg.m_num_edges;
+        const int M = PatchGraph::M;
         for (int e = 0; e < num_active; e++) {
-            if (m_pg.m_ii[e] == k || m_pg.m_jj[e] == k)
+            // Extract source frame from kk (matching BA logic)
+            int i_source = m_pg.m_kk[e] / M;  // Source frame index
+            int j_target = m_pg.m_jj[e];       // Target frame index
+            
+            // Remove edges where source frame > k OR target frame == k
+            // Python: to_remove = (active_ii > k) | (active_jj == k)
+            if (i_source > k || j_target == k) {
                 remove[e] = true;
+            }
         }
 
         removeFactors(remove, /*store=*/false);
@@ -1513,14 +1781,25 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // Phase B2: reindex remaining edges
         // ---------------------------------------------------------
+        // CRITICAL FIX: Extract frame from kk, don't use m_ii
+        // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1; active_jj[mask_jj] -= 1
         num_active = m_pg.m_num_edges;
         for (int e = 0; e < num_active; e++) {
-
-            if (m_pg.m_ii[e] > k) {
-                m_pg.m_ii[e] -= 1;
-                m_pg.m_kk[e] -= PatchGraph::M;
+            // Extract source frame from kk
+            int i_source = m_pg.m_kk[e] / M;
+            
+            // If source frame > k, decrement both kk and update m_ii
+            // Note: m_ii needs to be updated based on the new frame index
+            if (i_source > k) {
+                m_pg.m_kk[e] -= M;  // Decrement kk by M (one frame worth of patches)
+                // m_ii[e] stores m_index[frame][patch], so we need to update it
+                // But m_index might have changed, so we need to recompute it
+                int patch_idx = m_pg.m_kk[e] % M;
+                int new_frame = i_source - 1;
+                m_pg.m_ii[e] = m_pg.m_index[new_frame][patch_idx];
             }
 
+            // If target frame > k, decrement jj
             if (m_pg.m_jj[e] > k) {
                 m_pg.m_jj[e] -= 1;
             }
@@ -2557,13 +2836,16 @@ void DPVO::computePointCloud()
             static int coord_log_count = 0;
             bool should_log_coords = (coord_log_count++ % 50 == 0) && (i < 3 || i == n - 1);
             
-            // Skip invalid points (zero or negative inverse depth)
+            // Skip invalid points (outside Python BA clamp range [1e-3, 10.0])
             // CRITICAL: Only update sliding window buffer, don't overwrite historical points with zeros
             // Historical points should be preserved even when patches become invalid
-            if (pd <= 0.0f || pd > 10.0f) {
+            // Python BA clamps: disps.clamp(min=1e-3, max=10.0)
+            const float MIN_VALID_PD = 1e-3f;  // Match Python BA clamp minimum
+            const float MAX_VALID_PD = 10.0f;  // Match Python BA clamp maximum
+            if (pd < MIN_VALID_PD || pd > MAX_VALID_PD) {
                 if (should_log_coords && logger) {
-                    logger->warn("Point cloud [frame={}, patch={}]: Invalid depth pd={:.4f} (<=0 or >10), skipping",
-                                 i, k, pd);
+                    logger->warn("Point cloud [frame={}, patch={}]: Invalid depth pd={:.4f} (<{:.3f} or >{}), skipping",
+                                 i, k, pd, MIN_VALID_PD, MAX_VALID_PD);
                 }
                 m_pg.m_points[sw_idx].x = 0.0f;
                 m_pg.m_points[sw_idx].y = 0.0f;

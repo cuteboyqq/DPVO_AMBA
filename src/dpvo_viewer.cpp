@@ -239,41 +239,12 @@ void DPVOViewer::updatePoints(const Vec3* points, const uint8_t* colors, int num
             }
         }
         
-        printf("[DPVOViewer] updatePoints: Received %d points, valid=%d, filtered: zero=%d, nan/inf=%d, out_of_bounds=%d\n",
-               num_points, valid_count, zero_count, nan_inf_count, out_of_bounds_count);
-        
-        // Check if far points are being filtered
-        int far_points_count = 0;
-        float max_distance = 0.0f;
-        for (int i = 0; i < num_points; i++) {
-            const Vec3& p = points[i];
-            float dist = std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z);
-            if (dist > 100.0f) {  // Points more than 100 units away
-                far_points_count++;
-                max_distance = std::max(max_distance, dist);
-            }
+        // Only log if there are issues (many filtered points)
+        if (valid_count < num_points * 0.5f) {
+            printf("[DPVOViewer] updatePoints: WARNING - Only %d/%d points are valid (filtered: zero=%d, nan/inf=%d, out_of_bounds=%d)\n",
+                   valid_count, num_points, zero_count, nan_inf_count, out_of_bounds_count);
+            fflush(stdout);
         }
-        printf("[DPVOViewer] updatePoints: Far points (>100 units): %d, max_distance=%.2f\n",
-               far_points_count, max_distance);
-        
-        printf("[DPVOViewer] updatePoints: Points per frame (first 10 frames, input array): ");
-        for (int f = 0; f < std::min(10, num_frames); f++) {
-            printf("Frame[%d]=%d/%d ", f, input_valid_per_frame[f], points_per_frame[f]);
-        }
-        printf("\n");
-        
-        // Also check frames 6-94 which should have zero points
-        if (num_frames > 10) {
-            printf("[DPVOViewer] updatePoints: Checking frames that should have zero points (6, 10, 20, 50, 90): ");
-            std::vector<int> check_frames = {6, 10, 20, 50, 90};
-            for (int f : check_frames) {
-                if (f < num_frames) {
-                    printf("Frame[%d]=%d/%d ", f, input_valid_per_frame[f], points_per_frame[f]);
-                }
-            }
-            printf("\n");
-        }
-        fflush(stdout);
     }
 }
 
@@ -415,15 +386,7 @@ void DPVOViewer::convertPosesToMatrices()
         mat[2]  = T_cw(0,2); mat[6]  = T_cw(1,2); mat[10] = T_cw(2,2); mat[14] = T_cw(3,2);
         mat[3]  = T_cw(0,3); mat[7]  = T_cw(1,3); mat[11] = T_cw(2,3); mat[15] = T_cw(3,3);
         
-        // DIAGNOSTIC: Log conversion for first 3 frames to verify correctness
-        static int convert_log_count = 0;
-        if (i < 3 && (convert_log_count++ % 10 == 0)) {
-            printf("[DPVOViewer] convertPosesToMatrices[%d]: T_wc.t=(%.3f, %.3f, %.3f), "
-                   "T_cw.t=(%.3f, %.3f, %.3f), mat[3]=%.3f, mat[7]=%.3f, mat[11]=%.3f\n",
-                   i, t_wc.x(), t_wc.y(), t_wc.z(), t_cw.x(), t_cw.y(), t_cw.z(),
-                   mat[3], mat[7], mat[11]);
-            fflush(stdout);
-        }
+        // Diagnostic logging removed to reduce verbosity
     }
 #endif
 }
@@ -558,14 +521,7 @@ void DPVOViewer::drawPoses()
         float cam_y = mat[7];
         float cam_z = mat[11];
         
-        // DIAGNOSTIC: Log extraction for first 3 frames to verify correctness
-        static int draw_log_count = 0;
-        if (i < 3 && (draw_log_count++ % 10 == 0)) {
-            printf("[DPVOViewer] drawPoses[%d]: cam_x=%.3f, cam_y=%.3f, cam_z=%.3f, "
-                   "mat[3]=%.3f, mat[7]=%.3f, mat[11]=%.3f\n",
-                   i, cam_x, cam_y, cam_z, mat[3], mat[7], mat[11]);
-            fflush(stdout);
-        }
+        // Diagnostic logging removed to reduce verbosity
         
         // Extract rotation vectors from transformation matrix
         // Matrix is stored in column-major format: mat[col*4 + row]
@@ -1102,14 +1058,8 @@ void DPVOViewer::drawPoses_fake()
 void DPVOViewer::run()
 {
 #ifdef ENABLE_PANGOLIN_VIEWER
-    printf("[DPVOViewer] run() thread started\n");
-    fflush(stdout);
-    
     // Initialize Pangolin window
     pangolin::CreateWindowAndBind("DPVO Viewer", 2 * 640, 2 * 480);
-    
-    printf("[DPVOViewer] run() Pangolin window created\n");
-    fflush(stdout);
     
 #ifdef __linux__
     // Position window on the right side of the screen
@@ -1197,8 +1147,6 @@ void DPVOViewer::run()
     
     // Main rendering loop
     static int loop_count = 0;
-    printf("[DPVOViewer] run() entering main loop, m_running=%d\n", m_running ? 1 : 0);
-    fflush(stdout);
     
     while (!pangolin::ShouldQuit() && m_running) {
     // while (true) {

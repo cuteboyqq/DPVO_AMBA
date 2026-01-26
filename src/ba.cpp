@@ -10,6 +10,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <fstream>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -30,6 +31,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         logger->info("\033[32mSTEP 3.1: bundleAdjustment() - Bundle Adjustment\033[0m");
         logger->info("\033[32m========================================\033[0m");
     }
+    
+    // Save intermediate BA values for step-by-step comparison (only for first BA call)
+    static int ba_call_count = 0;
+    ba_call_count++;
+    bool save_intermediates = (ba_call_count == 1);
 
     const int M = m_cfg.PATCHES_PER_FRAME;
     const int P = m_P;
@@ -192,6 +198,19 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         weights_masked[e * 2 + 1] = w1;  // Weight for y-direction (matching Python)
     }
     
+    // Save STEP 1: Residuals and validity mask
+    if (save_intermediates) {
+        std::ofstream r_file("ba_step1_residuals.bin", std::ios::binary);
+        std::ofstream v_file("ba_step1_validity.bin", std::ios::binary);
+        if (r_file.is_open() && v_file.is_open()) {
+            r_file.write(reinterpret_cast<const char*>(r.data()), sizeof(float) * num_active * 2);
+            v_file.write(reinterpret_cast<const char*>(v.data()), sizeof(float) * num_active);
+            r_file.close();
+            v_file.close();
+            if (logger) logger->info("BA: Saved STEP 1 - residuals and validity mask");
+        }
+    }
+    
     // Extract Jacobians at patch center: [num_active, 2, 6] for Ji, Jj, [num_active, 2, 1] for Jz
     std::vector<float> Ji_center(num_active * 2 * 6); // [num_active, 2, 6]
     std::vector<float> Jj_center(num_active * 2 * 6); // [num_active, 2, 6]
@@ -235,12 +254,9 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         float w0 = weights_masked[e * 2 + 0];  // Channel 0: weight for x-direction
         float w1 = weights_masked[e * 2 + 1];  // Channel 1: weight for y-direction
         
-        if (w0 < 1e-6f && w1 < 1e-6f) { // Skip if both weights are zero
-            wJiT[e].setZero();
-            wJjT[e].setZero();
-            wJzT[e].setZero();
-            continue;
-        }
+        // NOTE: Python BA does NOT skip edges with zero weights - it computes Hessian blocks for all edges
+        // Even if weights are zero, the computation should proceed (result will be zero, but consistent with Python)
+        // Removing the early skip to match Python behavior
         
         // Ji_center: [num_active, 2, 6] -> transpose to [6, 2]
         // Jj_center: [num_active, 2, 6] -> transpose to [6, 2]
@@ -292,6 +308,109 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         Eik[e] = wJiT[e] * Jz_mat;
         Ejk[e] = wJjT[e] * Jz_mat;
     }
+    
+    // Save STEP 2: Weighted Jacobians
+    if (save_intermediates) {
+        std::ofstream wJiT_file("ba_step2_wJiT.bin", std::ios::binary);
+        std::ofstream wJjT_file("ba_step2_wJjT.bin", std::ios::binary);
+        std::ofstream wJzT_file("ba_step2_wJzT.bin", std::ios::binary);
+        std::ofstream weights_masked_file("ba_step2_weights_masked.bin", std::ios::binary);
+        if (wJiT_file.is_open() && wJjT_file.is_open() && wJzT_file.is_open() && weights_masked_file.is_open()) {
+            // Eigen matrices are column-major, but Python expects row-major
+            // Write row by row to match Python's expected format
+            for (int e = 0; e < num_active; e++) {
+                // Write wJiT[e] as [6, 2] in row-major order
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 2; j++) {
+                        float val = wJiT[e](i, j);
+                        wJiT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+                // Write wJjT[e] as [6, 2] in row-major order
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 2; j++) {
+                        float val = wJjT[e](i, j);
+                        wJjT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+                // Write wJzT[e] as [1, 2] in row-major order
+                for (int i = 0; i < 1; i++) {
+                    for (int j = 0; j < 2; j++) {
+                        float val = wJzT[e](i, j);
+                        wJzT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+            }
+            weights_masked_file.write(reinterpret_cast<const char*>(weights_masked.data()), sizeof(float) * num_active * 2);
+            wJiT_file.close();
+            wJjT_file.close();
+            wJzT_file.close();
+            weights_masked_file.close();
+            if (logger) logger->info("BA: Saved STEP 2 - weighted Jacobians and masked weights");
+        }
+    }
+    
+    // Save STEP 3: Hessian blocks
+    if (save_intermediates) {
+        std::ofstream Bii_file("ba_step3_Bii.bin", std::ios::binary);
+        std::ofstream Bij_file("ba_step3_Bij.bin", std::ios::binary);
+        std::ofstream Bji_file("ba_step3_Bji.bin", std::ios::binary);
+        std::ofstream Bjj_file("ba_step3_Bjj.bin", std::ios::binary);
+        std::ofstream Eik_file("ba_step3_Eik.bin", std::ios::binary);
+        std::ofstream Ejk_file("ba_step3_Ejk.bin", std::ios::binary);
+        if (Bii_file.is_open() && Bij_file.is_open() && Bji_file.is_open() && 
+            Bjj_file.is_open() && Eik_file.is_open() && Ejk_file.is_open()) {
+            // Eigen matrices are column-major, but Python expects row-major
+            // Write row by row to match Python's expected format
+            for (int e = 0; e < num_active; e++) {
+                // Write Bii[e] as [6, 6] in row-major order
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 6; j++) {
+                        float val = Bii[e](i, j);
+                        Bii_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+                // Write Bij[e] as [6, 6] in row-major order
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 6; j++) {
+                        float val = Bij[e](i, j);
+                        Bij_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+                // Write Bji[e] as [6, 6] in row-major order
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 6; j++) {
+                        float val = Bji[e](i, j);
+                        Bji_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+                // Write Bjj[e] as [6, 6] in row-major order
+                for (int i = 0; i < 6; i++) {
+                    for (int j = 0; j < 6; j++) {
+                        float val = Bjj[e](i, j);
+                        Bjj_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+                // Write Eik[e] as [6, 1] in row-major order (column vector, so just write column)
+                for (int i = 0; i < 6; i++) {
+                    float val = Eik[e](i, 0);
+                    Eik_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+                // Write Ejk[e] as [6, 1] in row-major order (column vector, so just write column)
+                for (int i = 0; i < 6; i++) {
+                    float val = Ejk[e](i, 0);
+                    Ejk_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            Bii_file.close();
+            Bij_file.close();
+            Bji_file.close();
+            Bjj_file.close();
+            Eik_file.close();
+            Ejk_file.close();
+            if (logger) logger->info("BA: Saved STEP 3 - Hessian blocks");
+        }
+    }
 
     // ---------------------------------------------------------
     // Step 4: Compute gradients
@@ -313,6 +432,24 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         vj[e] = wJjT[e] * r_vec;
         w_vec[e] = (wJzT[e] * r_vec)(0, 0);
     }
+    
+    // Save STEP 4: Gradients
+    if (save_intermediates) {
+        std::ofstream vi_file("ba_step4_vi.bin", std::ios::binary);
+        std::ofstream vj_file("ba_step4_vj.bin", std::ios::binary);
+        std::ofstream w_vec_file("ba_step4_w_vec.bin", std::ios::binary);
+        if (vi_file.is_open() && vj_file.is_open() && w_vec_file.is_open()) {
+            for (int e = 0; e < num_active; e++) {
+                vi_file.write(reinterpret_cast<const char*>(vi[e].data()), sizeof(float) * 6);
+                vj_file.write(reinterpret_cast<const char*>(vj[e].data()), sizeof(float) * 6);
+            }
+            w_vec_file.write(reinterpret_cast<const char*>(w_vec.data()), sizeof(float) * num_active);
+            vi_file.close();
+            vj_file.close();
+            w_vec_file.close();
+            if (logger) logger->info("BA: Saved STEP 4 - gradients");
+        }
+    }
 
     // ---------------------------------------------------------
     // Step 5: Fix first pose (gauge freedom)
@@ -328,10 +465,20 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     std::vector<int> ii_new(num_active);
     std::vector<int> jj_new(num_active);
     
+    // Debug: Track which edges connect to which poses
+    std::map<int, std::vector<int>> edges_to_pose_i;
+    std::map<int, std::vector<int>> edges_to_pose_j;
+    
     for (int e = 0; e < num_active; e++) {
         int i_source = m_pg.m_kk[e] / M;  // Extract source frame index from kk (matching reproject logic)
         ii_new[e] = i_source - fixedp;     // Adjust source frame index for fixed poses
         jj_new[e] = m_pg.m_jj[e] - fixedp; // Adjust target frame index for fixed poses
+        
+        // Track edges for debugging (only valid edges)
+        if (v[e] >= 0.5f) {
+            edges_to_pose_i[i_source].push_back(e);
+            edges_to_pose_j[m_pg.m_jj[e]].push_back(e);
+        }
     }
     
     int n_adjusted = n - fixedp; // number of pose variables after fixing
@@ -339,6 +486,15 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     if (logger) {
         logger->info("BA: num_active={}, n={}, fixedp={}, n_adjusted={}", 
                      num_active, n, fixedp, n_adjusted);
+        
+        // Debug: Log edge connections for first few poses
+        for (int pose_idx = 0; pose_idx < std::min(5, n); pose_idx++) {
+            int adjusted_idx = pose_idx - fixedp;
+            int edges_as_i = edges_to_pose_i[pose_idx].size();
+            int edges_as_j = edges_to_pose_j[pose_idx].size();
+            logger->info("BA: Pose[{}] (adjusted_idx={}) - {} edges as source (i), {} edges as target (j)",
+                        pose_idx, adjusted_idx, edges_as_i, edges_as_j);
+        }
     }
 
     // ---------------------------------------------------------
@@ -379,29 +535,51 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Debug: Count edges per adjusted pose index
     std::vector<int> edge_count_per_pose(n_adjusted, 0);
     
+    // Count edges connecting to fixed poses (for debugging)
+    int edges_to_fixed_i = 0;
+    int edges_to_fixed_j = 0;
+    int edges_both_adjustable = 0;
+    
+    // NOTE: Python's safe_scatter_add_mat filters edges based ONLY on indices:
+    //   v = (ii >= 0) & (jj >= 0) & (ii < n) & (jj < m)
+    // It does NOT filter by the validity mask v from residual checks.
+    // The validity mask is already applied to weights when computing wJiT/wJjT,
+    // so the Hessian blocks Bii/Bij/etc. already have the validity mask incorporated.
+    // We should NOT filter by v[e] here - only filter by indices to match Python.
+    
     for (int e = 0; e < num_active; e++) {
-        if (v[e] < 0.5f) continue;
-        
         int i = ii_new[e];
         int j = jj_new[e];
         
+        // Python's safe_scatter_add_mat filters: v = (ii >= 0) & (jj >= 0) & (ii < n) & (jj < m)
+        // So edges where i < 0 OR j < 0 OR i >= n OR j >= m are skipped from Hessian assembly
+        // This is correct: edges connecting to fixed poses don't contribute to adjustable pose Hessian
         if (i < 0 || i >= n_adjusted || j < 0 || j >= n_adjusted) {
-            if (logger && e < 5) {
+            if (logger && e < 10) {
                 int i_source = m_pg.m_kk[e] / M;
-                logger->warn("BA: Edge[{}] skipped - i_source={}, j={}, ii_new={}, jj_new={}, n_adjusted={}",
+                logger->debug("BA: Edge[{}] skipped from Hessian - i_source={}, j={}, ii_new={}, jj_new={}, n_adjusted={} (this is normal for edges to fixed poses)",
                              e, i_source, m_pg.m_jj[e], i, j, n_adjusted);
             }
+            if (i < 0) edges_to_fixed_i++;
+            if (j < 0) edges_to_fixed_j++;
             continue;
         }
         
+        edges_both_adjustable++;
         edge_count_per_pose[i]++;
         edge_count_per_pose[j]++;
         
-        // Scatter-add blocks
+        // Scatter-add blocks (only for edges where both poses are adjustable)
         B.block<6, 6>(6 * i, 6 * i) += Bii[e];
         B.block<6, 6>(6 * i, 6 * j) += Bij[e];
         B.block<6, 6>(6 * j, 6 * i) += Bji[e];
         B.block<6, 6>(6 * j, 6 * j) += Bjj[e];
+    }
+    
+    if (logger) {
+        logger->info("BA: Edge statistics - both adjustable: {}, to fixed i: {}, to fixed j: {}, total valid: {}",
+                     edges_both_adjustable, edges_to_fixed_i, edges_to_fixed_j, 
+                     edges_both_adjustable + edges_to_fixed_i + edges_to_fixed_j);
     }
     
     // Debug: Log edge count per pose after assembly
@@ -410,6 +588,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             int pose_idx = fixedp + idx;
             logger->info("BA: Adjusted pose idx={} (global pose_idx={}) has {} edges contributing to Hessian",
                          idx, pose_idx, edge_count_per_pose[idx]);
+        }
+    }
+    
+    // Save STEP 9: Assembled Hessian B
+    if (save_intermediates) {
+        std::ofstream B_file("ba_step9_B.bin", std::ios::binary);
+        if (B_file.is_open()) {
+            B_file.write(reinterpret_cast<const char*>(B.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
+            B_file.close();
+            if (logger) logger->info("BA: Saved STEP 9 - assembled Hessian B (size: {}x{})", 6 * n_adjusted, 6 * n_adjusted);
         }
     }
 
@@ -432,6 +620,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         E.block<6, 1>(6 * i, k) += Eik[e];
         E.block<6, 1>(6 * j, k) += Ejk[e];
     }
+    
+    // Save STEP 10: Pose-structure coupling E
+    if (save_intermediates) {
+        std::ofstream E_file("ba_step10_E.bin", std::ios::binary);
+        if (E_file.is_open()) {
+            E_file.write(reinterpret_cast<const char*>(E.data()), sizeof(float) * 6 * n_adjusted * m);
+            E_file.close();
+            if (logger) logger->info("BA: Saved STEP 10 - pose-structure coupling E (size: {}x{})", 6 * n_adjusted, m);
+        }
+    }
 
     // ---------------------------------------------------------
     // Step 9: Structure Hessian C [m] (diagonal)
@@ -451,6 +649,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         Jz_mat(0, 0) = Jz_center[e * 2 * 1 + 0];
         Jz_mat(1, 0) = Jz_center[e * 2 * 1 + 1];
         C[k] += (wJzT[e] * Jz_mat)(0, 0);
+    }
+    
+    // Save STEP 11: Structure Hessian C
+    if (save_intermediates) {
+        std::ofstream C_file("ba_step11_C.bin", std::ios::binary);
+        if (C_file.is_open()) {
+            C_file.write(reinterpret_cast<const char*>(C.data()), sizeof(float) * m);
+            C_file.close();
+            if (logger) logger->info("BA: Saved STEP 11 - structure Hessian C (size: {})", m);
+        }
     }
 
     // ---------------------------------------------------------
@@ -545,16 +753,53 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         }
     }
     
+    // Save STEP 11: Assembled gradients
+    if (save_intermediates) {
+        std::ofstream v_grad_file("ba_step11_v_grad.bin", std::ios::binary);
+        std::ofstream w_grad_file("ba_step11_w_grad.bin", std::ios::binary);
+        if (v_grad_file.is_open() && w_grad_file.is_open()) {
+            v_grad_file.write(reinterpret_cast<const char*>(v_grad.data()), sizeof(float) * 6 * n_adjusted);
+            w_grad_file.write(reinterpret_cast<const char*>(w_grad.data()), sizeof(float) * m);
+            v_grad_file.close();
+            w_grad_file.close();
+            if (logger) logger->info("BA: Saved STEP 11 - assembled gradients v_grad (size: {}) and w_grad (size: {})", 6 * n_adjusted, m);
+        }
+    }
+    
     // Levenberg-Marquardt damping
     Eigen::VectorXf C_lm = C.array() + lmbda;
     Eigen::VectorXf Q = 1.0f / C_lm.array(); // C^-1 (diagonal)
     
+    // Save STEP 13: Q (inverse structure Hessian)
+    if (save_intermediates) {
+        std::ofstream Q_file("ba_step13_Q.bin", std::ios::binary);
+        if (Q_file.is_open()) {
+            Q_file.write(reinterpret_cast<const char*>(Q.data()), sizeof(float) * m);
+            Q_file.close();
+            if (logger) logger->info("BA: Saved STEP 13 - Q (inverse structure Hessian, size: {})", m);
+        }
+    }
+
     // Schur complement: S = B - E * C^-1 * E^T
     Eigen::MatrixXf EQ = E * Q.asDiagonal(); // E * C^-1
     Eigen::MatrixXf S = B - EQ * E.transpose();
     
     // RHS: y = v - E * C^-1 * w
     Eigen::VectorXf y = v_grad - EQ * w_grad;
+    
+    // Save STEP 14: Schur complement S and RHS y
+    if (save_intermediates) {
+        std::ofstream S_file("ba_step14_S.bin", std::ios::binary);
+        std::ofstream y_file("ba_step14_y.bin", std::ios::binary);
+        if (S_file.is_open() && y_file.is_open()) {
+            S_file.write(reinterpret_cast<const char*>(S.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
+            y_file.write(reinterpret_cast<const char*>(y.data()), sizeof(float) * 6 * n_adjusted);
+            S_file.close();
+            y_file.close();
+            if (logger) logger->info("BA: Saved STEP 14 - Schur complement S (size: {}x{}) and RHS y (size: {})", 
+                                    6 * n_adjusted, 6 * n_adjusted, 6 * n_adjusted);
+        }
+    }
     
     if (logger) {
         float y_norm = y.norm();
@@ -577,14 +822,14 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         dZ = Q.asDiagonal() * w_grad;
     } else {
         // Python: A = A + (ep + lm * A) * torch.eye(n1*p1, device=A.device)
-        // where ep=100.0, lm=1e-4
-        // This adds: (ep + lm * diag(S)) * I to S
-        // For stability, we add ep * I + lm * diag(S) * I
-        Eigen::VectorXf S_diag = S.diagonal();
+        // where ep=100.0 (from BA call), lm=1e-4 (hardcoded in block_solve)
+        // Formula: A[i,i] += ep + lm * A[i,i]
+        // This is equivalent to: A[i,i] = A[i,i] * (1 + lm) + ep
         Eigen::MatrixXf S_damped = S;
         float lm = 1e-4f;
+        // Match Python exactly: add (ep + lm * S[i,i]) to each diagonal element
         for (int i = 0; i < 6 * n_adjusted; i++) {
-            S_damped(i, i) += ep + lm * S_diag[i];
+            S_damped(i, i) += ep + lm * S(i, i);
         }
         
         // Python uses Cholesky solver (matches Python: CholeskySolver.apply)
@@ -602,11 +847,33 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             if (logger) {
                 float y_norm = y.norm();
                 float dX_norm_before_check = dX.norm();
-                logger->info("BA: Solver success - y.norm()={:.6f}, dX.norm()={:.6f}", y_norm, dX_norm_before_check);
+                float S_diag_min = S_damped.diagonal().minCoeff();
+                float S_diag_max = S_damped.diagonal().maxCoeff();
+                float S_cond = S_diag_max / std::max(S_diag_min, 1e-10f);
+                logger->info("BA: Solver success - y.norm()={:.6f}, dX.norm()={:.6f}, S_diag_range=[{:.6f}, {:.6f}], S_cond={:.2e}, ep={:.2f}, lm={:.2e}",
+                             y_norm, dX_norm_before_check, S_diag_min, S_diag_max, S_cond, ep, lm);
+                if (dX_norm_before_check < 0.1f && y_norm > 10.0f) {
+                    logger->warn("BA: WARNING - Large residual (y.norm()={:.2f}) but small update (dX.norm()={:.4f})! "
+                                "This suggests damping might be too high or Hessian is poorly conditioned.",
+                                y_norm, dX_norm_before_check);
+                }
             }
             // Back-substitute structure increments: dZ = C^-1 * (w - E^T * dX)
             // Python: dZ = Q * (w - block_matmul(E.permute(0, 2, 1, 4, 3), dX).squeeze(dim=-1))
             dZ = Q.asDiagonal() * (w_grad - E.transpose() * dX);
+            
+            // Save STEP 15-16: Solution dX and dZ
+            if (save_intermediates) {
+                std::ofstream dX_file("ba_step15_dX.bin", std::ios::binary);
+                std::ofstream dZ_file("ba_step16_dZ.bin", std::ios::binary);
+                if (dX_file.is_open() && dZ_file.is_open()) {
+                    dX_file.write(reinterpret_cast<const char*>(dX.data()), sizeof(float) * dX.size());
+                    dZ_file.write(reinterpret_cast<const char*>(dZ.data()), sizeof(float) * dZ.size());
+                    dX_file.close();
+                    dZ_file.close();
+                    if (logger) logger->info("BA: Saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", dX.size(), dZ.size());
+                }
+            }
         }
     }
 
@@ -627,6 +894,14 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             if (pose_idx >= 0 && pose_idx < n) {
                 Eigen::Matrix<float, 6, 1> dx_vec = dX.segment<6>(6 * idx);
                 
+                // Debug: Log dX values for first few poses
+                if (logger && idx < 3) {
+                    logger->info("BA: Pose[{}] (idx={}) dX: t=({:.6f}, {:.6f}, {:.6f}), r=({:.6f}, {:.6f}, {:.6f})",
+                                pose_idx, idx,
+                                dx_vec(0), dx_vec(1), dx_vec(2),
+                                dx_vec(3), dx_vec(4), dx_vec(5));
+                }
+                
                 // Python BA directly passes dX to pose_retr without any validation or clamping
                 // Python: poses = pose_retr(poses, dX, fixedp + torch.arange(n))
                 // Python retr: Exp(a) * X (no negation, no clamping, no validation)
@@ -638,7 +913,22 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 // Previous reordering was WRONG and caused incorrect pose updates
                 
                 // Apply update directly (matches Python: no validation, no clamping, no reverting)
+                SE3 pose_before = m_pg.m_poses[pose_idx];
                 m_pg.m_poses[pose_idx] = m_pg.m_poses[pose_idx].retr(dx_vec);
+                
+                // Debug: Log pose before and after for first few poses
+                if (logger && idx < 3) {
+                    Eigen::Vector3f t_before = pose_before.t;
+                    Eigen::Quaternionf q_before = pose_before.q;
+                    Eigen::Vector3f t_after = m_pg.m_poses[pose_idx].t;
+                    Eigen::Quaternionf q_after = m_pg.m_poses[pose_idx].q;
+                    logger->info("BA: Pose[{}] before: t=({:.6f}, {:.6f}, {:.6f}), q=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
+                                pose_idx, t_before.x(), t_before.y(), t_before.z(),
+                                q_before.x(), q_before.y(), q_before.z(), q_before.w());
+                    logger->info("BA: Pose[{}] after:  t=({:.6f}, {:.6f}, {:.6f}), q=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
+                                pose_idx, t_after.x(), t_after.y(), t_after.z(),
+                                q_after.x(), q_after.y(), q_after.z(), q_after.w());
+                }
             }
         }
     } else {
@@ -661,11 +951,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         float dZ_val = dZ[idx];
         
         // Update all pixels in the patch (Python scatter_sum adds to entire patch)
-        // Clamp inverse depth to reasonable range: [0.01, 10.0]
-        //   pd = 0.01 means depth = 100 (far but reasonable)
+        // Clamp inverse depth to match Python exactly: [1e-3, 10.0]
+        //   pd = 1e-3 means depth = 1000 (far but allowed by Python)
         //   pd = 10.0 means depth = 0.1 (very close)
-        // Previous clamp [1e-3, 10.0] allowed pd=0.001 (depth=1000) which is too far
-        const float MIN_PD = 0.01f;   // Minimum inverse depth (maximum depth = 100)
+        // Python: disps = disp_retr(disps, dZ, kx).clamp(min=1e-3, max=10.0)
+        const float MIN_PD = 1e-3f;   // Minimum inverse depth (maximum depth = 1000) - matches Python
         const float MAX_PD = 10.0f;   // Maximum inverse depth (minimum depth = 0.1)
         for (int y = 0; y < P; y++) {
             for (int x = 0; x < P; x++) {

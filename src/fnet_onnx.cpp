@@ -238,7 +238,7 @@ bool FNetInferenceONNX::_loadInput(void* imgTensor, std::vector<float>& input_da
     if (H == m_inputHeight && W == m_inputWidth) {
         img_resized = img_bgr.clone();
     } else {
-        cv::resize(img_bgr, img_resized, cv::Size(m_inputWidth, m_inputHeight), 0, 0, cv::INTER_LINEAR);
+        cv::resize(img_bgr, img_resized, cv::Size(m_inputWidth, m_inputHeight), 0, 0, cv::INTER_LINEAR); //INTER_LINEAR
     }
     
     // Convert BGR to RGB using OpenCV (matches Python DPVO)

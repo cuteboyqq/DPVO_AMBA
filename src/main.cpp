@@ -11,6 +11,7 @@
   violation of applicable laws and may result in severe legal penalties.
 */
 #include "main.hpp"
+#include <opencv2/opencv.hpp>
 
 
 /**
@@ -1133,6 +1134,180 @@ void processApp(
 // =================================================================================================
 
 /**
+ * @brief Preprocess image tensor: undistort and crop to divisible by 16
+ * 
+ * This function matches Python DPVO preprocessing:
+ * 1. Undistort if distortion parameters are available
+ * 2. Crop to make dimensions divisible by 16
+ * 
+ * @param imgTensor Input tensor (will be modified)
+ * @param config Config containing camera parameters
+ * @param logger Logger for logging
+ * @return true if preprocessing succeeded, false otherwise
+ */
+static bool preprocessImageTensor(ea_tensor_t* imgTensor, Config_S* config, std::shared_ptr<spdlog::logger> logger)
+{
+	if (logger) {
+		logger->info("preprocessImageTensor: Function called, imgTensor={}, config={}", 
+		             (void*)imgTensor, (void*)config);
+	}
+	
+	if (!imgTensor) {
+		if (logger) logger->error("preprocessImageTensor: imgTensor is null");
+		return false;
+	}
+	if (!config) {
+		if (logger) logger->error("preprocessImageTensor: config is null");
+		return false;
+	}
+	
+	const size_t* shape = ea_tensor_shape(imgTensor);
+	int H = static_cast<int>(shape[EA_H]);
+	int W = static_cast<int>(shape[EA_W]);
+	int C = static_cast<int>(shape[EA_C]);
+	
+	if (C != 3) {
+		if (logger) logger->error("preprocessImageTensor: Expected 3 channels, got {}", C);
+		return false;
+	}
+	
+	void* tensor_data = ea_tensor_data(imgTensor);
+	if (!tensor_data) {
+		if (logger) logger->error("preprocessImageTensor: Failed to get tensor data");
+		return false;
+	}
+	
+	// Convert from [C, H, W] BGR to cv::Mat [H, W, C] BGR format
+	cv::Mat img_bgr(H, W, CV_8UC3);
+	const uint8_t* src = static_cast<const uint8_t*>(tensor_data);
+	for (int c = 0; c < 3; c++) {
+		for (int y = 0; y < H; y++) {
+			for (int x = 0; x < W; x++) {
+				int src_idx = c * H * W + y * W + x;
+				img_bgr.at<cv::Vec3b>(y, x)[c] = src[src_idx];
+			}
+		}
+	}
+	
+	cv::Mat img_processed = img_bgr.clone();
+	static unsigned int frame_count = 0;
+	
+	// STEP 1: Undistort if distortion parameters are available (matching Python: if len(calib) > 4)
+	bool has_distortion = (std::abs(config->stCameraConfig.distortion_k1) > 1e-6f ||
+	                       std::abs(config->stCameraConfig.distortion_k2) > 1e-6f ||
+	                       std::abs(config->stCameraConfig.distortion_p1) > 1e-6f ||
+	                       std::abs(config->stCameraConfig.distortion_p2) > 1e-6f);
+	
+	if (has_distortion) {
+		// Build camera matrix K
+		cv::Mat K = cv::Mat::eye(3, 3, CV_64F);
+		K.at<double>(0, 0) = config->stCameraConfig.intrinsic_fx;  // fx
+		K.at<double>(0, 2) = config->stCameraConfig.intrinsic_cx;  // cx
+		K.at<double>(1, 1) = config->stCameraConfig.intrinsic_fy;  // fy
+		K.at<double>(1, 2) = config->stCameraConfig.intrinsic_cy;  // cy
+		
+		// Build distortion coefficients [k1, k2, p1, p2]
+		cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+		dist_coeffs.at<double>(0) = config->stCameraConfig.distortion_k1;
+		dist_coeffs.at<double>(1) = config->stCameraConfig.distortion_k2;
+		dist_coeffs.at<double>(2) = config->stCameraConfig.distortion_p1;
+		dist_coeffs.at<double>(3) = config->stCameraConfig.distortion_p2;
+		
+		if (logger && frame_count == 0) {
+			logger->info("preprocessImageTensor: Applying undistortion with k1={:.6f}, k2={:.6f}, p1={:.6f}, p2={:.6f}",
+			             config->stCameraConfig.distortion_k1, config->stCameraConfig.distortion_k2,
+			             config->stCameraConfig.distortion_p1, config->stCameraConfig.distortion_p2);
+		}
+		
+		cv::undistort(img_bgr, img_processed, K, dist_coeffs);
+		
+		// Update dimensions after undistortion (may change slightly)
+		H = img_processed.rows;
+		W = img_processed.cols;
+	} else {
+		if (logger && frame_count == 0) {
+			logger->info("preprocessImageTensor: No distortion parameters (all zero), skipping undistortion");
+		}
+	}
+	
+	// STEP 2: Crop to make dimensions divisible by 16 (matching Python: image[:h-h%16, :w-w%16])
+	int h_cropped = H; //- (H % 16);
+	int w_cropped = W; //- (W % 16);
+	
+	if (h_cropped != H || w_cropped != W) {
+		if (logger && frame_count == 0) {
+			logger->info("preprocessImageTensor: Cropping from {}x{} to {}x{} (divisible by 16)",
+			             W, H, w_cropped, h_cropped);
+		}
+		img_processed = img_processed(cv::Rect(0, 0, w_cropped, h_cropped));
+		H = h_cropped;
+		W = w_cropped;
+	} else {
+		if (logger && frame_count == 0) {
+			logger->info("preprocessImageTensor: Dimensions {}x{} already divisible by 16, no cropping needed", W, H);
+		}
+	}
+	
+	frame_count++;
+	
+	// Convert back from [H, W, C] BGR to [C, H, W] BGR format
+	// Note: We need to update the tensor data, but tensor dimensions may have changed
+	// For now, we'll copy back to the original tensor (assuming it's large enough)
+	// If dimensions changed, we'd need to create a new tensor, but that's complex with ea_tensor_t
+	// So we'll only update the data if dimensions match, otherwise log a warning
+	const size_t* shape_after = ea_tensor_shape(imgTensor);
+	int H_orig = static_cast<int>(shape_after[EA_H]);
+	int W_orig = static_cast<int>(shape_after[EA_W]);
+	
+	if (H != H_orig || W != W_orig) {
+		if (logger && frame_count == 1) {
+			logger->warn("preprocessImageTensor: Dimensions changed from {}x{} to {}x{}, but cannot resize tensor. "
+			             "Using cropped region only.", W_orig, H_orig, W, H);
+		}
+		// Copy only the cropped region
+		uint8_t* dst = static_cast<uint8_t*>(tensor_data);
+		for (int c = 0; c < 3; c++) {
+			for (int y = 0; y < H && y < H_orig; y++) {
+				for (int x = 0; x < W && x < W_orig; x++) {
+					int dst_idx = c * H_orig * W_orig + y * W_orig + x;
+					dst[dst_idx] = img_processed.at<cv::Vec3b>(y, x)[c];
+				}
+			}
+		}
+		// Zero out remaining pixels if cropped
+		if (H < H_orig || W < W_orig) {
+			for (int c = 0; c < 3; c++) {
+				for (int y = H; y < H_orig; y++) {
+					for (int x = 0; x < W_orig; x++) {
+						int dst_idx = c * H_orig * W_orig + y * W_orig + x;
+						dst[dst_idx] = 0;
+					}
+				}
+				for (int y = 0; y < H; y++) {
+					for (int x = W; x < W_orig; x++) {
+						int dst_idx = c * H_orig * W_orig + y * W_orig + x;
+						dst[dst_idx] = 0;
+					}
+				}
+			}
+		}
+	} else {
+		// Dimensions match, copy back normally
+		uint8_t* dst = static_cast<uint8_t*>(tensor_data);
+		for (int c = 0; c < 3; c++) {
+			for (int y = 0; y < H; y++) {
+				for (int x = 0; x < W; x++) {
+					int dst_idx = c * H * W + y * W + x;
+					dst[dst_idx] = img_processed.at<cv::Vec3b>(y, x)[c];
+				}
+			}
+		}
+	}
+	
+	return true;
+}
+
+/**
  * @brief Process the input data for DPVO
  * 
  * This function processes the input data based on the input type for DPVO.
@@ -1146,6 +1321,7 @@ void processApp(
  * @param dpvo DPVO instance
  * @param modelH Model input height
  * @param modelW Model input width
+ * @param config Config containing camera parameters
  */
 void processDPVOInput(
 	const std::string& inputPath,
@@ -1155,9 +1331,19 @@ void processDPVOInput(
 	global_param_t* G_param,
 	DPVO* dpvo,
 	int modelH,
-	int modelW)
+	int modelW,
+	Config_S* config)
 {
 	int rval = EA_SUCCESS;
+	
+	if (logger) {
+		logger->info("processDPVOInput: Called with config={}", (void*)config);
+		if (config) {
+			logger->info("processDPVOInput: Config has distortion_k1={:.6f}, distortion_k2={:.6f}, distortion_p1={:.6f}, distortion_p2={:.6f}",
+			             config->stCameraConfig.distortion_k1, config->stCameraConfig.distortion_k2,
+			             config->stCameraConfig.distortion_p1, config->stCameraConfig.distortion_p2);
+		}
+	}
 
 	ea_tensor_t* tmpTensor = NULL;
 	ea_img_resource_data_t data;
@@ -1254,7 +1440,27 @@ void processDPVOInput(
 
 		ea_tensor_t* imgTensor = ea_tensor_new_from_other(tmpTensor, 0);
 
-		// Get actual image dimensions from tensor
+		// Apply preprocessing: undistort and crop to divisible by 16 (matching Python DPVO)
+		if (config) {
+			if (logger) {
+				logger->info("preprocessImageTensor: Starting preprocessing for frame {}", count);
+			}
+			if (!preprocessImageTensor(imgTensor, config, logger)) {
+				if (logger) {
+					logger->warn("preprocessImageTensor failed, continuing with original image");
+				}
+			} else {
+				if (logger) {
+					logger->info("preprocessImageTensor: Preprocessing completed successfully");
+				}
+			}
+		} else {
+			if (logger) {
+				logger->warn("preprocessImageTensor: config is null, skipping preprocessing");
+			}
+		}
+
+		// Get actual image dimensions from tensor (after preprocessing)
 		const size_t* shape = ea_tensor_shape(imgTensor);
 		int tensorH = static_cast<int>(shape[EA_H]);
 		int tensorW = static_cast<int>(shape[EA_W]);
@@ -1504,7 +1710,8 @@ void processDPVOApp(
 			G_param,
 			dpvo.get(),
 			ht,
-			wd);
+			wd,
+			config);
 		logger->error("processDPVOInput finished");
 		// Signal completion and wait for thread
 		{

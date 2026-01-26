@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <fstream>
+#include <string>
 #include <spdlog/spdlog.h>
 
 // =================================================================================================
@@ -238,52 +239,59 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
     fflush(stdout);
     
-    // Save patchify outputs for comparison with Python (frame 0 only)
-    static bool patchify_outputs_saved = false;
-    if (!patchify_outputs_saved) {
+    // Save patchify outputs for comparison with Python (frame 0 and frame 1)
+    static int patchify_frame_counter = 0;
+    patchify_frame_counter++;
+    
+    if (patchify_frame_counter == 1 || patchify_frame_counter == 2) {
+        int frame_idx = patchify_frame_counter - 1;  // frame_idx: 0 for first call, 1 for second call
+        
         // Save coordinates
-        std::ofstream coords_file("cpp_coords_frame0.bin", std::ios::binary);
+        std::string coords_filename = "cpp_coords_frame" + std::to_string(frame_idx) + ".bin";
+        std::ofstream coords_file(coords_filename, std::ios::binary);
         if (coords_file.is_open()) {
             coords_file.write(reinterpret_cast<const char*>(coords), M * 2 * sizeof(float));
             coords_file.close();
-            printf("[Patchifier] Saved coordinates to cpp_coords_frame0.bin: M=%d, size=%zu bytes\n", M, M * 2 * sizeof(float));
+            printf("[Patchifier] Saved coordinates to %s: M=%d, size=%zu bytes\n", 
+                   coords_filename.c_str(), M, M * 2 * sizeof(float));
             fflush(stdout);
         }
         
         // Save gmap: [M, 128, P, P] = [4, 128, 3, 3]
-        std::ofstream gmap_file("cpp_gmap_frame0.bin", std::ios::binary);
+        std::string gmap_filename = "cpp_gmap_frame" + std::to_string(frame_idx) + ".bin";
+        std::ofstream gmap_file(gmap_filename, std::ios::binary);
         if (gmap_file.is_open()) {
             int gmap_size = M * 128 * m_patch_size * m_patch_size;
             gmap_file.write(reinterpret_cast<const char*>(gmap), gmap_size * sizeof(float));
             gmap_file.close();
-            printf("[Patchifier] Saved gmap to cpp_gmap_frame0.bin: shape=[%d, 128, %d, %d], size=%zu bytes\n",
-                   M, m_patch_size, m_patch_size, gmap_size * sizeof(float));
+            printf("[Patchifier] Saved gmap to %s: shape=[%d, 128, %d, %d], size=%zu bytes\n",
+                   gmap_filename.c_str(), M, m_patch_size, m_patch_size, gmap_size * sizeof(float));
             fflush(stdout);
         }
         
         // Save imap: [M, 384, 1, 1] = [4, 384, 1, 1]
-        std::ofstream imap_file("cpp_imap_frame0.bin", std::ios::binary);
+        std::string imap_filename = "cpp_imap_frame" + std::to_string(frame_idx) + ".bin";
+        std::ofstream imap_file(imap_filename, std::ios::binary);
         if (imap_file.is_open()) {
             int imap_size = M * inet_output_channels * 1 * 1;
             imap_file.write(reinterpret_cast<const char*>(imap), imap_size * sizeof(float));
             imap_file.close();
-            printf("[Patchifier] Saved imap to cpp_imap_frame0.bin: shape=[%d, %d, 1, 1], size=%zu bytes\n",
-                   M, inet_output_channels, imap_size * sizeof(float));
+            printf("[Patchifier] Saved imap to %s: shape=[%d, %d, 1, 1], size=%zu bytes\n",
+                   imap_filename.c_str(), M, inet_output_channels, imap_size * sizeof(float));
             fflush(stdout);
         }
         
         // Save patches: [M, 3, P, P] = [4, 3, 3, 3]
-        std::ofstream patches_file("cpp_patches_frame0.bin", std::ios::binary);
+        std::string patches_filename = "cpp_patches_frame" + std::to_string(frame_idx) + ".bin";
+        std::ofstream patches_file(patches_filename, std::ios::binary);
         if (patches_file.is_open()) {
             int patches_size = M * 3 * m_patch_size * m_patch_size;
             patches_file.write(reinterpret_cast<const char*>(patches), patches_size * sizeof(float));
             patches_file.close();
-            printf("[Patchifier] Saved patches to cpp_patches_frame0.bin: shape=[%d, 3, %d, %d], size=%zu bytes\n",
-                   M, m_patch_size, m_patch_size, patches_size * sizeof(float));
+            printf("[Patchifier] Saved patches to %s: shape=[%d, 3, %d, %d], size=%zu bytes\n",
+                   patches_filename.c_str(), M, m_patch_size, m_patch_size, patches_size * sizeof(float));
             fflush(stdout);
         }
-        
-        patchify_outputs_saved = true;
     }
 
     printf("[Patchifier] About to extract colors\n");

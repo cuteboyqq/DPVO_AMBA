@@ -135,6 +135,135 @@ SE3 SE3::retr(const Eigen::Matrix<float,6,1>& dx) const {
 }
 
 // -----------------------------
+// Logarithm map: SE3 → se3 (6-vector [tau, phi])
+// Python: Log() returns [Vinv * translation, phi] where phi = so3.Log()
+// -----------------------------
+Eigen::Matrix<float,6,1> SE3::log() const {
+    // Extract rotation part: quaternion → axis-angle (phi)
+    // Python lietorch uses atan-based formula: phi = (2 * atan(n/w) / n) * q.vec()
+    // where n = ||q.vec()|| and w = q.w()
+    Eigen::Vector3f phi;
+    float qw = q.w();
+    Eigen::Vector3f qvec = q.vec();  // [qx, qy, qz]
+    float squared_n = qvec.squaredNorm();
+    float n = std::sqrt(squared_n);
+    
+    float two_atan_nbyw_by_n;
+    const float EPS = 1e-6f;
+    
+    if (squared_n < EPS * EPS) {
+        // Small rotation: q.vec() ≈ 0, so w ≈ 1
+        float squared_w = qw * qw;
+        two_atan_nbyw_by_n = 2.0f / qw - (2.0f / 3.0f) * squared_n / (qw * squared_w);
+    } else {
+        if (std::abs(qw) < EPS) {
+            // w ≈ 0: rotation by π
+            if (qw > 0.0f) {
+                two_atan_nbyw_by_n = M_PI / n;
+            } else {
+                two_atan_nbyw_by_n = -M_PI / n;
+            }
+        } else {
+            // General case: phi = (2 * atan(n/w) / n) * q.vec()
+            // Python uses atan(n/w), not atan2(n, w)
+            two_atan_nbyw_by_n = 2.0f * std::atan(n / qw) / n;
+        }
+    }
+    
+    phi = two_atan_nbyw_by_n * qvec;
+    
+    // Compute left jacobian inverse: Vinv
+    // Python lietorch formula: Vinv = I - 0.5 * Phi + coef2 * Phi^2
+    // where coef2 = (1 - theta * cos(half_theta) / (2 * sin(half_theta))) / (theta^2)
+    // or coef2 = 1/12 for small angles
+    float theta_norm = phi.norm();
+    Eigen::Matrix3f phi_skew = skew(phi);
+    Eigen::Matrix3f phi_skew2 = phi_skew * phi_skew;
+    Eigen::Matrix3f Vinv;
+    
+    if (theta_norm < 1e-6f) {
+        // Small angle: Vinv = I - 0.5 * Phi + (1/12) * Phi^2
+        Vinv = Eigen::Matrix3f::Identity() - 0.5f * phi_skew + (1.0f / 12.0f) * phi_skew2;
+    } else {
+        float half_theta = 0.5f * theta_norm;
+        float sin_half_theta = std::sin(half_theta);
+        float cos_half_theta = std::cos(half_theta);
+        
+        // coef2 = (1 - theta * cos(half_theta) / (2 * sin(half_theta))) / (theta^2)
+        float theta2 = theta_norm * theta_norm;
+        float coef2 = (1.0f - theta_norm * cos_half_theta / (2.0f * sin_half_theta)) / theta2;
+        
+        Vinv = Eigen::Matrix3f::Identity() - 0.5f * phi_skew + coef2 * phi_skew2;
+    }
+    
+    // Compute tau = Vinv * translation
+    Eigen::Vector3f tau = Vinv * t;
+    
+    // Return [tau, phi] = [translation, rotation]
+    Eigen::Matrix<float,6,1> result;
+    result.head<3>() = tau;
+    result.tail<3>() = phi;
+    return result;
+}
+
+// -----------------------------
+// Exponential map: se3 (6-vector [tau, phi]) → SE3
+// Python: Exp([tau, phi]) returns SE3(SO3.Exp(phi), left_jacobian(phi) * tau)
+// -----------------------------
+SE3 SE3::Exp(const Eigen::Matrix<float,6,1>& tau_phi) {
+    Eigen::Vector3f tau = tau_phi.head<3>();  // Translation part
+    Eigen::Vector3f phi = tau_phi.tail<3>();  // Rotation part
+    
+    // Compute SO3 exponential: Exp(phi) → quaternion
+    float theta = phi.norm();
+    Eigen::Quaternionf so3_q;
+    
+    if (theta < 1e-6f) {
+        // Small angle: use Taylor expansion
+        float half_theta = theta / 2.0f;
+        so3_q.w() = 1.0f - 0.5f * half_theta * half_theta;
+        so3_q.vec() = 0.5f * phi;
+    } else {
+        float half_theta = theta / 2.0f;
+        float sin_half_theta = std::sin(half_theta);
+        so3_q.w() = std::cos(half_theta);
+        so3_q.vec() = (sin_half_theta / theta) * phi;
+    }
+    so3_q.normalize();
+    
+    // Compute left jacobian: V
+    // V = I + (1-cos(θ))/θ² * [phi]_× + (θ - sin(θ))/θ³ * [phi]_×²
+    Eigen::Matrix3f phi_skew = skew(phi);
+    Eigen::Matrix3f V;
+    
+    if (theta < 1e-6f) {
+        // Small angle: use Taylor expansion matching retr()
+        float theta2 = theta * theta;
+        float coef1 = 0.5f - (1.0f / 24.0f) * theta2;
+        float coef2 = (1.0f / 6.0f) - (1.0f / 120.0f) * theta2;
+        V = Eigen::Matrix3f::Identity() + coef1 * phi_skew + coef2 * phi_skew * phi_skew;
+    } else {
+        float sin_theta = std::sin(theta);
+        float cos_theta = std::cos(theta);
+        float one_minus_cos_over_theta2 = (1.0f - cos_theta) / (theta * theta);
+        float theta_minus_sin_over_theta3 = (theta - sin_theta) / (theta * theta * theta);
+        
+        V = Eigen::Matrix3f::Identity()
+          + one_minus_cos_over_theta2 * phi_skew
+          + theta_minus_sin_over_theta3 * phi_skew * phi_skew;
+    }
+    
+    // Compute translation: t = V * tau
+    Eigen::Vector3f t_exp = V * tau;
+    
+    // Return SE3(SO3.Exp(phi), V * tau)
+    SE3 result;
+    result.q = so3_q;
+    result.t = t_exp;
+    return result;
+}
+
+// -----------------------------
 // Skew-symmetric
 // -----------------------------
 Eigen::Matrix3f SE3::skew(const Eigen::Vector3f& v) {
