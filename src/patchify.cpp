@@ -8,6 +8,7 @@
 #include "correlation_kernel.hpp"
 #include "dla_config.hpp"
 #include "patchify_file_io.hpp"  // Patchify file I/O utilities
+#include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include "logger.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -240,34 +241,41 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     printf("[Patchifier] patchify_cpu_safe (patches) completed\n");
     fflush(stdout);
     
-    // Save patchify outputs for comparison with Python (frame 0 and frame 1)
+    // Save patchify outputs (coords, gmap, imap, patches) for a specific frame
+    // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
     static int patchify_frame_counter = 0;
     patchify_frame_counter++;
+    int current_patchify_frame = patchify_frame_counter - 1;  // 0-indexed frame number
     
-    if (patchify_frame_counter == 1 || patchify_frame_counter == 2) {
-        int frame_idx = patchify_frame_counter - 1;  // frame_idx: 0 for first call, 1 for second call
-        
+    if (TARGET_FRAME >= 0 && current_patchify_frame == TARGET_FRAME) {
         // Get logger for file I/O operations
         auto logger_patch = spdlog::get("fnet");
         if (!logger_patch) {
             logger_patch = spdlog::get("inet");
         }
         
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        
         // Save coordinates
-        std::string coords_filename = "cpp_coords_frame" + std::to_string(frame_idx) + ".bin";
+        std::string coords_filename = "cpp_coords_frame" + frame_suffix + ".bin";
         patchify_file_io::save_coordinates(coords_filename, coords, M, logger_patch);
         
         // Save gmap: [M, 128, P, P] = [4, 128, 3, 3]
-        std::string gmap_filename = "cpp_gmap_frame" + std::to_string(frame_idx) + ".bin";
+        std::string gmap_filename = "cpp_gmap_frame" + frame_suffix + ".bin";
         patchify_file_io::save_patch_data(gmap_filename, gmap, M, 128, m_patch_size, logger_patch, "gmap");
         
         // Save imap: [M, 384, 1, 1] = [4, 384, 1, 1]
-        std::string imap_filename = "cpp_imap_frame" + std::to_string(frame_idx) + ".bin";
+        std::string imap_filename = "cpp_imap_frame" + frame_suffix + ".bin";
         patchify_file_io::save_patch_data_hw(imap_filename, imap, M, inet_output_channels, 1, 1, logger_patch, "imap");
         
         // Save patches: [M, 3, P, P] = [4, 3, 3, 3]
-        std::string patches_filename = "cpp_patches_frame" + std::to_string(frame_idx) + ".bin";
+        std::string patches_filename = "cpp_patches_frame" + frame_suffix + ".bin";
         patchify_file_io::save_patch_data(patches_filename, patches, M, 3, m_patch_size, logger_patch, "patches");
+        
+        if (logger_patch) {
+            logger_patch->info("[Patchifier] Saved patchify outputs for frame {}: {}, {}, {}, {}", 
+                              current_patchify_frame, coords_filename, gmap_filename, imap_filename, patches_filename);
+        }
     }
 
     printf("[Patchifier] About to extract colors\n");
@@ -395,10 +403,12 @@ void Patchifier::forward(
             if (logger_patch) logger_patch->info("[Patchifier] inet_onnx->runInference (tensor) successful");
         }
         
-        // Save frame 0 and frame 1 outputs to binary files for comparison with Python
+        // Save ONNX model outputs for a specific frame to binary files for comparison with Python
+        // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
         static int frame_counter = 0;
         if (fnet_success && inet_success) {
             frame_counter++;
+            int current_frame = frame_counter - 1;  // frame_counter is 1-indexed, current_frame is 0-indexed
             
             // Get output dimensions for logging
             int fnet_C = 128;  // FNet output channels
@@ -408,25 +418,24 @@ void Patchifier::forward(
             int inet_H = fmap_H;
             int inet_W = fmap_W;
             
-            // Save frame 0
-            if (frame_counter == 1) {
+            // Save the target frame
+            if (TARGET_FRAME >= 0 && current_frame == TARGET_FRAME) {
+                std::string frame_suffix = std::to_string(TARGET_FRAME);
+                
                 // Save fnet output
-                patchify_file_io::save_model_output("fnet_frame0.bin", m_fmap_buffer.data(), 
+                std::string fnet_filename = "fnet_frame" + frame_suffix + ".bin";
+                patchify_file_io::save_model_output(fnet_filename, m_fmap_buffer.data(), 
                                                      fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
                 
                 // Save inet output
-                patchify_file_io::save_model_output("inet_frame0.bin", m_imap_buffer.data(), 
+                std::string inet_filename = "inet_frame" + frame_suffix + ".bin";
+                patchify_file_io::save_model_output(inet_filename, m_imap_buffer.data(), 
                                                      inet_C, inet_H, inet_W, logger_patch, "inet");
-            }
-            // Save frame 1
-            else if (frame_counter == 2) {
-                // Save fnet output
-                patchify_file_io::save_model_output("fnet_frame1.bin", m_fmap_buffer.data(), 
-                                                     fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
                 
-                // Save inet output
-                patchify_file_io::save_model_output("inet_frame1.bin", m_imap_buffer.data(), 
-                                                     inet_C, inet_H, inet_W, logger_patch, "inet");
+                if (logger_patch) {
+                    logger_patch->info("[Patchifier] Saved ONNX outputs for frame {}: {} and {}", 
+                                      current_frame, fnet_filename, inet_filename);
+                }
             }
         }
     } else {

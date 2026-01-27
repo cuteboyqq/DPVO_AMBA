@@ -4,6 +4,7 @@
 #include "eigen_common.h"
 #include "eigen/Eigen/Dense"
 #include "eigen/Eigen/Cholesky"
+#include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cmath>
@@ -33,8 +34,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     // Save intermediate BA values for step-by-step comparison at a specific frame
-    // Match the target frame used in update() - change TARGET_FRAME here to match dpvo.cpp
-    static const int TARGET_FRAME = 77;  // Must match TARGET_FRAME in dpvo.cpp
+    // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
     // bundleAdjustment() is a member function, so we can access m_counter directly
     bool save_intermediates = (m_counter == TARGET_FRAME);
 

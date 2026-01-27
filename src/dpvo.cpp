@@ -14,6 +14,7 @@
 #include "projective_ops.hpp"
 #include "correlation_kernel.hpp"
 #include "ba_file_io.hpp"  // BA file I/O utilities
+#include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <cmath>
@@ -926,8 +927,7 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
 
 void DPVO::update()
 {
-    // Define TARGET_FRAME at function scope so it's accessible throughout
-    static const int TARGET_FRAME = 77;  // Change this to compare a different frame
+    // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
     
     const int num_active = m_pg.m_num_edges;
     if (num_active == 0)
@@ -1258,6 +1258,27 @@ void DPVO::update()
             logger->info("DPVO::update: Input data ready - net_input size={}, inp_input size={}, corr_input size={}",
                          m_reshape_net_input.size(), m_reshape_inp_input.size(), m_reshape_corr_input.size());
         }
+        // Save metadata for update model inputs/outputs when TARGET_FRAME matches
+        if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
+            const int CORR_DIM = 882;
+            const int DIM = 384;
+            std::string frame_suffix = std::to_string(TARGET_FRAME);
+            std::string metadata_filename = "update_metadata_frame" + frame_suffix + ".txt";
+            
+            std::ofstream meta_file(metadata_filename);
+            if (meta_file.is_open()) {
+                meta_file << "frame=" << m_counter << "\n";
+                meta_file << "num_active=" << num_active << "\n";
+                meta_file << "MAX_EDGE=" << m_maxEdge << "\n";
+                meta_file << "DIM=" << DIM << "\n";
+                meta_file << "CORR_DIM=" << CORR_DIM << "\n";
+                meta_file.close();
+                if (logger) {
+                    logger->info("[DPVO::update] Saved update model metadata to {}", metadata_filename);
+                }
+            }
+        }
+        
         bool inference_success = false;
 #ifdef USE_ONNX_RUNTIME
         if (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) {
