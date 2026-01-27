@@ -14,6 +14,7 @@
 #include "projective_ops.hpp"
 #include "correlation_kernel.hpp"
 #include "ba_file_io.hpp"  // BA file I/O utilities
+#include "correlation_file_io.hpp"  // Correlation file I/O utilities
 #include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -1021,6 +1022,42 @@ void DPVO::update()
     
     printf("[DPVO::update] computeCorrelation returned\n");
     fflush(stdout);
+    
+    // Save correlation inputs and outputs for comparison with Python when TARGET_FRAME matches
+    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
+        // Get correlation parameters - must match correlation_kernel.cpp
+        // Note: correlation_kernel.cpp computeCorrelation uses R=2, D=2*R+1=5 (matches Python)
+        // This matches the values in correlation_kernel.cpp line 697-698 (updated to R=2, D=5)
+        const int R = 2;  // Correlation radius (matches Python)
+        const int D = 2 * R + 1;  // Correlation window diameter (D = 5 for R=2)
+        
+        correlation_file_io::save_correlation_data(
+            m_counter,
+            coords.data(),      // [num_active, 2, P, P]
+            m_pg.m_kk,          // kk - linear patch indices
+            m_pg.m_jj,          // jj - target frame indices
+            m_pg.m_ii,          // ii - patch indices (for reference)
+            m_gmap,             // gmap - patch features ring buffer
+            m_fmap1,            // fmap1 - pyramid level 0
+            m_fmap2,            // fmap2 - pyramid level 1
+            corr.data(),        // corr - correlation output
+            num_active,
+            M,
+            P,
+            D,
+            m_mem,              // num_frames
+            m_pmem,             // num_gmap_frames
+            m_fmap1_H, m_fmap1_W,
+            m_fmap2_H, m_fmap2_W,
+            128,                // feature_dim
+            logger
+        );
+        
+        if (logger) {
+            logger->info("[DPVO::update] Saved correlation inputs/outputs for frame {} (TARGET_FRAME={})", 
+                        m_counter, TARGET_FRAME);
+        }
+    }
     
     if (logger) logger->info("DPVO::update: Correlation completed");
 
