@@ -393,11 +393,10 @@ def print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches,
 def run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches):
     """Run detailed comparisons between C++ and Python outputs"""
     print(f"\n🔍 Comparing C++ vs Python outputs...")
-    
+    print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches)
     print(f"\n{'='*80}")
     print(f"GMAP COMPARISON (patches from fmap)")
     print(f"{'='*80}")
-    print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches)
     compare_arrays(cpp_gmap, py_gmap, "gmap", tolerance=1e-4, show_samples=True)
     
     print(f"\n{'='*80}")

@@ -15,28 +15,20 @@ import cv2
 import sys
 import os
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Dict, Optional
+from dataclasses import dataclass
 
 def resize_nearest_neighbor_cpp_style(img: np.ndarray, target_H: int, target_W: int) -> np.ndarray:
     """
     Resize image using nearest neighbor interpolation, matching C++ implementation exactly.
     
-    Args:
-        img: Input image array in HWC format (Height, Width, Channels) or HW format.
-        target_H: Target height for the resized image.
-        target_W: Target width for the resized image.
-    
-    Returns:
-        Resized image array with shape (target_H, target_W, C) or (target_H, target_W).
-    
-    Note:
-        C++ code does:
-            scale_x = W / target_W
-            scale_y = H / target_H
-            src_x = int(x * scale_x)
-            src_y = int(y * scale_y)
-            src_x = clamp(src_x, 0, W-1)
-            src_y = clamp(src_y, 0, H-1)
+    C++ code does:
+        scale_x = W / target_W
+        scale_y = H / target_H
+        src_x = int(x * scale_x)
+        src_y = int(y * scale_y)
+        src_x = clamp(src_x, 0, W-1)
+        src_y = clamp(src_y, 0, H-1)
     """
     H, W = img.shape[:2]
     scale_x = float(W) / float(target_W)
@@ -64,25 +56,20 @@ def resize_nearest_neighbor_cpp_style(img: np.ndarray, target_H: int, target_W: 
     
     return resized
 
-def load_image(image_path: str, use_bgr: bool = False, match_python_dpvo: bool = True) -> Tuple[np.ndarray, int, int]:
+def load_image(image_path: str, use_bgr: bool = True, match_python_dpvo: bool = True, 
+               apply_undistort: bool = True, is_video: bool = False) -> Tuple[np.ndarray, int, int]:
     """Load and preprocess image for ONNX inference.
     
     Args:
-        image_path: Path to the input image file (supports formats readable by OpenCV).
-        use_bgr: If True, keep BGR color format (don't convert to RGB). 
-                 If False, convert BGR to RGB (default). OpenCV loads images as BGR.
-        match_python_dpvo: If True, use Python DPVO preprocessing (OpenCV resize with INTER_LINEAR).
-                          If False, use C++ preprocessing (nearest neighbor interpolation).
-    
-    Returns:
-        Tuple containing:
-            - Preprocessed image array in NCHW format [1, C, H, W] with values normalized to [-0.5, 1.5]
-            - Original image height (int)
-            - Original image width (int)
-    
-    Note:
-        Normalization formula: 2 * (image / 255.0) - 0.5
-        Model input size is typically 528x960 (HxW).
+        image_path: Path to image file
+        use_bgr: If True, keep BGR format (don't convert to RGB). 
+                 If False, convert BGR to RGB (default).
+        match_python_dpvo: If True, use Python DPVO preprocessing.
+                          If False, use C++ preprocessing (nearest neighbor).
+        apply_undistort: If True, apply undistortion using camera intrinsics and distortion parameters.
+                        Matches Python DPVO behavior: if len(calib) > 4, apply cv2.undistort
+        is_video: If True, use video stream preprocessing (resize by 0.5x with INTER_AREA).
+                  If False, use image stream preprocessing (resize to model size with INTER_LINEAR).
     """
     # Load image (OpenCV loads as BGR)
     img = cv2.imread(image_path)
@@ -92,48 +79,96 @@ def load_image(image_path: str, use_bgr: bool = False, match_python_dpvo: bool =
     # Get dimensions
     H, W, C = img.shape
     
-    # Resize to model input size (typically 528x960)
+    # STEP 1: Apply undistortion if requested (matching Python DPVO: if len(calib) > 4)
+    if apply_undistort:
+        # Camera intrinsics (at full resolution)
+        fx = 1660.0
+        fy = 1660.0
+        cx = 960.0
+        cy = 540.0
+        
+        # Distortion parameters
+        k1 = 0.07
+        k2 = -0.08
+        p1 = 0.0
+        p2 = 0.0
+        
+        # Build camera matrix K
+        K = np.array([[fx, 0, cx],
+                      [0, fy, cy],
+                      [0, 0, 1]], dtype=np.float64)
+        
+        # Build distortion coefficients [k1, k2, p1, p2]
+        dist_coeffs = np.array([k1, k2, p1, p2], dtype=np.float64)
+        
+        # Apply undistortion (matching Python DPVO: cv2.undistort(image, K, calib[4:]))
+        img = cv2.undistort(img, K, dist_coeffs)
+        
+        # Update dimensions after undistortion (may change slightly)
+        H, W = img.shape[:2]
+    
+    # STEP 2: Resize (matching Python DPVO behavior)
+    # Python DPVO video_stream preprocessing flow:
+    #   1. video_stream(): resize(0.5x with INTER_AREA) -> crop to divisible by 16
+    #      Example: 1920x1080 -> 960x540 -> crop to 960x528 (if needed)
+    #      Intrinsics are scaled: fx*0.5, fy*0.5, cx*0.5, cy*0.5
+    #   2. Then the ONNX model (fnet/inet) or preprocessing code resizes to model input size (528x960)
+    #      This happens in dpvo.py or the model's preprocessing before ONNX inference
+    #   3. Final ONNX model input: 528x960 (torch.Size([3, 528, 960]))
+    #
+    # Why does video_stream do 0.5x resize?
+    #   - To reduce memory/computation for video processing
+    #   - Intrinsics are scaled accordingly (fx*0.5, fy*0.5, cx*0.5, cy*0.5)
+    #   - The model then resizes to its fixed input size (528x960) internally
+    #
+    # For comparison, we need to match the FINAL ONNX model input (528x960), not the intermediate video_stream output
+    # So we do: resize directly to 528x960 using INTER_AREA (matching video_stream's interpolation method)
     model_H = 528
     model_W = 960
     
     if match_python_dpvo:
-        # Python DPVO uses OpenCV resize with INTER_LINEAR (default) or INTER_AREA
-        # For image streams: cv2.resize(image, None, fx=0.5, fy=0.5) uses INTER_LINEAR
-        # For video streams: cv2.resize(image, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        # We'll use INTER_LINEAR to match image stream behavior
-        img_resized = cv2.resize(img, (model_W, model_H), interpolation=cv2.INTER_LINEAR)
+        if is_video:
+            # Python DPVO video_stream: resize to model input size using INTER_AREA
+            # Note: video_stream() does resize(0.5x), but the final ONNX model input is 528x960
+            # The model or preprocessing code resizes the video_stream output to model size
+            # We resize directly to model size using INTER_AREA to match video_stream's interpolation method
+            img_resized = cv2.resize(img, (model_W, model_H), interpolation=cv2.INTER_AREA)
+        else:
+            # Python DPVO image_stream: no resize (commented out with if 0:)
+            # But for model input, we need to resize to model size
+            # Use INTER_LINEAR as default (matches image stream behavior when resize is enabled)
+            img_resized = cv2.resize(img, (model_W, model_H), interpolation=cv2.INTER_LINEAR)
     else:
         # C++ uses nearest neighbor interpolation with exact integer mapping
         img_resized = resize_nearest_neighbor_cpp_style(img, model_H, model_W)
     
-    # Convert BGR to RGB if needed
-    # Python DPVO expects RGB format (images are converted from BGR to RGB)
+    # STEP 3: Crop to make dimensions divisible by 16 (matching Python DPVO: image[:h-h%16, :w-w%16])
+    # h_cropped = img_resized.shape[0] - (img_resized.shape[0] % 16)
+    # w_cropped = img_resized.shape[1] - (img_resized.shape[1] % 16)
+    # if h_cropped != img_resized.shape[0] or w_cropped != img_resized.shape[1]:
+    #     img_resized = img_resized[:h_cropped, :w_cropped]
+    
+    # STEP 4: Convert BGR to RGB if needed
+    # NOTE: Python DPVO actually uses BGR format (cv2.imread loads as BGR, no conversion)
+    # The ONNX models were trained with BGR input, so C++ also uses BGR
+    # This RGB conversion is only for comparison/testing purposes
     if not use_bgr:
         img_resized = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
     
-    # Normalize: Python DPVO uses: image = 2 * (image / 255.0) - 0.5
+    # STEP 5: Normalize: Python DPVO uses: image = 2 * (image / 255.0) - 0.5
     # This is equivalent to: (2 * image - 127.5) / 255.0
     img_normalized = 2.0 * (img_resized.astype(np.float32) / 255.0) - 0.5
     
-    # Convert from HWC to CHW format
+    # STEP 6: Convert from HWC to CHW format
     img_chw = np.transpose(img_normalized, (2, 0, 1))  # [C, H, W]
     
-    # Add batch dimension: [1, C, H, W]
+    # STEP 7: Add batch dimension: [1, C, H, W]
     img_nchw = np.expand_dims(img_chw, axis=0)
     
     return img_nchw, H, W
 
 def run_fnet_inference(session: ort.InferenceSession, input_data: np.ndarray) -> np.ndarray:
-    """Run FNet inference.
-    
-    Args:
-        session: ONNX Runtime inference session for the FNet model.
-        input_data: Preprocessed input image in NCHW format [1, 3, H, W].
-    
-    Returns:
-        FNet output feature map in NCHW format [1, 128, H_out, W_out].
-        Output is at 1/4 resolution of input (H_out = H/4, W_out = W/4).
-    """
+    """Run FNet inference."""
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
     
@@ -144,16 +179,7 @@ def run_fnet_inference(session: ort.InferenceSession, input_data: np.ndarray) ->
     return fnet_out
 
 def run_inet_inference(session: ort.InferenceSession, input_data: np.ndarray) -> np.ndarray:
-    """Run INet inference.
-    
-    Args:
-        session: ONNX Runtime inference session for the INet model.
-        input_data: Preprocessed input image in NCHW format [1, 3, H, W].
-    
-    Returns:
-        INet output feature map in NCHW format [1, 384, H_out, W_out].
-        Output is at 1/4 resolution of input (H_out = H/4, W_out = W/4).
-    """
+    """Run INet inference."""
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
     
@@ -163,35 +189,67 @@ def run_inet_inference(session: ort.InferenceSession, input_data: np.ndarray) ->
     
     return inet_out
 
-def compare_outputs(cpp_data: np.ndarray, py_data: np.ndarray, name: str, tolerance: float = 1e-5) -> bool:
-    """Compare C++ and Python outputs.
+@dataclass
+class PreprocessingSettings:
+    """Preprocessing settings used for input."""
+    use_bgr: bool
+    match_python_dpvo: bool
+    apply_undistort: bool
+    is_video: bool
     
-    Args:
-        cpp_data: C++ output array in CHW format [C, H, W].
-        py_data: Python output array in NCHW format [1, C, H, W] or CHW format [C, H, W].
-                 Batch dimension will be removed if present.
-        name: Name/description of the comparison (for logging purposes).
-        tolerance: Maximum allowed difference between values to be considered matching (default: 1e-5).
-    
-    Returns:
-        True if outputs match within tolerance, False otherwise.
-    
-    Note:
-        Prints detailed comparison statistics including max difference, mean difference,
-        and percentage of elements that differ beyond tolerance.
-    """
+    def __str__(self) -> str:
+        """Format settings as a readable string."""
+        color = "BGR" if self.use_bgr else "RGB"
+        match = "Python DPVO" if self.match_python_dpvo else "C++ style"
+        undistort = "Yes" if self.apply_undistort else "No"
+        mode = "Video" if self.is_video else "Image"
+        return f"Color: {color}, Match: {match}, Undistort: {undistort}, Mode: {mode}"
+
+@dataclass
+class ComparisonResult:
+    """Structured comparison result."""
+    name: str
+    matches: bool
+    max_diff: float
+    mean_diff: float
+    num_different: int
+    total_elements: int
+    percent_different: float
+    shape_match: bool
+    cpp_shape: tuple
+    py_shape: tuple
+    tolerance: float
+    sample_diffs: List[Tuple[tuple, float, float, float]]  # [(idx, cpp_val, py_val, diff), ...]
+    preprocessing: Optional[PreprocessingSettings] = None  # Preprocessing settings used
+
+def compare_outputs(cpp_data: np.ndarray, py_data: np.ndarray, name: str, tolerance: float = 1e-5,
+                    preprocessing: Optional[PreprocessingSettings] = None) -> ComparisonResult:
+    """Compare C++ and Python outputs and return structured result."""
     # Reshape Python output to match C++ format (remove batch dimension)
     if py_data.ndim == 4:
         py_data_chw = py_data[0]  # Remove batch: [C, H, W]
     else:
         py_data_chw = py_data
     
-    # Ensure shapes match
-    if cpp_data.shape != py_data_chw.shape:
-        print(f"  ❌ ERROR: Shape mismatch for {name}:")
-        print(f"    ⚙️  C++ shape: {cpp_data.shape}")
-        print(f"    🐍 Python shape: {py_data_chw.shape}")
-        return False
+    # Check shape match
+    shape_match = (cpp_data.shape == py_data_chw.shape)
+    
+    if not shape_match:
+        return ComparisonResult(
+            name=name,
+            matches=False,
+            max_diff=float('inf'),
+            mean_diff=float('inf'),
+            num_different=0,
+            total_elements=0,
+            percent_different=100.0,
+            shape_match=False,
+            cpp_shape=cpp_data.shape,
+            py_shape=py_data_chw.shape,
+            tolerance=tolerance,
+            sample_diffs=[],
+            preprocessing=preprocessing
+        )
     
     # Compare values
     diff = np.abs(cpp_data - py_data_chw)
@@ -203,75 +261,155 @@ def compare_outputs(cpp_data: np.ndarray, py_data: np.ndarray, name: str, tolera
     total_elements = cpp_data.size
     percent_different = (num_different / total_elements) * 100.0
     
-    print(f"  🔍 {name} comparison:")
-    print(f"    📊 Max difference: {max_diff:.6e}")
-    print(f"    📊 Mean difference: {mean_diff:.6e}")
-    print(f"    📊 Elements different (>{tolerance}): {num_different}/{total_elements} ({percent_different:.2f}%)")
-    
-    if max_diff < tolerance:
-        print(f"    ✅ PASS: All values match within tolerance ({tolerance})")
-        indices = np.where(diff <= tolerance)
-        print(f"    📋 Sample differences (first 5):")
+    # Get sample differences
+    sample_diffs = []
+    if num_different > 0:
+        indices = np.where(diff > tolerance)
         for i in range(min(5, len(indices[0]))):
             sample_idx = tuple(ind[i] for ind in indices)
-            print(f"      [{sample_idx}]: C++={cpp_data[sample_idx]:.10f}, Python={py_data_chw[sample_idx]:.10f}, diff={diff[sample_idx]:.10e}")
-        return True
+            sample_diffs.append((
+                sample_idx,
+                float(cpp_data[sample_idx]),
+                float(py_data_chw[sample_idx]),
+                float(diff[sample_idx])
+            ))
     else:
-        print(f"    ❌ FAIL: Values differ beyond tolerance ({tolerance})")
-        
-        # Show some example differences
-        if num_different > 0:
-            indices = np.where(diff > tolerance)
-            print(f"    📋 Sample differences (first 5):")
-            for i in range(min(5, len(indices[0]))):
-                sample_idx = tuple(ind[i] for ind in indices)
-                print(f"      [{sample_idx}]: C++={cpp_data[sample_idx]:.6f}, Python={py_data_chw[sample_idx]:.6f}, diff={diff[sample_idx]:.6e}")
-        
-        return False
+        # If all match, show some sample matching values
+        indices = np.where(diff <= tolerance)
+        for i in range(min(5, len(indices[0]))):
+            sample_idx = tuple(ind[i] for ind in indices)
+            sample_diffs.append((
+                sample_idx,
+                float(cpp_data[sample_idx]),
+                float(py_data_chw[sample_idx]),
+                float(diff[sample_idx])
+            ))
+    
+    matches = (max_diff < tolerance) and shape_match
+    
+    return ComparisonResult(
+        name=name,
+        matches=matches,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
+        num_different=num_different,
+        total_elements=total_elements,
+        percent_different=percent_different,
+        shape_match=shape_match,
+        cpp_shape=cpp_data.shape,
+        py_shape=py_data_chw.shape,
+        tolerance=tolerance,
+        sample_diffs=sample_diffs,
+        preprocessing=preprocessing
+    )
 
-def parse_arguments() -> Tuple[str, str, str, str, str]:
-    """Parse command line arguments and return paths.
+def format_number(val: float, max_precision: int = 6) -> str:
+    """Format number for table display."""
+    if val == float('inf'):
+        return "∞"
+    elif val == float('-inf'):
+        return "-∞"
+    elif np.isnan(val):
+        return "NaN"
+    elif val >= 1e6:
+        return f"{val:.2e}"
+    elif val >= 1.0:
+        return f"{val:.{max_precision}f}"
+    elif val >= 0.01:
+        return f"{val:.{max_precision}f}"
+    elif val >= 0.0001:
+        return f"{val:.{max_precision+2}f}"
+    elif val >= 0.000001:
+        return f"{val:.{max_precision+4}f}"
+    else:
+        return f"{val:.{max_precision}e}"
+
+def print_comparison_table(results: List[ComparisonResult]) -> None:
+    """Print comparison results in a formatted table."""
+    print("\n" + "=" * 120)
+    print("📊 Comparison Results Table")
+    print("=" * 120)
     
-    Returns:
-        Tuple containing:
-            - image_path: Path to input image file
-            - fnet_model_path: Path to FNet ONNX model file
-            - inet_model_path: Path to INet ONNX model file
-            - fnet_cpp_bin: Path to C++ FNet output binary file (default: "fnet_frame0.bin")
-            - inet_cpp_bin: Path to C++ INet output binary file (default: "inet_frame0.bin")
+    # Table header
+    header = f"{'Model':<30} {'Status':<12} {'Max Diff':<15} {'Mean Diff':<15} {'Different':<15} {'Shape Match':<12}"
+    print(header)
+    print("-" * 120)
     
-    Note:
-        Exits with error code 1 if required arguments are missing.
-        Optional arguments (fnet_cpp_bin, inet_cpp_bin) default to frame0 files.
-    """
+    # Table rows
+    for result in results:
+        status = "✅ MATCH" if result.matches else "❌ DIFFER"
+        max_diff_str = format_number(result.max_diff)
+        mean_diff_str = format_number(result.mean_diff)
+        
+        if result.total_elements > 0:
+            diff_str = f"{result.num_different}/{result.total_elements} ({result.percent_different:.2f}%)"
+        else:
+            diff_str = "N/A"
+        
+        shape_status = "✅" if result.shape_match else "❌"
+        
+        row = f"{result.name:<25} {status:<12} {max_diff_str:<15} {mean_diff_str:<15} {diff_str:<15} {shape_status:<12}"
+        print(row)
+    
+    print("=" * 120)
+    
+    # Detailed information for mismatches
+    mismatches = [r for r in results if not r.matches]
+    if mismatches:
+        print("\n" + "=" * 120)
+        print("🔍 Detailed Information for Mismatches")
+        print("=" * 120)
+        
+        for result in mismatches:
+            print(f"\n📋 {result.name}:")
+            if not result.shape_match:
+                print(f"  ❌ Shape Mismatch:")
+                print(f"     C++ shape: {result.cpp_shape}")
+                print(f"     Python shape: {result.py_shape}")
+            else:
+                print(f"  📊 Statistics:")
+                print(f"     Max difference: {format_number(result.max_diff)}")
+                print(f"     Mean difference: {format_number(result.mean_diff)}")
+                print(f"     Different elements: {result.num_different}/{result.total_elements} ({result.percent_different:.2f}%)")
+                print(f"     Tolerance: {result.tolerance}")
+                
+                if result.sample_diffs:
+                    print(f"  📋 Sample Differences (first {len(result.sample_diffs)}):")
+                    print(f"     {'Index':<20} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20}")
+                    print(f"     {'-'*20} {'-'*20} {'-'*20} {'-'*20}")
+                    for idx, cpp_val, py_val, diff_val in result.sample_diffs:
+                        idx_str = str(idx)[:18]
+                        print(f"     {idx_str:<20} {format_number(cpp_val):<20} {format_number(py_val):<20} {format_number(diff_val):<20}")
+    
+    print("\n" + "=" * 120)
+
+def parse_arguments() -> Tuple[str, str, str, str, str, bool]:
+    """Parse command line arguments and return paths."""
     if len(sys.argv) < 4:
-        print("❌ Usage: python compare_onnx_outputs.py <image_path> <fnet_model_path> <inet_model_path> [fnet_cpp_bin] [inet_cpp_bin]")
+        print("❌ Usage: python compare_onnx_outputs.py <image_path> <fnet_model_path> <inet_model_path> [fnet_cpp_bin] [inet_cpp_bin] [--video]")
         print("📝 Example: python compare_onnx_outputs.py frame0.jpg fnet.onnx inet.onnx")
         print("📝 Example: python compare_onnx_outputs.py frame1.jpg fnet.onnx inet.onnx fnet_frame1.bin inet_frame1.bin")
+        print("📝 Example: python compare_onnx_outputs.py frame0.jpg fnet.onnx inet.onnx --video")
+        print("  --video: Use video stream preprocessing (resize by 0.5x with INTER_AREA)")
         sys.exit(1)
     
     image_path = sys.argv[1]
     fnet_model_path = sys.argv[2]
     inet_model_path = sys.argv[3]
     
-    # Optional: C++ output file names (default to frame0)
-    fnet_cpp_bin = sys.argv[4] if len(sys.argv) > 4 else "fnet_frame0.bin"
-    inet_cpp_bin = sys.argv[5] if len(sys.argv) > 5 else "inet_frame0.bin"
+    # Check for --video flag
+    is_video = "--video" in sys.argv
     
-    return image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin
+    # Optional: C++ output file names (default to frame0)
+    # Skip --video flag when parsing file names
+    args_without_flags = [arg for arg in sys.argv[4:] if arg != "--video"]
+    fnet_cpp_bin = args_without_flags[0] if len(args_without_flags) > 0 else "fnet_frame0.bin"
+    inet_cpp_bin = args_without_flags[1] if len(args_without_flags) > 1 else "inet_frame0.bin"
+    
+    return image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin, is_video
 
 def validate_inputs(image_path: str, fnet_model_path: str, inet_model_path: str) -> None:
-    """Validate that all input files exist.
-    
-    Args:
-        image_path: Path to input image file to validate.
-        fnet_model_path: Path to FNet ONNX model file to validate.
-        inet_model_path: Path to INet ONNX model file to validate.
-    
-    Note:
-        Exits with error code 1 if any file is missing.
-        Prints error messages indicating which files are not found.
-    """
+    """Validate that all input files exist."""
     if not os.path.exists(image_path):
         print(f"❌ ERROR: Image file not found: {image_path}")
         sys.exit(1)
@@ -283,18 +421,7 @@ def validate_inputs(image_path: str, fnet_model_path: str, inet_model_path: str)
         sys.exit(1)
 
 def print_header(image_path: str, fnet_model_path: str, inet_model_path: str, fnet_cpp_bin: str, inet_cpp_bin: str) -> None:
-    """Print comparison header with file paths.
-    
-    Args:
-        image_path: Path to input image file (for display).
-        fnet_model_path: Path to FNet ONNX model file (for display).
-        inet_model_path: Path to INet ONNX model file (for display).
-        fnet_cpp_bin: Path to C++ FNet output binary file (for display).
-        inet_cpp_bin: Path to C++ INet output binary file (for display).
-    
-    Note:
-        Prints a formatted header showing all file paths being used in the comparison.
-    """
+    """Print comparison header with file paths."""
     print("=" * 80)
     print("🔍 ONNX Inference Output Comparison")
     print("=" * 80)
@@ -305,31 +432,36 @@ def print_header(image_path: str, fnet_model_path: str, inet_model_path: str, fn
     print(f"📂 C++ INet output: {inet_cpp_bin}")
     print()
 
-def load_and_preprocess_images(image_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_and_preprocess_images(image_path: str, is_video: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load and preprocess images with different methods.
     
     Args:
-        image_path: Path to input image file to load and preprocess.
-    
-    Returns:
-        Tuple containing three preprocessed image arrays (all in NCHW format [1, C, H, W]):
-            - input_data_python_dpvo: Preprocessed using Python DPVO method (INTER_LINEAR resize, RGB)
-            - input_data_cpp_bgr: Preprocessed using C++ method (nearest neighbor resize, BGR)
-            - input_data_cpp_rgb: Preprocessed using C++ method (nearest neighbor resize, RGB)
-    
-    Note:
-        All three preprocessing methods are tested to identify which matches C++ ONNX inference.
-        Prints preprocessing information and input shapes for each method.
+        image_path: Path to image file
+        is_video: If True, use video stream preprocessing (resize by 0.5x with INTER_AREA).
+                  If False, use image stream preprocessing (resize to model size with INTER_LINEAR).
     """
     print("🖼️  Loading and preprocessing image...")
-    print("  📝 NOTE: Using Python DPVO preprocessing (OpenCV resize with INTER_LINEAR, RGB format)")
-    print("  ✅ This matches the Python DPVO repository preprocessing flow")
-    input_data_python_dpvo, orig_H, orig_W = load_image(image_path, use_bgr=False, match_python_dpvo=True)
+    if is_video:
+        print("  📝 NOTE: Using Python DPVO VIDEO stream preprocessing:")
+        print("    - Undistort (if distortion params exist)")
+        print("    - Resize to model input size (528x960) using INTER_AREA")
+        print("    - Crop to divisible by 16")
+        print("    - BGR format")
+        print("  ✅ This matches Python DPVO video_stream() -> model input (final size: 528x960)")
+    else:
+        print("  📝 NOTE: Using Python DPVO IMAGE stream preprocessing:")
+        print("    - Undistort (if distortion params exist)")
+        print("    - Resize to model size using INTER_LINEAR")
+        print("    - Crop to divisible by 16")
+        print("    - BGR format")
+        print("  ✅ This matches Python DPVO image_stream() function")
+    print("  🔧 Applying undistortion with k1=0.07, k2=-0.08, p1=0, p2=0")
+    input_data_python_dpvo, orig_H, orig_W = load_image(image_path, use_bgr=False, match_python_dpvo=True, apply_undistort=False, is_video=is_video)
     
-    # Also try C++ preprocessing for comparison
-    print("  🔄 Also testing C++ preprocessing (nearest neighbor, BGR format) for comparison")
-    input_data_cpp_bgr, _, _ = load_image(image_path, use_bgr=True, match_python_dpvo=False)
-    input_data_cpp_rgb, _, _ = load_image(image_path, use_bgr=False, match_python_dpvo=False)
+    # Also try C++ preprocessing for comparison (with undistortion to match C++ code)
+    print("  🔄 Also testing C++ preprocessing (undistort + nearest neighbor + crop to divisible by 16, BGR format) for comparison")
+    input_data_cpp_bgr, _, _ = load_image(image_path, use_bgr=True, match_python_dpvo=False, apply_undistort=True, is_video=False)
+    input_data_cpp_rgb, _, _ = load_image(image_path, use_bgr=False, match_python_dpvo=False, apply_undistort=True, is_video=False)
     
     print(f"  📐 Original image size: {orig_W}x{orig_H}")
     print(f"  🐍 Python DPVO input shape: {input_data_python_dpvo.shape} (NCHW)")
@@ -340,21 +472,7 @@ def load_and_preprocess_images(image_path: str) -> Tuple[np.ndarray, np.ndarray,
     return input_data_python_dpvo, input_data_cpp_bgr, input_data_cpp_rgb
 
 def load_onnx_models(fnet_model_path: str, inet_model_path: str) -> Tuple[ort.InferenceSession, ort.InferenceSession]:
-    """Load ONNX models and print model information.
-    
-    Args:
-        fnet_model_path: Path to FNet ONNX model file (.onnx).
-        inet_model_path: Path to INet ONNX model file (.onnx).
-    
-    Returns:
-        Tuple containing:
-            - fnet_session: ONNX Runtime inference session for FNet model
-            - inet_session: ONNX Runtime inference session for INet model
-    
-    Note:
-        Uses CPUExecutionProvider for inference.
-        Prints model input/output shapes for verification.
-    """
+    """Load ONNX models and print model information."""
     print("📦 Loading ONNX models...")
     fnet_session = ort.InferenceSession(fnet_model_path, providers=['CPUExecutionProvider'])
     inet_session = ort.InferenceSession(inet_model_path, providers=['CPUExecutionProvider'])
@@ -376,28 +494,7 @@ def load_onnx_models(fnet_model_path: str, inet_model_path: str) -> Tuple[ort.In
 def run_all_inferences(fnet_session: ort.InferenceSession, inet_session: ort.InferenceSession,
                        input_data_python_dpvo: np.ndarray, input_data_cpp_bgr: np.ndarray,
                        input_data_cpp_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Run all inference variations and return all outputs.
-    
-    Args:
-        fnet_session: ONNX Runtime inference session for FNet model.
-        inet_session: ONNX Runtime inference session for INet model.
-        input_data_python_dpvo: Preprocessed image using Python DPVO method [1, C, H, W].
-        input_data_cpp_bgr: Preprocessed image using C++ method with BGR format [1, C, H, W].
-        input_data_cpp_rgb: Preprocessed image using C++ method with RGB format [1, C, H, W].
-    
-    Returns:
-        Tuple containing six output arrays (all in NCHW format):
-            - fnet_py_dpvo: FNet output with Python DPVO preprocessing [1, 128, H_out, W_out]
-            - fnet_py_cpp_bgr: FNet output with C++ preprocessing (BGR) [1, 128, H_out, W_out]
-            - fnet_py_cpp_rgb: FNet output with C++ preprocessing (RGB) [1, 128, H_out, W_out]
-            - inet_py_dpvo: INet output with Python DPVO preprocessing [1, 384, H_out, W_out]
-            - inet_py_cpp_bgr: INet output with C++ preprocessing (BGR) [1, 384, H_out, W_out]
-            - inet_py_cpp_rgb: INet output with C++ preprocessing (RGB) [1, 384, H_out, W_out]
-    
-    Note:
-        Runs inference for both FNet and INet models with all three preprocessing methods.
-        Prints output shapes for each inference run.
-    """
+    """Run all inference variations and return all outputs."""
     print("🚀 Running inference...")
     
     # FNet inference
@@ -432,28 +529,7 @@ def run_all_inferences(fnet_session: ort.InferenceSession, inet_session: ort.Inf
 
 def save_python_outputs(fnet_py_dpvo: np.ndarray, fnet_py_cpp_bgr: np.ndarray, fnet_py_cpp_rgb: np.ndarray,
                         inet_py_dpvo: np.ndarray, inet_py_cpp_bgr: np.ndarray, inet_py_cpp_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Save all Python outputs to binary files.
-    
-    Args:
-        fnet_py_dpvo: FNet output with Python DPVO preprocessing [1, C, H, W].
-        fnet_py_cpp_bgr: FNet output with C++ preprocessing (BGR) [1, C, H, W].
-        fnet_py_cpp_rgb: FNet output with C++ preprocessing (RGB) [1, C, H, W].
-        inet_py_dpvo: INet output with Python DPVO preprocessing [1, C, H, W].
-        inet_py_cpp_bgr: INet output with C++ preprocessing (BGR) [1, C, H, W].
-        inet_py_cpp_rgb: INet output with C++ preprocessing (RGB) [1, C, H, W].
-    
-    Returns:
-        Tuple containing:
-            - fnet_py_dpvo_chw: FNet output in CHW format [C, H, W] (batch dimension removed)
-            - inet_py_dpvo_chw: INet output in CHW format [C, H, W] (batch dimension removed)
-    
-    Note:
-        Saves all outputs to binary files (.bin) for later comparison:
-        - fnet_py_dpvo_frame0.bin, inet_py_dpvo_frame0.bin (Python DPVO preprocessing)
-        - fnet_py_cpp_bgr_frame0.bin, inet_py_cpp_bgr_frame0.bin (C++ preprocessing, BGR)
-        - fnet_py_cpp_rgb_frame0.bin, inet_py_cpp_rgb_frame0.bin (C++ preprocessing, RGB)
-        Prints file paths and sizes for each saved file.
-    """
+    """Save all Python outputs to binary files."""
     print("💾 Saving Python outputs to binary files...")
     
     # Save Python DPVO outputs (primary - matches Python DPVO repository)
@@ -485,25 +561,11 @@ def save_python_outputs(fnet_py_dpvo: np.ndarray, fnet_py_cpp_bgr: np.ndarray, f
     
     return fnet_py_dpvo_chw, inet_py_dpvo_chw
 
-def load_cpp_outputs(fnet_cpp_bin: str, inet_cpp_bin: str, fnet_py_dpvo_chw: np.ndarray, inet_py_dpvo_chw: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Load C++ outputs from binary files.
-    
-    Args:
-        fnet_cpp_bin: Path to C++ FNet output binary file (.bin).
-        inet_cpp_bin: Path to C++ INet output binary file (.bin).
-        fnet_py_dpvo_chw: Python FNet output in CHW format [C, H, W] (used to infer dimensions).
-        inet_py_dpvo_chw: Python INet output in CHW format [C, H, W] (used to infer dimensions).
-    
-    Returns:
-        Tuple containing:
-            - fnet_cpp: C++ FNet output array in CHW format [C, H, W]
-            - inet_cpp: C++ INet output array in CHW format [C, H, W]
-    
-    Note:
-        Exits with error code 1 if binary files are not found.
-        Uses Python output shapes to reshape C++ binary data (assumes same dimensions).
-        Prints loaded file information including shapes and sizes.
-    """
+def load_cpp_outputs(fnet_cpp_bin: str, 
+                     inet_cpp_bin: str, 
+                     fnet_py_dpvo_chw: np.ndarray, 
+                     inet_py_dpvo_chw: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Load C++ outputs from binary files."""
     print("📂 Loading C++ outputs...")
     if not os.path.exists(fnet_cpp_bin):
         print(f"  ❌ ERROR: {fnet_cpp_bin} not found. Run C++ code first to generate this file.")
@@ -528,99 +590,243 @@ def load_cpp_outputs(fnet_cpp_bin: str, inet_cpp_bin: str, fnet_py_dpvo_chw: np.
     
     return fnet_cpp, inet_cpp
 
+def print_sample_values_table(cpp_data: np.ndarray, py_data: np.ndarray, model_name: str, num_samples: int = 10) -> None:
+    """Print a table showing sample value comparisons."""
+    # Reshape Python output to match C++ format (remove batch dimension)
+    if py_data.ndim == 4:
+        py_data_chw = py_data[0]  # Remove batch: [C, H, W]
+    else:
+        py_data_chw = py_data
+    
+    if cpp_data.shape != py_data_chw.shape:
+        print(f"  ⚠️  Cannot show sample values: shape mismatch")
+        print(f"     C++ shape: {cpp_data.shape}, Python shape: {py_data_chw.shape}")
+        return
+    
+    # Compute differences
+    diff = np.abs(cpp_data - py_data_chw)
+    
+    # Get sample indices - mix of largest differences and random samples
+    flat_diff = diff.flatten()
+    flat_cpp = cpp_data.flatten()
+    flat_py = py_data_chw.flatten()
+    
+    # Get indices of largest differences
+    num_large_samples = min(5, num_samples // 2)
+    large_diff_indices = np.argsort(flat_diff)[-num_large_samples:][::-1]
+    
+    # Get random samples from different channels/spatial locations
+    num_random_samples = num_samples - num_large_samples
+    if num_random_samples > 0:
+        random_indices = np.random.choice(len(flat_diff), size=min(num_random_samples, len(flat_diff)), replace=False)
+    else:
+        random_indices = []
+    
+    # Combine and get unique indices
+    all_indices = np.unique(np.concatenate([large_diff_indices, random_indices]))
+    
+    # Convert flat indices back to multi-dimensional indices
+    sample_indices = []
+    for flat_idx in all_indices[:num_samples]:
+        multi_idx = np.unravel_index(flat_idx, cpp_data.shape)
+        sample_indices.append((multi_idx, flat_cpp[flat_idx], flat_py[flat_idx], flat_diff[flat_idx]))
+    
+    # Print table
+    print(f"\n  📋 Sample Value Comparisons for {model_name}:")
+    print(f"     {'Index (C,H,W)':<25} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20} {'Status':<10}")
+    print(f"     {'-'*25} {'-'*20} {'-'*20} {'-'*20} {'-'*10}")
+    
+    for (idx, cpp_val, py_val, diff_val) in sample_indices:
+        idx_str = str(idx)[:23]
+        status = "✅" if diff_val < 1e-5 else "⚠️"
+        print(f"     {idx_str:<25} {format_number(cpp_val):<20} {format_number(py_val):<20} {format_number(diff_val):<20} {status:<10}")
+    
+    print()
+
+def print_category_table(title: str, results: List[ComparisonResult], description: str = "", 
+                        cpp_data_dict: Optional[Dict[str, np.ndarray]] = None,
+                        py_data_dict: Optional[Dict[str, np.ndarray]] = None,
+                        show_samples: bool = True) -> None:
+    """Print a table for a specific category of comparisons."""
+    print("\n" + "=" * 120)
+    print(f"🔍 {title}")
+    print("=" * 120)
+    if description:
+        print(f"  📝 {description}")
+    
+    # Display preprocessing settings at the top if available
+    if results and results[0].preprocessing:
+        print(f"  ⚙️  Preprocessing Settings:")
+        # Get unique preprocessing settings (should be same for all results in category)
+        unique_settings = set()
+        for result in results:
+            if result.preprocessing:
+                unique_settings.add(str(result.preprocessing))
+        
+        for setting_str in unique_settings:
+            # Parse and display in a more readable format
+            print(f"     • {setting_str}")
+    
+    print()
+    
+    # Table header
+    header = f"{'Model':<25} {'Status':<12} {'Max Diff':<15} {'Mean Diff':<15} {'Different':<15} {'Shape Match':<12}"
+    print(header)
+    print("-" * 120)
+    
+    # Table rows
+    for result in results:
+        status = "✅ MATCH" if result.matches else "❌ DIFFER"
+        max_diff_str = format_number(result.max_diff)
+        mean_diff_str = format_number(result.mean_diff)
+        
+        if result.total_elements > 0:
+            diff_str = f"{result.num_different}/{result.total_elements} ({result.percent_different:.2f}%)"
+        else:
+            diff_str = "N/A"
+        
+        shape_status = "✅" if result.shape_match else "❌"
+        
+        row = f"{result.name:<25} {status:<12} {max_diff_str:<15} {mean_diff_str:<15} {diff_str:<15} {shape_status:<12}"
+        print(row)
+    
+    print("=" * 120)
+    
+    # Show sample value comparisons if requested
+    if show_samples and cpp_data_dict and py_data_dict:
+        for result in results:
+            model_key = result.name.lower().replace(" ", "_")
+            # Try to find matching data
+            for key in cpp_data_dict.keys():
+                if model_key in key.lower() or key.lower() in model_key:
+                    if key in py_data_dict:
+                        print_sample_values_table(cpp_data_dict[key], py_data_dict[key], result.name, num_samples=10)
+                        break
+
 def run_comparisons(fnet_cpp: np.ndarray, inet_cpp: np.ndarray, fnet_py_dpvo: np.ndarray,
                     fnet_py_cpp_bgr: np.ndarray, fnet_py_cpp_rgb: np.ndarray,
-                    inet_py_dpvo: np.ndarray, inet_py_cpp_bgr: np.ndarray, inet_py_cpp_rgb: np.ndarray) -> Tuple[bool, bool, bool, bool, bool, bool]:
-    """Run all comparisons and return match results.
-    
-    Args:
-        fnet_cpp: C++ FNet output array in CHW format [C, H, W].
-        inet_cpp: C++ INet output array in CHW format [C, H, W].
-        fnet_py_dpvo: Python FNet output with DPVO preprocessing [1, C, H, W] or [C, H, W].
-        fnet_py_cpp_bgr: Python FNet output with C++ preprocessing (BGR) [1, C, H, W] or [C, H, W].
-        fnet_py_cpp_rgb: Python FNet output with C++ preprocessing (RGB) [1, C, H, W] or [C, H, W].
-        inet_py_dpvo: Python INet output with DPVO preprocessing [1, C, H, W] or [C, H, W].
-        inet_py_cpp_bgr: Python INet output with C++ preprocessing (BGR) [1, C, H, W] or [C, H, W].
-        inet_py_cpp_rgb: Python INet output with C++ preprocessing (RGB) [1, C, H, W] or [C, H, W].
-    
-    Returns:
-        Tuple containing six boolean match results:
-            - fnet_match_dpvo: True if C++ FNet matches Python DPVO preprocessing
-            - inet_match_dpvo: True if C++ INet matches Python DPVO preprocessing
-            - fnet_match_cpp_bgr: True if C++ FNet matches Python C++ preprocessing (BGR)
-            - inet_match_cpp_bgr: True if C++ INet matches Python C++ preprocessing (BGR)
-            - fnet_match_cpp_rgb: True if C++ FNet matches Python C++ preprocessing (RGB)
-            - inet_match_cpp_rgb: True if C++ INet matches Python C++ preprocessing (RGB)
-    
-    Note:
-        Compares C++ outputs against all Python preprocessing variations.
-        Prints detailed comparison results for each pairing.
-        Uses tolerance of 1e-5 for value matching.
-    """
-    print("=" * 80)
-    print("🔍 Comparing Python DPVO preprocessing outputs with C++ outputs...")
-    print("=" * 80)
-    print("  📝 (This shows if C++ preprocessing matches Python DPVO preprocessing)")
+                    inet_py_dpvo: np.ndarray, inet_py_cpp_bgr: np.ndarray, inet_py_cpp_rgb: np.ndarray,
+                    is_video: bool = False) -> Tuple[bool, bool, bool, bool, bool, bool]:
+    """Run all comparisons and return match results."""
+    print("=" * 120)
+    print("🔍 Running Comparisons")
+    print("=" * 120)
+    print("  📝 Comparing all preprocessing methods with C++ outputs...")
     print()
     
-    fnet_match_dpvo = compare_outputs(fnet_cpp, fnet_py_dpvo, "FNet (Python DPVO preprocessing)", tolerance=1e-5)
-    print()
+    # Define preprocessing settings for each comparison
+    dpvo_settings = PreprocessingSettings(
+        use_bgr=False,
+        match_python_dpvo=True,
+        apply_undistort=False,
+        is_video=is_video
+    )
     
-    inet_match_dpvo = compare_outputs(inet_cpp, inet_py_dpvo, "INet (Python DPVO preprocessing)", tolerance=1e-5)
-    print()
+    cpp_bgr_settings = PreprocessingSettings(
+        use_bgr=True,
+        match_python_dpvo=False,
+        apply_undistort=True,
+        is_video=False
+    )
     
-    print("=" * 80)
-    print("🔍 Comparing C++ preprocessing outputs with C++ outputs...")
-    print("=" * 80)
-    print("  📝 (This shows if C++ preprocessing matches C++ ONNX inference)")
-    print()
+    cpp_rgb_settings = PreprocessingSettings(
+        use_bgr=False,
+        match_python_dpvo=False,
+        apply_undistort=True,
+        is_video=False
+    )
     
-    fnet_match_cpp_bgr = compare_outputs(fnet_cpp, fnet_py_cpp_bgr, "FNet (C++ preprocessing, BGR)", tolerance=1e-5)
-    print()
+    # Run all comparisons
+    all_results = []
     
-    inet_match_cpp_bgr = compare_outputs(inet_cpp, inet_py_cpp_bgr, "INet (C++ preprocessing, BGR)", tolerance=1e-5)
-    print()
+    # Python DPVO comparisons
+    fnet_dpvo_result = compare_outputs(fnet_cpp, fnet_py_dpvo, "FNet", tolerance=1e-5, preprocessing=dpvo_settings)
+    inet_dpvo_result = compare_outputs(inet_cpp, inet_py_dpvo, "INet", tolerance=1e-5, preprocessing=dpvo_settings)
+    dpvo_results = [fnet_dpvo_result, inet_dpvo_result]
     
-    fnet_match_cpp_rgb = compare_outputs(fnet_cpp, fnet_py_cpp_rgb, "FNet (C++ preprocessing, RGB)", tolerance=1e-5)
-    print()
+    # C++ BGR comparisons
+    fnet_cpp_bgr_result = compare_outputs(fnet_cpp, fnet_py_cpp_bgr, "FNet", tolerance=1e-5, preprocessing=cpp_bgr_settings)
+    inet_cpp_bgr_result = compare_outputs(inet_cpp, inet_py_cpp_bgr, "INet", tolerance=1e-5, preprocessing=cpp_bgr_settings)
+    cpp_bgr_results = [fnet_cpp_bgr_result, inet_cpp_bgr_result]
     
-    inet_match_cpp_rgb = compare_outputs(inet_cpp, inet_py_cpp_rgb, "INet (C++ preprocessing, RGB)", tolerance=1e-5)
-    print()
+    # C++ RGB comparisons
+    fnet_cpp_rgb_result = compare_outputs(fnet_cpp, fnet_py_cpp_rgb, "FNet", tolerance=1e-5, preprocessing=cpp_rgb_settings)
+    inet_cpp_rgb_result = compare_outputs(inet_cpp, inet_py_cpp_rgb, "INet", tolerance=1e-5, preprocessing=cpp_rgb_settings)
+    cpp_rgb_results = [fnet_cpp_rgb_result, inet_cpp_rgb_result]
+    
+    # Collect all results
+    all_results.extend(dpvo_results)
+    all_results.extend(cpp_bgr_results)
+    all_results.extend(cpp_rgb_results)
+    
+    # Prepare data dictionaries for sample value tables
+    dpvo_cpp_dict = {"fnet": fnet_cpp, "inet": inet_cpp}
+    dpvo_py_dict = {"fnet": fnet_py_dpvo, "inet": inet_py_dpvo}
+    
+    cpp_bgr_cpp_dict = {"fnet": fnet_cpp, "inet": inet_cpp}
+    cpp_bgr_py_dict = {"fnet": fnet_py_cpp_bgr, "inet": inet_py_cpp_bgr}
+    
+    cpp_rgb_cpp_dict = {"fnet": fnet_cpp, "inet": inet_cpp}
+    cpp_rgb_py_dict = {"fnet": fnet_py_cpp_rgb, "inet": inet_py_cpp_rgb}
+    
+    # Print category-specific tables with sample values
+    print_category_table(
+        "Python DPVO Preprocessing vs C++ Outputs",
+        dpvo_results,
+        "This shows if C++ preprocessing matches Python DPVO preprocessing",
+        cpp_data_dict=dpvo_cpp_dict,
+        py_data_dict=dpvo_py_dict,
+        show_samples=True
+    )
+    
+    print_category_table(
+        "C++ Preprocessing (BGR) vs C++ Outputs",
+        cpp_bgr_results,
+        "This shows if C++ preprocessing (BGR format) matches C++ ONNX inference",
+        cpp_data_dict=cpp_bgr_cpp_dict,
+        py_data_dict=cpp_bgr_py_dict,
+        show_samples=False  # Only show samples for Python DPVO to avoid clutter
+    )
+    
+    print_category_table(
+        "C++ Preprocessing (RGB) vs C++ Outputs",
+        cpp_rgb_results,
+        "This shows if C++ preprocessing (RGB format) matches C++ ONNX inference",
+        cpp_data_dict=cpp_rgb_cpp_dict,
+        py_data_dict=cpp_rgb_py_dict,
+        show_samples=False  # Only show samples for Python DPVO to avoid clutter
+    )
+    
+    # Print overall comparison table
+    print("\n" + "=" * 120)
+    print("📊 Overall Comparison Summary")
+    print("=" * 120)
+    print_comparison_table(all_results)
+    
+    # Extract boolean results
+    fnet_match_dpvo = dpvo_results[0].matches
+    inet_match_dpvo = dpvo_results[1].matches
+    fnet_match_cpp_bgr = cpp_bgr_results[0].matches
+    inet_match_cpp_bgr = cpp_bgr_results[1].matches
+    fnet_match_cpp_rgb = cpp_rgb_results[0].matches
+    inet_match_cpp_rgb = cpp_rgb_results[1].matches
     
     return fnet_match_dpvo, inet_match_dpvo, fnet_match_cpp_bgr, inet_match_cpp_bgr, fnet_match_cpp_rgb, inet_match_cpp_rgb
 
 def print_summary(fnet_match_dpvo: bool, inet_match_dpvo: bool, fnet_match_cpp_bgr: bool,
                   inet_match_cpp_bgr: bool, fnet_match_cpp_rgb: bool, inet_match_cpp_rgb: bool) -> int:
-    """Print final summary and return exit code.
+    """Print final summary in table format and return exit code."""
+    print("\n" + "=" * 120)
+    print("📊 Final Summary")
+    print("=" * 120)
     
-    Args:
-        fnet_match_dpvo: True if C++ FNet matches Python DPVO preprocessing.
-        inet_match_dpvo: True if C++ INet matches Python DPVO preprocessing.
-        fnet_match_cpp_bgr: True if C++ FNet matches Python C++ preprocessing (BGR).
-        inet_match_cpp_bgr: True if C++ INet matches Python C++ preprocessing (BGR).
-        fnet_match_cpp_rgb: True if C++ FNet matches Python C++ preprocessing (RGB).
-        inet_match_cpp_rgb: True if C++ INet matches Python C++ preprocessing (RGB).
-    
-    Returns:
-        Exit code: 0 if any preprocessing method matches perfectly, 1 otherwise.
-    
-    Note:
-        Prints a formatted summary table showing match status for all comparisons.
-        Determines which preprocessing method (if any) matches C++ outputs.
-        Provides guidance on which preprocessing method to use based on results.
-    """
-    print("=" * 80)
-    print("📊 Summary:")
-    print("=" * 80)
-    print(f"🐍 Python DPVO preprocessing vs C++ outputs:")
-    print(f"  🧠 FNet: {'✅ MATCH' if fnet_match_dpvo else '❌ DIFFER'}")
-    print(f"  🧠 INet: {'✅ MATCH' if inet_match_dpvo else '❌ DIFFER'}")
-    print()
-    print(f"⚙️  C++ preprocessing vs C++ outputs:")
-    print(f"  🧠 FNet (BGR): {'✅ MATCH' if fnet_match_cpp_bgr else '❌ DIFFER'}")
-    print(f"  🧠 INet (BGR): {'✅ MATCH' if inet_match_cpp_bgr else '❌ DIFFER'}")
-    print(f"  🧠 FNet (RGB): {'✅ MATCH' if fnet_match_cpp_rgb else '❌ DIFFER'}")
-    print(f"  🧠 INet (RGB): {'✅ MATCH' if inet_match_cpp_rgb else '❌ DIFFER'}")
+    # Summary table
+    print(f"\n{'Category':<40} {'FNet':<20} {'INet':<20}")
+    print("-" * 120)
+    print(f"{'Python DPVO preprocessing':<40} {'✅ MATCH' if fnet_match_dpvo else '❌ DIFFER':<20} {'✅ MATCH' if inet_match_dpvo else '❌ DIFFER':<20}")
+    print(f"{'C++ preprocessing (BGR)':<40} {'✅ MATCH' if fnet_match_cpp_bgr else '❌ DIFFER':<20} {'✅ MATCH' if inet_match_cpp_bgr else '❌ DIFFER':<20}")
+    print(f"{'C++ preprocessing (RGB)':<40} {'✅ MATCH' if fnet_match_cpp_rgb else '❌ DIFFER':<20} {'✅ MATCH' if inet_match_cpp_rgb else '❌ DIFFER':<20}")
+    print("=" * 120)
     print()
     
     if fnet_match_dpvo and inet_match_dpvo:
@@ -646,25 +852,8 @@ def print_summary(fnet_match_dpvo: bool, inet_match_dpvo: bool, fnet_match_cpp_b
         return 1
 
 def main() -> int:
-    """Main function to orchestrate the ONNX output comparison workflow.
-    
-    Returns:
-        Exit code: 0 on success, 1 on failure or no match found.
-    
-    Workflow:
-        1. Parse command line arguments
-        2. Validate input files exist
-        3. Print comparison header
-        4. Load and preprocess images with different methods
-        5. Load ONNX models
-        6. Run all inference variations
-        7. Save Python outputs to binary files
-        8. Load C++ outputs from binary files
-        9. Run comparisons between C++ and Python outputs
-        10. Print summary and return exit code
-    """
     # Step 1: Parse arguments
-    image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin = parse_arguments()
+    image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin, is_video = parse_arguments()
     
     # Step 2: Validate inputs
     validate_inputs(image_path, fnet_model_path, inet_model_path)
@@ -673,7 +862,7 @@ def main() -> int:
     print_header(image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin)
     
     # Step 4: Load and preprocess images
-    input_data_python_dpvo, input_data_cpp_bgr, input_data_cpp_rgb = load_and_preprocess_images(image_path)
+    input_data_python_dpvo, input_data_cpp_bgr, input_data_cpp_rgb = load_and_preprocess_images(image_path, is_video=is_video)
     
     # Step 5: Load ONNX models
     fnet_session, inet_session = load_onnx_models(fnet_model_path, inet_model_path)
@@ -694,7 +883,7 @@ def main() -> int:
     # Step 9: Run comparisons
     fnet_match_dpvo, inet_match_dpvo, fnet_match_cpp_bgr, inet_match_cpp_bgr, fnet_match_cpp_rgb, inet_match_cpp_rgb = \
         run_comparisons(fnet_cpp, inet_cpp, fnet_py_dpvo, fnet_py_cpp_bgr, fnet_py_cpp_rgb,
-                       inet_py_dpvo, inet_py_cpp_bgr, inet_py_cpp_rgb)
+                       inet_py_dpvo, inet_py_cpp_bgr, inet_py_cpp_rgb, is_video=is_video)
     
     # Step 10: Print summary and return
     return print_summary(fnet_match_dpvo, inet_match_dpvo, fnet_match_cpp_bgr, inet_match_cpp_bgr,
