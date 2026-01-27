@@ -153,12 +153,11 @@ def python_patchify(fmap, imap, coords, P=3, radius=1):
     return gmap, imap_patches, patches
 
 def print_sample_values(arr, name, max_samples=20):
-    """Print sample values from an array"""
+    """Print sample values from an array in table format"""
     arr = np.asarray(arr)
-    print(f"\n📋 {name} Sample Values:")
     
     if arr.size == 0:
-        print("   (empty array)")
+        print(f"\n📋 {name}: (empty array)")
         return
     
     # Flatten for sampling
@@ -167,79 +166,135 @@ def print_sample_values(arr, name, max_samples=20):
     
     # Sample evenly across the array
     if arr_flat.size <= max_samples:
-        indices = range(arr_flat.size)
+        indices = list(range(arr_flat.size))
     else:
         step = arr_flat.size // max_samples
-        indices = range(0, arr_flat.size, step)[:max_samples]
+        indices = list(range(0, arr_flat.size, step))[:max_samples]
     
-    print(f"   Shape: {arr.shape}, Total elements: {arr.size}")
-    print(f"   Sample {num_samples} values:")
-    for i, idx in enumerate(indices):
+    print(f"\n{'='*80}")
+    print(f"{name} Sample Values")
+    print(f"{'='*80}")
+    print(f"Shape: {arr.shape}, Total elements: {arr.size}")
+    print(f"Stats: min={arr.min():.6f}, max={arr.max():.6f}, mean={arr.mean():.6f}, std={arr.std():.6f}")
+    print(f"\n{'Index':<15} {'Location':<25} {'Value':<20}")
+    print("-"*80)
+    
+    for idx in indices:
         orig_idx = np.unravel_index(idx, arr.shape)
-        print(f"      [{', '.join(map(str, orig_idx))}] = {arr_flat[idx]:.6f}")
+        idx_str = ', '.join(map(str, orig_idx))
+        print(f"{idx:<15} {idx_str:<25} {format_number(arr_flat[idx]):<20}")
     
-    # Print statistics
-    print(f"   Stats: min={arr.min():.6f}, max={arr.max():.6f}, mean={arr.mean():.6f}, std={arr.std():.6f}")
+    print("="*80)
 
-def compare_arrays(arr1, arr2, name, tolerance=1e-5, show_samples=True):
-    """Compare two arrays and print statistics"""
-    arr1 = np.asarray(arr1)
-    arr2 = np.asarray(arr2)
-    
-    if arr1.shape != arr2.shape:
-        print(f"❌ {name}: Shape mismatch - {arr1.shape} vs {arr2.shape}")
-        return False
-    
-    diff = np.abs(arr1 - arr2)
+def format_number(val):
+    """Format number for display in table"""
+    if abs(val) < 1e-6:
+        return f"{val:.2e}"
+    elif abs(val) < 0.001:
+        return f"{val:.6f}"
+    else:
+        return f"{val:.6f}"
+
+def print_comparison_table(name, arr1, arr2, diff, tolerance=1e-5):
+    """Print comparison results in a table format"""
     max_diff = np.max(diff)
     mean_diff = np.mean(diff)
-    
-    # Count differences
     num_diff = np.sum(diff > tolerance)
     total = arr1.size
     pct_diff = 100.0 * num_diff / total
     
-    print(f"\n📊 {name} Comparison:")
-    print(f"   Shape: {arr1.shape}")
-    print(f"   Max difference: {max_diff:.6f}")
-    print(f"   Mean difference: {mean_diff:.6f}")
-    print(f"   Elements differing > {tolerance}: {num_diff}/{total} ({pct_diff:.2f}%)")
+    # Determine status
+    if max_diff < tolerance:
+        status = "✅ MATCH"
+    elif pct_diff < 1.0:
+        status = "⚠️  MOSTLY MATCH"
+    else:
+        status = "❌ MISMATCH"
+    
+    print(f"\n{'='*100}")
+    print(f"{name.upper()} COMPARISON")
+    print(f"{'='*100}")
+    print(f"{'Metric':<30} {'Value':<30} {'Details':<40}")
+    print("-"*100)
+    print(f"{'Shape':<30} {str(arr1.shape):<30} {'':<40}")
+    print(f"{'Max Difference':<30} {format_number(max_diff):<30} {'':<40}")
+    print(f"{'Mean Difference':<30} {format_number(mean_diff):<30} {'':<40}")
+    print(f"{'Mismatches':<30} {f'{num_diff}/{total} ({pct_diff:.2f}%)':<30} {'':<40}")
+    print(f"{'Status':<30} {status:<30} {'':<40}")
+    
+    # Show max difference location
+    if arr1.size > 0 and max_diff >= tolerance:
+        flat_idx = np.argmax(diff)
+        idx = np.unravel_index(flat_idx, arr1.shape)
+        idx_str = ', '.join(map(str, idx))
+        print(f"{'Max Diff Location':<30} {idx_str:<30} {'':<40}")
+        print(f"{'C++ Value':<30} {format_number(arr1[idx]):<30} {'':<40}")
+        print(f"{'Python Value':<30} {format_number(arr2[idx]):<30} {'':<40}")
+        print(f"{'Difference':<30} {format_number(diff[idx]):<30} {'':<40}")
+    
+    print("="*100)
+
+def print_sample_values_table(arr1, arr2, name, max_samples=20):
+    """Print sample values in a table format"""
+    arr1_flat = arr1.flatten()
+    arr2_flat = arr2.flatten()
+    diff_flat = np.abs(arr1_flat - arr2_flat)
+    
+    # Get indices for sampling
+    num_samples = min(max_samples, arr1_flat.size)
+    if arr1_flat.size <= num_samples:
+        indices = list(range(arr1_flat.size))
+    else:
+        step = arr1_flat.size // num_samples
+        indices = list(range(0, arr1_flat.size, step))[:num_samples]
+    
+    print(f"\n{'='*100}")
+    print(f"SAMPLE VALUES: {name}")
+    print(f"{'='*100}")
+    print(f"{'Index':<15} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20} {'Location':<25}")
+    print("-"*100)
+    
+    for idx in indices:
+        orig_idx = np.unravel_index(idx, arr1.shape)
+        idx_str = ', '.join(map(str, orig_idx))
+        cpp_val = arr1_flat[idx]
+        py_val = arr2_flat[idx]
+        diff_val = diff_flat[idx]
+        
+        print(f"{idx:<15} {format_number(cpp_val):<20} {format_number(py_val):<20} "
+              f"{format_number(diff_val):<20} {idx_str:<25}")
+    
+    print("="*100)
+
+def compare_arrays(arr1, arr2, name, tolerance=1e-5, show_samples=True):
+    """Compare two arrays and print statistics in table format"""
+    arr1 = np.asarray(arr1)
+    arr2 = np.asarray(arr2)
+    
+    if arr1.shape != arr2.shape:
+        print(f"\n❌ {name}: Shape mismatch - {arr1.shape} vs {arr2.shape}")
+        return False
+    
+    diff = np.abs(arr1 - arr2)
+    
+    # Print comparison table
+    print_comparison_table(name, arr1, arr2, diff, tolerance)
     
     if show_samples:
-        # Show sample values from both arrays
-        print_sample_values(arr1, f"C++ {name}", max_samples=10)
-        print_sample_values(arr2, f"Python {name}", max_samples=10)
-        
-        # Show sample differences
-        print(f"\n📋 Sample Differences (C++ - Python):")
-        flat_diff = diff.flatten()
-        num_samples = min(10, flat_diff.size)
-        if flat_diff.size <= num_samples:
-            indices = range(flat_diff.size)
-        else:
-            step = flat_diff.size // num_samples
-            indices = range(0, flat_diff.size, step)[:num_samples]
-        
-        for idx in indices:
-            orig_idx = np.unravel_index(idx, arr1.shape)
-            cpp_val = arr1.flatten()[idx]
-            py_val = arr2.flatten()[idx]
-            diff_val = flat_diff[idx]
-            print(f"      [{', '.join(map(str, orig_idx))}]: C++={cpp_val:.6f}, Python={py_val:.6f}, diff={diff_val:.6f}")
+        # Show sample values in table format
+        print_sample_values_table(arr1, arr2, name, max_samples=20)
+    
+    # Determine if they match
+    max_diff = np.max(diff)
+    num_diff = np.sum(diff > tolerance)
+    total = arr1.size
+    pct_diff = 100.0 * num_diff / total
     
     if max_diff < tolerance:
-        print(f"   ✅ MATCH (max diff < {tolerance})")
         return True
     elif pct_diff < 1.0:
-        print(f"   ⚠️  Mostly matches ({100-pct_diff:.2f}% identical)")
         return True
     else:
-        print(f"   ❌ MISMATCH")
-        # Print max difference location
-        if arr1.size > 0:
-            flat_idx = np.argmax(diff)
-            idx = np.unravel_index(flat_idx, arr1.shape)
-            print(f"   Max diff at {idx}: C++={arr1[idx]:.6f}, Python={arr2[idx]:.6f}, diff={diff[idx]:.6f}")
         return False
 
 def load_inputs(frame_idx):
@@ -358,56 +413,75 @@ def load_cpp_outputs(frame_idx, M=4, P=3):
     return cpp_gmap, cpp_imap, cpp_patches
 
 def print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches):
-    """Print detailed values for the first patch"""
-    print(f"\n🔍 First Patch (patch 0) Detailed Values:")
+    """Print detailed values for the first patch in table format"""
+    print(f"\n{'='*100}")
+    print(f"FIRST PATCH (Patch 0) DETAILED VALUES")
+    print(f"{'='*100}")
     
-    # GMap details
-    print(f"\n   GMAP - First channel (channel 0):")
-    print(f"   C++   gmap[0, 0, :, :] =")
-    for y in range(min(3, cpp_gmap.shape[2])):
-        print(f"      [{', '.join(f'{cpp_gmap[0, 0, y, x]:.6f}' for x in range(min(3, cpp_gmap.shape[3])))}]")
-    print(f"   Python gmap[0, 0, :, :] =")
-    for y in range(min(3, py_gmap.shape[2])):
-        print(f"      [{', '.join(f'{py_gmap[0, 0, y, x]:.6f}' for x in range(min(3, py_gmap.shape[3])))}]")
+    # GMap details - First channel
+    print(f"\n{'='*100}")
+    print(f"GMAP - First Channel (Channel 0)")
+    print(f"{'='*100}")
+    print(f"{'Row':<10} {'C++ Values':<45} {'Python Values':<45}")
+    print("-"*100)
+    P = cpp_gmap.shape[2]
+    for y in range(P):
+        cpp_vals = ', '.join(f'{cpp_gmap[0, 0, y, x]:.6f}' for x in range(P))
+        py_vals = ', '.join(f'{py_gmap[0, 0, y, x]:.6f}' for x in range(P))
+        print(f"{y:<10} {cpp_vals:<45} {py_vals:<45}")
     
-    # IMap details
-    print(f"\n   IMAP - First 10 channels:")
-    print(f"   C++   imap[0, :10, 0, 0] =")
-    print(f"      [{', '.join(f'{cpp_imap[0, c, 0, 0]:.6f}' for c in range(min(10, cpp_imap.shape[1])))}]")
-    print(f"   Python imap[0, :10, 0, 0] =")
-    print(f"      [{', '.join(f'{py_imap[0, c, 0, 0]:.6f}' for c in range(min(10, py_imap.shape[1])))}]")
+    # IMap details - First 10 channels
+    print(f"\n{'='*100}")
+    print(f"IMAP - First 10 Channels")
+    print(f"{'='*100}")
+    print(f"{'Channel':<10} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20}")
+    print("-"*100)
+    for c in range(min(10, cpp_imap.shape[1])):
+        cpp_val = cpp_imap[0, c, 0, 0]
+        py_val = py_imap[0, c, 0, 0]
+        diff = abs(cpp_val - py_val)
+        print(f"{c:<10} {format_number(cpp_val):<20} {format_number(py_val):<20} {format_number(diff):<20}")
     
-    # Patches details
-    print(f"\n   PATCHES - All 3 channels (x, y, d):")
-    print(f"   C++ patches[0, :, :, :]:")
+    # Patches details - All 3 channels
+    print(f"\n{'='*100}")
+    print(f"PATCHES - All 3 Channels (x, y, d)")
+    print(f"{'='*100}")
     for c in range(3):
-        print(f"      Channel {c}:")
-        for y in range(min(3, cpp_patches.shape[2])):
-            print(f"         [{', '.join(f'{cpp_patches[0, c, y, x]:.2f}' for x in range(min(3, cpp_patches.shape[3])))}]")
-    print(f"   Python patches[0, :, :, :]:")
-    for c in range(3):
-        print(f"      Channel {c}:")
-        for y in range(min(3, py_patches.shape[2])):
-            print(f"         [{', '.join(f'{py_patches[0, c, y, x]:.2f}' for x in range(min(3, py_patches.shape[3])))}]")
+        channel_name = ['X', 'Y', 'D'][c]
+        print(f"\nChannel {c} ({channel_name}):")
+        print(f"{'Row':<10} {'C++ Values':<45} {'Python Values':<45}")
+        print("-"*100)
+        for y in range(P):
+            cpp_vals = ', '.join(f'{cpp_patches[0, c, y, x]:.2f}' for x in range(P))
+            py_vals = ', '.join(f'{py_patches[0, c, y, x]:.2f}' for x in range(P))
+            print(f"{y:<10} {cpp_vals:<45} {py_vals:<45}")
+    
+    print("="*100)
 
 def run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches):
     """Run detailed comparisons between C++ and Python outputs"""
     print(f"\n🔍 Comparing C++ vs Python outputs...")
+    
+    # Show first patch details
     print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches)
-    print(f"\n{'='*80}")
-    print(f"GMAP COMPARISON (patches from fmap)")
-    print(f"{'='*80}")
-    compare_arrays(cpp_gmap, py_gmap, "gmap", tolerance=1e-4, show_samples=True)
     
-    print(f"\n{'='*80}")
-    print(f"IMAP COMPARISON (patches from inet)")
-    print(f"{'='*80}")
-    compare_arrays(cpp_imap, py_imap, "imap", tolerance=1e-4, show_samples=True)
+    # Run comparisons with table output
+    gmap_match = compare_arrays(cpp_gmap, py_gmap, "gmap (patches from fmap)", tolerance=1e-4, show_samples=True)
+    imap_match = compare_arrays(cpp_imap, py_imap, "imap (patches from inet)", tolerance=1e-4, show_samples=True)
+    patches_match = compare_arrays(cpp_patches, py_patches, "patches (coordinate patches)", tolerance=1e-4, show_samples=True)
     
-    print(f"\n{'='*80}")
-    print(f"PATCHES COMPARISON (coordinate patches)")
-    print(f"{'='*80}")
-    compare_arrays(cpp_patches, py_patches, "patches", tolerance=1e-4, show_samples=True)
+    # Summary table
+    print(f"\n{'='*100}")
+    print(f"SUMMARY")
+    print(f"{'='*100}")
+    print(f"{'Output':<30} {'Status':<20}")
+    print("-"*100)
+    print(f"{'gmap':<30} {'✅ MATCH' if gmap_match else '❌ MISMATCH':<20}")
+    print(f"{'imap':<30} {'✅ MATCH' if imap_match else '❌ MISMATCH':<20}")
+    print(f"{'patches':<30} {'✅ MATCH' if patches_match else '❌ MISMATCH':<20}")
+    print("="*100)
+    
+    return gmap_match and imap_match and patches_match
 
 def main():
     print("=" * 80)
