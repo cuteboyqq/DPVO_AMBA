@@ -111,26 +111,69 @@ def print_comparison_table(results: list[ComparisonResult]) -> None:
     
     print("="*100)
 
-def print_sample_values(cpp_data: np.ndarray, py_data: np.ndarray, name: str,
-                       shape: Tuple[int, ...], num_samples: int = 5) -> None:
-    """Print sample values for debugging."""
+def print_sample_values_table(cpp_data: np.ndarray, py_data: np.ndarray, name: str,
+                               shape: Tuple[int, ...], num_samples: int = 20) -> None:
+    """Print sample values in a comprehensive table format."""
     cpp_reshaped = cpp_data.reshape(shape)
     py_reshaped = py_data.reshape(shape)
+    diff = np.abs(cpp_reshaped - py_reshaped)
     
-    print(f"\n{'='*80}")
+    # Flatten for easier indexing
+    cpp_flat = cpp_reshaped.flatten()
+    py_flat = py_reshaped.flatten()
+    diff_flat = diff.flatten()
+    
+    # Get indices for sampling (first N, last N, and some random ones)
+    total_size = cpp_flat.size
+    num_samples = min(num_samples, total_size)
+    
+    # Sample indices: first few, last few, and some from middle
+    sample_indices = []
+    if total_size <= num_samples:
+        sample_indices = list(range(total_size))
+    else:
+        # First few
+        sample_indices.extend(range(min(5, total_size)))
+        # Last few
+        sample_indices.extend(range(max(0, total_size - 5), total_size))
+        # Middle samples
+        if num_samples > 10:
+            step = total_size // (num_samples - 10)
+            middle_indices = list(range(5, total_size - 5, step))[:num_samples - 10]
+            sample_indices.extend(middle_indices)
+        sample_indices = sample_indices[:num_samples]
+    
+    print(f"\n{'='*100}")
     print(f"SAMPLE VALUES: {name}")
-    print(f"{'='*80}")
+    print(f"{'='*100}")
+    print(f"Shape: {shape}, Total elements: {total_size}")
+    print(f"{'Index':<15} {'Location':<30} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20}")
+    print("-"*100)
     
-    # Print first few elements
-    flat_size = min(num_samples, cpp_data.size)
-    print(f"{'Index':<10} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20}")
-    print("-"*80)
+    for idx in sample_indices:
+        # Convert flat index to multi-dimensional index
+        orig_idx = np.unravel_index(idx, shape)
+        idx_str = ', '.join(map(str, orig_idx))
+        
+        cpp_val = cpp_flat[idx]
+        py_val = py_flat[idx]
+        diff_val = diff_flat[idx]
+        
+        print(f"{idx:<15} {idx_str:<30} {format_number(cpp_val):<20} "
+              f"{format_number(py_val):<20} {format_number(diff_val):<20}")
     
-    for i in range(flat_size):
-        cpp_val = cpp_data[i]
-        py_val = py_data[i]
-        diff = abs(cpp_val - py_val)
-        print(f"{i:<10} {cpp_val:<20.6f} {py_val:<20.6f} {diff:<20.6e}")
+    # Print statistics
+    max_diff = np.max(diff_flat)
+    mean_diff = np.mean(diff_flat)
+    print("-"*100)
+    print(f"{'Statistics':<15} {'':<30} {'Max Diff':<20} {'Mean Diff':<20}")
+    print(f"{'':<15} {'':<30} {format_number(max_diff):<20} {format_number(mean_diff):<20}")
+    print("="*100)
+
+def print_sample_values(cpp_data: np.ndarray, py_data: np.ndarray, name: str,
+                       shape: Tuple[int, ...], num_samples: int = 5) -> None:
+    """Print sample values for debugging (legacy function, calls table version)."""
+    print_sample_values_table(cpp_data, py_data, name, shape, num_samples)
 
 def main() -> int:
     """Main function."""
@@ -296,15 +339,74 @@ def main() -> int:
     # Print comparison table
     print_comparison_table(results)
     
-    # Print sample values for mismatched outputs
-    for result in results:
-        if not result.matches:
-            if result.name == "net_out":
-                print_sample_values(net_out_cpp, net_out_py.flatten(), result.name, result.shape)
-            elif result.name == "d_out":
-                print_sample_values(d_out_cpp, d_out_py.flatten(), result.name, result.shape)
-            elif result.name == "w_out":
-                print_sample_values(w_out_cpp, w_out_py.flatten(), result.name, result.shape)
+    # Print sample values for all outputs in table format
+    print("\n" + "="*100)
+    print("DETAILED SAMPLE VALUES COMPARISON")
+    print("="*100)
+    
+    # Print sample values for net_out
+    print_sample_values_table(net_out_cpp, net_out_py.flatten(), "net_out", 
+                             (1, DIM, MAX_EDGE, 1), num_samples=20)
+    
+    # Print sample values for d_out (delta output)
+    print_sample_values_table(d_out_cpp, d_out_py.flatten(), "d_out", 
+                             (1, 2, MAX_EDGE, 1), num_samples=20)
+    
+    # Print sample values for w_out (weight output)
+    print_sample_values_table(w_out_cpp, w_out_py.flatten(), "w_out", 
+                             (1, 2, MAX_EDGE, 1), num_samples=20)
+    
+    # Print edge-by-edge comparison for d_out and w_out (more readable)
+    print(f"\n{'='*100}")
+    print("EDGE-BY-EDGE COMPARISON (First 10 Edges)")
+    print("="*100)
+    
+    # d_out comparison (delta: x, y for each edge)
+    d_out_cpp_reshaped = d_out_cpp.reshape(1, 2, MAX_EDGE, 1)
+    d_out_py_reshaped = d_out_py.reshape(1, 2, MAX_EDGE, 1)
+    
+    print(f"\n{'='*100}")
+    print("D_OUT (Delta Output) - Edge Comparison")
+    print("="*100)
+    print(f"{'Edge':<10} {'C++ (x, y)':<30} {'Python (x, y)':<30} {'Difference (x, y)':<30}")
+    print("-"*100)
+    
+    num_edges_to_show = min(10, MAX_EDGE)
+    for e in range(num_edges_to_show):
+        cpp_x = d_out_cpp_reshaped[0, 0, e, 0]
+        cpp_y = d_out_cpp_reshaped[0, 1, e, 0]
+        py_x = d_out_py_reshaped[0, 0, e, 0]
+        py_y = d_out_py_reshaped[0, 1, e, 0]
+        diff_x = abs(cpp_x - py_x)
+        diff_y = abs(cpp_y - py_y)
+        
+        print(f"{e:<10} ({format_number(cpp_x)}, {format_number(cpp_y)}){'':<15} "
+              f"({format_number(py_x)}, {format_number(py_y)}){'':<15} "
+              f"({format_number(diff_x)}, {format_number(diff_y)}){'':<15}")
+    
+    # w_out comparison (weight: w0, w1 for each edge)
+    w_out_cpp_reshaped = w_out_cpp.reshape(1, 2, MAX_EDGE, 1)
+    w_out_py_reshaped = w_out_py.reshape(1, 2, MAX_EDGE, 1)
+    
+    print(f"\n{'='*100}")
+    print("W_OUT (Weight Output) - Edge Comparison")
+    print("="*100)
+    print(f"{'Edge':<10} {'C++ (w0, w1)':<30} {'Python (w0, w1)':<30} {'Difference (w0, w1)':<30}")
+    print("-"*100)
+    
+    for e in range(num_edges_to_show):
+        cpp_w0 = w_out_cpp_reshaped[0, 0, e, 0]
+        cpp_w1 = w_out_cpp_reshaped[0, 1, e, 0]
+        py_w0 = w_out_py_reshaped[0, 0, e, 0]
+        py_w1 = w_out_py_reshaped[0, 1, e, 0]
+        diff_w0 = abs(cpp_w0 - py_w0)
+        diff_w1 = abs(cpp_w1 - py_w1)
+        
+        print(f"{e:<10} ({format_number(cpp_w0)}, {format_number(cpp_w1)}){'':<15} "
+              f"({format_number(py_w0)}, {format_number(py_w1)}){'':<15} "
+              f"({format_number(diff_w0)}, {format_number(diff_w1)}){'':<15}")
+    
+    print("="*100)
     
     # Summary
     print("\n" + "="*80)
