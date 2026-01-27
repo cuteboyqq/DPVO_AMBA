@@ -1,14 +1,11 @@
-#ifndef TARGET_FRAME_HPP
-#define TARGET_FRAME_HPP
-
 // =================================================================================================
-// Shared TARGET_FRAME constant declaration for saving debug outputs
+// Shared TARGET_FRAME constant definition
 // =================================================================================================
 // This constant controls which frame's data is saved to binary files for comparison with Python.
 // Set to the frame number you want to save (0-indexed, e.g., 69 for frame 69).
 // Set to -1 to disable saving.
 // 
-// The constant is defined in target_frame.cpp and declared here as extern.
+// This constant is declared as extern in target_frame.hpp and defined here.
 // 
 // This constant is used in:
 //   - dpvo.cpp: Save BA input parameters
@@ -17,7 +14,7 @@
 //   - update_onnx.cpp: Save update model inputs/outputs
 // =================================================================================================
 
-extern const int TARGET_FRAME;  // Defined in target_frame.cpp
-
-#endif // TARGET_FRAME_HPP
+// Note: 'extern' is required here to give the constant external linkage
+// Without it, 'const' variables at namespace scope have internal linkage by default
+extern const int TARGET_FRAME = 55;  // Change this to save a different frame
 
