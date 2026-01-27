@@ -13,6 +13,7 @@
 #include <random>   // For random depth initialization
 #include "projective_ops.hpp"
 #include "correlation_kernel.hpp"
+#include "ba_file_io.hpp"  // BA file I/O utilities
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <cmath>
@@ -925,6 +926,9 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
 
 void DPVO::update()
 {
+    // Define TARGET_FRAME at function scope so it's accessible throughout
+    static const int TARGET_FRAME = 77;  // Change this to compare a different frame
+    
     const int num_active = m_pg.m_num_edges;
     if (num_active == 0)
         return;
@@ -943,12 +947,29 @@ void DPVO::update()
     // 1. Reprojection
     // -------------------------------------------------
     if (logger) logger->info("\033[32m--- Step 3.1: Reprojection ---\033[0m");
+    
     std::vector<float> coords(num_active * 2 * P * P); // [num_active, 2, P, P]
     reproject(
         m_pg.m_ii, m_pg.m_jj, m_pg.m_kk,
         num_active,
         coords.data()
     );
+    
+    // Store coords for comparison with BA's reproject call
+    // This will help verify that both reproject() calls produce the same coords
+    static std::vector<float> saved_coords_for_comparison;
+    if (m_counter == TARGET_FRAME) {
+        saved_coords_for_comparison = coords;
+        if (logger) {
+            int center_idx = (P / 2) * P + (P / 2);
+            logger->info("DPVO::update: Saved coords from first reproject() for comparison (first 3 edges):");
+            for (int e = 0; e < std::min(3, num_active); e++) {
+                float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
+                float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
+                logger->info("  Edge[{}]: coords=({:.6f}, {:.6f})", e, cx, cy);
+            }
+        }
+    }
 
     // -------------------------------------------------
     // 2. Correlation
@@ -1410,6 +1431,12 @@ void DPVO::update()
         m_pg.m_target[e * 2 + 0] = cx + dx;
         m_pg.m_target[e * 2 + 1] = cy + dy;
         
+        // Debug: Log first few edges to diagnose target computation
+        if (logger && e < 5 && m_counter == TARGET_FRAME) {
+            logger->info("DPVO::update: Edge[{}] target computation - cx={:.6f}, cy={:.6f}, dx={:.6f}, dy={:.6f}, target=({:.6f}, {:.6f})",
+                        e, cx, cy, dx, dy, m_pg.m_target[e * 2 + 0], m_pg.m_target[e * 2 + 1]);
+        }
+        
         // Store both weight channels separately (matching Python [1, M, 2] format)
         m_pg.m_weight[e][0] = weight[e * 2 + 0];  // Channel 0: weight for x-direction
         m_pg.m_weight[e][1] = weight[e * 2 + 1];  // Channel 1: weight for y-direction
@@ -1463,202 +1490,53 @@ void DPVO::update()
         logger->info("DPVO::update: Starting bundle adjustment");
     }
     
-    // Save BA inputs for comparison (first two update() calls)
-    // update() is first called when m_pg.m_n >= 8, so m_counter == 0 or 1 will never be true
-    // Use a static counter to track update() calls instead
-    static int update_call_count = 0;
-    update_call_count++;
-    // Only save for the first update() call to avoid file overwriting issues
-    // The first call happens when m_pg.m_n >= 8 (after initialization)
-    bool save_ba_inputs = (update_call_count == 1);
+    // Save BA inputs for comparison at a specific frame
+    // m_counter is incremented in runAfterPatchify before update() is called
+    // So when update() is called, m_counter represents the current frame number (0-indexed)
+    // TARGET_FRAME is already defined at the top of this function
+    bool save_ba_inputs = (m_counter == TARGET_FRAME);
     
     if (save_ba_inputs) {
         if (logger) {
-            logger->info("DPVO::update: Saving BA inputs for update() call #{} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
-                        update_call_count, m_counter, m_pg.m_n);
+            logger->info("DPVO::update: Saving BA inputs for frame {} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
+                        TARGET_FRAME, m_counter, m_pg.m_n);
         }
         
         const int N = m_pg.m_n;
         const int M = m_cfg.PATCHES_PER_FRAME;
         const int P = m_P;
         
-        // Save poses [N, 7] format: [tx, ty, tz, qx, qy, qz, qw]
-        std::string poses_filename = "ba_poses.bin";
-        std::ofstream poses_file(poses_filename, std::ios::binary);
-        if (poses_file.is_open()) {
-            for (int i = 0; i < N; i++) {
-                Eigen::Vector3f t = m_pg.m_poses[i].t;
-                Eigen::Quaternionf q = m_pg.m_poses[i].q;
-                float pose_data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
-                poses_file.write(reinterpret_cast<const char*>(pose_data), sizeof(float) * 7);
-            }
-            poses_file.close();
-            if (logger) logger->info("DPVO::update: Saved {} poses to {}", N, poses_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", poses_filename);
-        }
-        
-        // Save patches [N*M, 3, P, P]
-        std::string patches_filename = "ba_patches.bin";
-        std::ofstream patches_file(patches_filename, std::ios::binary);
-        if (patches_file.is_open()) {
-            for (int i = 0; i < N; i++) {
-                for (int j = 0; j < M; j++) {
-                    for (int c = 0; c < 3; c++) {
-                        for (int y = 0; y < P; y++) {
-                            for (int x = 0; x < P; x++) {
-                                float val = m_pg.m_patches[i][j][c][y][x];
-                                patches_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                            }
-                        }
-                    }
-                }
-            }
-            patches_file.close();
-            if (logger) logger->info("DPVO::update: Saved patches [{}*{}, 3, {}, {}] to {}", N, M, P, P, patches_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", patches_filename);
-        }
-        
-        // Save intrinsics [N, 4] format: [fx, fy, cx, cy]
-        std::string intrinsics_filename = "ba_intrinsics.bin";
-        std::ofstream intrinsics_file(intrinsics_filename, std::ios::binary);
-        if (intrinsics_file.is_open()) {
-            for (int i = 0; i < N; i++) {
-                intrinsics_file.write(reinterpret_cast<const char*>(m_pg.m_intrinsics[i]), sizeof(float) * 4);
-            }
-            intrinsics_file.close();
-            if (logger) logger->info("DPVO::update: Saved {} intrinsics to {}", N, intrinsics_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", intrinsics_filename);
-        }
-        
-        // Save indices [num_active] (int32)
-        // CRITICAL: m_pg.m_ii stores patch index mapping, NOT frame index!
-        // Python BA expects ii = source frame index, which we extract from kk: i = kk[e] / M
-        std::string ii_filename = "ba_ii.bin";
-        std::string jj_filename = "ba_jj.bin";
-        std::string kk_filename = "ba_kk.bin";
-        std::ofstream ii_file(ii_filename, std::ios::binary);
-        std::ofstream jj_file(jj_filename, std::ios::binary);
-        std::ofstream kk_file(kk_filename, std::ios::binary);
-        
-        if (ii_file.is_open() && jj_file.is_open() && kk_file.is_open()) {
-            for (int e = 0; e < num_active; e++) {
-                // Extract source frame index from kk (matching BA logic)
-                int i_source = m_pg.m_kk[e] / M;  // Source frame index
-                int32_t ii_val = static_cast<int32_t>(i_source);  // Frame index, not patch index!
-                int32_t jj_val = static_cast<int32_t>(m_pg.m_jj[e]);  // Target frame index
-                int32_t kk_val = static_cast<int32_t>(m_pg.m_kk[e]);  // Global patch index
-                ii_file.write(reinterpret_cast<const char*>(&ii_val), sizeof(int32_t));
-                jj_file.write(reinterpret_cast<const char*>(&jj_val), sizeof(int32_t));
-                kk_file.write(reinterpret_cast<const char*>(&kk_val), sizeof(int32_t));
-            }
-            ii_file.close();
-            jj_file.close();
-            kk_file.close();
-            if (logger) logger->info("DPVO::update: Saved {} indices to {}, {}, {} (ii=frame_index from kk/M, jj=frame_index, kk=patch_index)", 
-                                    num_active, ii_filename, jj_filename, kk_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open index files for writing");
-        }
-        
-        // Save reprojected coordinates at patch center [num_active, 2]
-        // We already have coords from reproject() call above
-        std::string coords_filename = "ba_reprojected_coords.bin";
-        std::ofstream coords_file(coords_filename, std::ios::binary);
-        if (coords_file.is_open()) {
-            int center_idx = (P / 2) * P + (P / 2);
-            for (int e = 0; e < num_active; e++) {
-                float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
-                float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
-                coords_file.write(reinterpret_cast<const char*>(&cx), sizeof(float));
-                coords_file.write(reinterpret_cast<const char*>(&cy), sizeof(float));
-            }
-            coords_file.close();
-            if (logger) logger->info("DPVO::update: Saved {} reprojected coordinates to {}", num_active, coords_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", coords_filename);
-        }
-        
-        // Save targets [num_active, 2] (reprojected_coords + delta from update model)
-        std::string targets_filename = "ba_targets.bin";
-        std::ofstream targets_file(targets_filename, std::ios::binary);
-        if (targets_file.is_open()) {
-            for (int e = 0; e < num_active; e++) {
-                float target_x = m_pg.m_target[e * 2 + 0];
-                float target_y = m_pg.m_target[e * 2 + 1];
-                targets_file.write(reinterpret_cast<const char*>(&target_x), sizeof(float));
-                targets_file.write(reinterpret_cast<const char*>(&target_y), sizeof(float));
-            }
-            targets_file.close();
-            if (logger) logger->info("DPVO::update: Saved {} targets to {}", num_active, targets_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", targets_filename);
-        }
-        
-        // Save weights [num_active, 2] (from update model)
-        std::string weights_filename = "ba_weights.bin";
-        std::ofstream weights_file(weights_filename, std::ios::binary);
-        if (weights_file.is_open()) {
-            for (int e = 0; e < num_active; e++) {
-                float w0 = m_pg.m_weight[e][0];
-                float w1 = m_pg.m_weight[e][1];
-                weights_file.write(reinterpret_cast<const char*>(&w0), sizeof(float));
-                weights_file.write(reinterpret_cast<const char*>(&w1), sizeof(float));
-            }
-            weights_file.close();
-            if (logger) logger->info("DPVO::update: Saved {} weights to {}", num_active, weights_filename);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", weights_filename);
-        }
+        // Save BA inputs using utility functions
+        ba_file_io::save_poses("ba_poses.bin", m_pg.m_poses, N, logger);
+        ba_file_io::save_patches("ba_patches.bin", m_pg.m_patches, N, M, P, logger);
+        ba_file_io::save_intrinsics("ba_intrinsics.bin", m_pg.m_intrinsics, N, logger);
+        ba_file_io::save_edge_indices("ba_ii.bin", "ba_jj.bin", "ba_kk.bin", 
+                                      m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
+        ba_file_io::save_reprojected_coords_center("ba_reprojected_coords.bin", coords.data(), 
+                                                   num_active, P, logger);
+        ba_file_io::save_targets("ba_targets.bin", m_pg.m_target, num_active, logger);
+        ba_file_io::save_weights("ba_weights.bin", m_pg.m_weight, num_active, logger);
         
         // Save metadata
-        std::string metadata_filename = "test_metadata.txt";
-        std::ofstream meta_file(metadata_filename);
-        if (meta_file.is_open()) {
-            const int CORR_DIM = 882;  // 2*49*P*P = 2*49*3*3 = 882 for P=3
-            const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
-            meta_file << "num_active=" << num_active << "\n";
-            meta_file << "MAX_EDGE=" << MAX_EDGE << "\n";
-            meta_file << "DIM=" << m_DIM << "\n";
-            meta_file << "CORR_DIM=" << CORR_DIM << "\n";
-            meta_file << "M=" << M << "\n";
-            meta_file << "P=" << P << "\n";
-            meta_file << "N=" << N << "\n";
-            meta_file.close();
-            if (logger) logger->info("DPVO::update: Saved metadata to {}: num_active={}, MAX_EDGE={}, DIM={}, CORR_DIM={}, M={}, P={}, N={}", 
-                                    metadata_filename, num_active, MAX_EDGE, m_DIM, CORR_DIM, M, P, N);
-        } else {
-            if (logger) logger->error("DPVO::update: Failed to open {} for writing", metadata_filename);
-        }
+        const int CORR_DIM = 882;  // 2*49*P*P = 2*49*3*3 = 882 for P=3
+        const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
+        ba_file_io::save_metadata("test_metadata.txt", num_active, MAX_EDGE, m_DIM, 
+                                  CORR_DIM, M, P, N, logger);
     }
     
     try {
         bundleAdjustment(1e-4f, 100.0f, false, 1);
         
-        // Save BA outputs (updated poses) for first update() call
+        // Save BA outputs (updated poses) for target frame
         if (save_ba_inputs) {
             if (logger) {
-                logger->info("DPVO::update: Saving BA outputs for update() call #{} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
-                            update_call_count, m_counter, m_pg.m_n);
+                logger->info("DPVO::update: Saving BA outputs for frame {} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
+                            TARGET_FRAME, m_counter, m_pg.m_n);
             }
             
             const int N = m_pg.m_n;
-            std::string poses_out_filename = "ba_poses_cpp.bin";
-            std::ofstream poses_out_file(poses_out_filename, std::ios::binary);
-            if (poses_out_file.is_open()) {
-                for (int i = 0; i < N; i++) {
-                    Eigen::Vector3f t = m_pg.m_poses[i].t;
-                    Eigen::Quaternionf q = m_pg.m_poses[i].q;
-                    float pose_data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
-                    poses_out_file.write(reinterpret_cast<const char*>(pose_data), sizeof(float) * 7);
-                }
-                poses_out_file.close();
-                if (logger) logger->info("DPVO::update: Saved {} updated poses to {}", N, poses_out_filename);
-            } else {
-                if (logger) logger->error("DPVO::update: Failed to open {} for writing", poses_out_filename);
-            }
+            // Save BA outputs (updated poses) using utility function
+            ba_file_io::save_poses("ba_poses_cpp.bin", m_pg.m_poses, N, logger);
         }
         
         // Sync optimized poses from sliding window (m_pg.m_poses) back to historical buffer (m_allPoses)

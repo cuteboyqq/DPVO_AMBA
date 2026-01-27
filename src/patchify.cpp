@@ -7,6 +7,7 @@
 #endif
 #include "correlation_kernel.hpp"
 #include "dla_config.hpp"
+#include "patchify_file_io.hpp"  // Patchify file I/O utilities
 #include "logger.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -246,52 +247,27 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
     if (patchify_frame_counter == 1 || patchify_frame_counter == 2) {
         int frame_idx = patchify_frame_counter - 1;  // frame_idx: 0 for first call, 1 for second call
         
+        // Get logger for file I/O operations
+        auto logger_patch = spdlog::get("fnet");
+        if (!logger_patch) {
+            logger_patch = spdlog::get("inet");
+        }
+        
         // Save coordinates
         std::string coords_filename = "cpp_coords_frame" + std::to_string(frame_idx) + ".bin";
-        std::ofstream coords_file(coords_filename, std::ios::binary);
-        if (coords_file.is_open()) {
-            coords_file.write(reinterpret_cast<const char*>(coords), M * 2 * sizeof(float));
-            coords_file.close();
-            printf("[Patchifier] Saved coordinates to %s: M=%d, size=%zu bytes\n", 
-                   coords_filename.c_str(), M, M * 2 * sizeof(float));
-            fflush(stdout);
-        }
+        patchify_file_io::save_coordinates(coords_filename, coords, M, logger_patch);
         
         // Save gmap: [M, 128, P, P] = [4, 128, 3, 3]
         std::string gmap_filename = "cpp_gmap_frame" + std::to_string(frame_idx) + ".bin";
-        std::ofstream gmap_file(gmap_filename, std::ios::binary);
-        if (gmap_file.is_open()) {
-            int gmap_size = M * 128 * m_patch_size * m_patch_size;
-            gmap_file.write(reinterpret_cast<const char*>(gmap), gmap_size * sizeof(float));
-            gmap_file.close();
-            printf("[Patchifier] Saved gmap to %s: shape=[%d, 128, %d, %d], size=%zu bytes\n",
-                   gmap_filename.c_str(), M, m_patch_size, m_patch_size, gmap_size * sizeof(float));
-            fflush(stdout);
-        }
+        patchify_file_io::save_patch_data(gmap_filename, gmap, M, 128, m_patch_size, logger_patch, "gmap");
         
         // Save imap: [M, 384, 1, 1] = [4, 384, 1, 1]
         std::string imap_filename = "cpp_imap_frame" + std::to_string(frame_idx) + ".bin";
-        std::ofstream imap_file(imap_filename, std::ios::binary);
-        if (imap_file.is_open()) {
-            int imap_size = M * inet_output_channels * 1 * 1;
-            imap_file.write(reinterpret_cast<const char*>(imap), imap_size * sizeof(float));
-            imap_file.close();
-            printf("[Patchifier] Saved imap to %s: shape=[%d, %d, 1, 1], size=%zu bytes\n",
-                   imap_filename.c_str(), M, inet_output_channels, imap_size * sizeof(float));
-            fflush(stdout);
-        }
+        patchify_file_io::save_patch_data_hw(imap_filename, imap, M, inet_output_channels, 1, 1, logger_patch, "imap");
         
         // Save patches: [M, 3, P, P] = [4, 3, 3, 3]
         std::string patches_filename = "cpp_patches_frame" + std::to_string(frame_idx) + ".bin";
-        std::ofstream patches_file(patches_filename, std::ios::binary);
-        if (patches_file.is_open()) {
-            int patches_size = M * 3 * m_patch_size * m_patch_size;
-            patches_file.write(reinterpret_cast<const char*>(patches), patches_size * sizeof(float));
-            patches_file.close();
-            printf("[Patchifier] Saved patches to %s: shape=[%d, 3, %d, %d], size=%zu bytes\n",
-                   patches_filename.c_str(), M, m_patch_size, m_patch_size, patches_size * sizeof(float));
-            fflush(stdout);
-        }
+        patchify_file_io::save_patch_data(patches_filename, patches, M, 3, m_patch_size, logger_patch, "patches");
     }
 
     printf("[Patchifier] About to extract colors\n");
@@ -435,78 +411,22 @@ void Patchifier::forward(
             // Save frame 0
             if (frame_counter == 1) {
                 // Save fnet output
-                std::ofstream fnet_file("fnet_frame0.bin", std::ios::binary);
-                if (fnet_file.is_open()) {
-                    size_t fnet_size = m_fmap_buffer.size() * sizeof(float);
-                    fnet_file.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fnet_size);
-                    fnet_file.close();
-                    if (logger_patch) {
-                        logger_patch->info("[Patchifier] Saved fnet output to fnet_frame0.bin: "
-                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
-                                           fnet_C, fnet_H, fnet_W, fnet_size, m_fmap_buffer.size());
-                    }
-                    printf("[Patchifier] Saved fnet output to fnet_frame0.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
-                           fnet_C, fnet_H, fnet_W, fnet_size);
-                    fflush(stdout);
-                } else {
-                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open fnet_frame0.bin for writing");
-                }
+                patchify_file_io::save_model_output("fnet_frame0.bin", m_fmap_buffer.data(), 
+                                                     fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
                 
                 // Save inet output
-                std::ofstream inet_file("inet_frame0.bin", std::ios::binary);
-                if (inet_file.is_open()) {
-                    size_t inet_size = m_imap_buffer.size() * sizeof(float);
-                    inet_file.write(reinterpret_cast<const char*>(m_imap_buffer.data()), inet_size);
-                    inet_file.close();
-                    if (logger_patch) {
-                        logger_patch->info("[Patchifier] Saved inet output to inet_frame0.bin: "
-                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
-                                           inet_C, inet_H, inet_W, inet_size, m_imap_buffer.size());
-                    }
-                    printf("[Patchifier] Saved inet output to inet_frame0.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
-                           inet_C, inet_H, inet_W, inet_size);
-                    fflush(stdout);
-                } else {
-                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open inet_frame0.bin for writing");
-                }
+                patchify_file_io::save_model_output("inet_frame0.bin", m_imap_buffer.data(), 
+                                                     inet_C, inet_H, inet_W, logger_patch, "inet");
             }
             // Save frame 1
             else if (frame_counter == 2) {
                 // Save fnet output
-                std::ofstream fnet_file("fnet_frame1.bin", std::ios::binary);
-                if (fnet_file.is_open()) {
-                    size_t fnet_size = m_fmap_buffer.size() * sizeof(float);
-                    fnet_file.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fnet_size);
-                    fnet_file.close();
-                    if (logger_patch) {
-                        logger_patch->info("[Patchifier] Saved fnet output to fnet_frame1.bin: "
-                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
-                                           fnet_C, fnet_H, fnet_W, fnet_size, m_fmap_buffer.size());
-                    }
-                    printf("[Patchifier] Saved fnet output to fnet_frame1.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
-                           fnet_C, fnet_H, fnet_W, fnet_size);
-                    fflush(stdout);
-                } else {
-                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open fnet_frame1.bin for writing");
-                }
+                patchify_file_io::save_model_output("fnet_frame1.bin", m_fmap_buffer.data(), 
+                                                     fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
                 
                 // Save inet output
-                std::ofstream inet_file("inet_frame1.bin", std::ios::binary);
-                if (inet_file.is_open()) {
-                    size_t inet_size = m_imap_buffer.size() * sizeof(float);
-                    inet_file.write(reinterpret_cast<const char*>(m_imap_buffer.data()), inet_size);
-                    inet_file.close();
-                    if (logger_patch) {
-                        logger_patch->info("[Patchifier] Saved inet output to inet_frame1.bin: "
-                                           "shape=[1, {}, {}, {}] (C, H, W), {} bytes, {} floats",
-                                           inet_C, inet_H, inet_W, inet_size, m_imap_buffer.size());
-                    }
-                    printf("[Patchifier] Saved inet output to inet_frame1.bin: shape=[1, %d, %d, %d] (NCHW), %zu bytes\n",
-                           inet_C, inet_H, inet_W, inet_size);
-                    fflush(stdout);
-                } else {
-                    if (logger_patch) logger_patch->error("[Patchifier] Failed to open inet_frame1.bin for writing");
-                }
+                patchify_file_io::save_model_output("inet_frame1.bin", m_imap_buffer.data(), 
+                                                     inet_C, inet_H, inet_W, logger_patch, "inet");
             }
         }
     } else {

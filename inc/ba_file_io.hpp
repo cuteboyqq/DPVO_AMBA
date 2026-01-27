@@ -1,0 +1,326 @@
+#pragma once
+
+#include <fstream>
+#include <string>
+#include <vector>
+#include "eigen_common.h"  // Provides Eigen types (Vector3f, Quaternionf, etc.)
+#include "se3.h"
+#include "logger.hpp"
+
+/**
+ * Utility functions for saving BA input/output parameters to binary files
+ * Used for comparison with Python BA implementation
+ */
+namespace ba_file_io {
+
+/**
+ * Save a float array to a binary file
+ * @param filename Output filename
+ * @param data Pointer to data array
+ * @param num_elements Number of elements to write
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_float_array(const std::string& filename, const float* data, size_t num_elements, 
+                            std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    file.write(reinterpret_cast<const char*>(data), sizeof(float) * num_elements);
+    file.close();
+    if (logger) logger->info("Saved {} floats to {}", num_elements, filename);
+    return true;
+}
+
+/**
+ * Save an int32 array to a binary file
+ * @param filename Output filename
+ * @param data Pointer to data array
+ * @param num_elements Number of elements to write
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_int32_array(const std::string& filename, const int32_t* data, size_t num_elements,
+                            std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    file.write(reinterpret_cast<const char*>(data), sizeof(int32_t) * num_elements);
+    file.close();
+    if (logger) logger->info("Saved {} int32s to {}", num_elements, filename);
+    return true;
+}
+
+/**
+ * Save poses to binary file [N, 7] format: [tx, ty, tz, qx, qy, qz, qw]
+ * @param filename Output filename
+ * @param poses Array of SE3 poses
+ * @param N Number of poses
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_poses(const std::string& filename, const SE3* poses, int N,
+                      std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int i = 0; i < N; i++) {
+        Eigen::Vector3f t = poses[i].t;
+        Eigen::Quaternionf q = poses[i].q;
+        float pose_data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+        file.write(reinterpret_cast<const char*>(pose_data), sizeof(float) * 7);
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved {} poses to {}", N, filename);
+    return true;
+}
+
+/**
+ * Save patches to binary file [N*M, 3, P, P]
+ * @param filename Output filename
+ * @param patches 5D array: patches[frame][patch][channel][y][x]
+ * @param N Number of frames
+ * @param M Number of patches per frame
+ * @param P Patch size (PxP)
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename PatchArray>
+inline bool save_patches(const std::string& filename, const PatchArray& patches, int N, int M, int P,
+                        std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < M; j++) {
+            for (int c = 0; c < 3; c++) {
+                for (int y = 0; y < P; y++) {
+                    for (int x = 0; x < P; x++) {
+                        float val = patches[i][j][c][y][x];
+                        file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                    }
+                }
+            }
+        }
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved patches [{}*{}, 3, {}, {}] to {}", N, M, P, P, filename);
+    return true;
+}
+
+/**
+ * Save intrinsics to binary file [N, 4] format: [fx, fy, cx, cy]
+ * @param filename Output filename
+ * @param intrinsics Array of intrinsics arrays (each is 4 floats)
+ * @param N Number of frames
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename IntrinsicsArray>
+inline bool save_intrinsics(const std::string& filename, const IntrinsicsArray& intrinsics, int N,
+                           std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int i = 0; i < N; i++) {
+        file.write(reinterpret_cast<const char*>(intrinsics[i]), sizeof(float) * 4);
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved {} intrinsics to {}", N, filename);
+    return true;
+}
+
+/**
+ * Save edge indices to binary files [num_active] (int32)
+ * @param ii_filename Output filename for source frame indices
+ * @param jj_filename Output filename for target frame indices
+ * @param kk_filename Output filename for patch indices
+ * @param kk_array Array of global patch indices (kk[e])
+ * @param jj_array Array of target frame indices (jj[e])
+ * @param num_active Number of active edges
+ * @param M Number of patches per frame (used to extract source frame from kk)
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename KKArray, typename JJArray>
+inline bool save_edge_indices(const std::string& ii_filename, const std::string& jj_filename, 
+                              const std::string& kk_filename,
+                              const KKArray& kk_array, const JJArray& jj_array,
+                              int num_active, int M,
+                              std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream ii_file(ii_filename, std::ios::binary);
+    std::ofstream jj_file(jj_filename, std::ios::binary);
+    std::ofstream kk_file(kk_filename, std::ios::binary);
+    
+    if (!ii_file.is_open() || !jj_file.is_open() || !kk_file.is_open()) {
+        if (logger) logger->error("Failed to open index files for writing");
+        return false;
+    }
+    
+    for (int e = 0; e < num_active; e++) {
+        // Extract source frame index from kk (matching BA logic)
+        int i_source = kk_array[e] / M;  // Source frame index
+        int32_t ii_val = static_cast<int32_t>(i_source);  // Frame index, not patch index!
+        int32_t jj_val = static_cast<int32_t>(jj_array[e]);  // Target frame index
+        int32_t kk_val = static_cast<int32_t>(kk_array[e]);  // Global patch index
+        
+        ii_file.write(reinterpret_cast<const char*>(&ii_val), sizeof(int32_t));
+        jj_file.write(reinterpret_cast<const char*>(&jj_val), sizeof(int32_t));
+        kk_file.write(reinterpret_cast<const char*>(&kk_val), sizeof(int32_t));
+    }
+    
+    ii_file.close();
+    jj_file.close();
+    kk_file.close();
+    
+    if (logger) {
+        logger->info("Saved {} indices to {}, {}, {} (ii=frame_index from kk/M, jj=frame_index, kk=patch_index)", 
+                    num_active, ii_filename, jj_filename, kk_filename);
+    }
+    return true;
+}
+
+/**
+ * Save reprojected coordinates at patch center [num_active, 2]
+ * @param filename Output filename
+ * @param coords Flat array of coordinates [num_active, 2, P, P]
+ * @param num_active Number of active edges
+ * @param P Patch size
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_reprojected_coords_center(const std::string& filename, const float* coords,
+                                          int num_active, int P,
+                                          std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    int center_idx = (P / 2) * P + (P / 2);
+    for (int e = 0; e < num_active; e++) {
+        float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
+        float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
+        file.write(reinterpret_cast<const char*>(&cx), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&cy), sizeof(float));
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved {} reprojected coordinates to {}", num_active, filename);
+    return true;
+}
+
+/**
+ * Save targets [num_active, 2] (reprojected_coords + delta from update model)
+ * @param filename Output filename
+ * @param targets Flat array [num_active * 2] - accessed as targets[e * 2 + 0] and targets[e * 2 + 1]
+ * @param num_active Number of active edges
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_targets(const std::string& filename, const float* targets, int num_active,
+                        std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int e = 0; e < num_active; e++) {
+        float target_x = targets[e * 2 + 0];
+        float target_y = targets[e * 2 + 1];
+        file.write(reinterpret_cast<const char*>(&target_x), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&target_y), sizeof(float));
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved {} targets to {}", num_active, filename);
+    return true;
+}
+
+/**
+ * Save weights [num_active, 2] (from update model)
+ * @param filename Output filename
+ * @param weights 2D array weights[edge][dim]
+ * @param num_active Number of active edges
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename WeightArray>
+inline bool save_weights(const std::string& filename, const WeightArray& weights, int num_active,
+                        std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int e = 0; e < num_active; e++) {
+        float w0 = weights[e][0];
+        float w1 = weights[e][1];
+        file.write(reinterpret_cast<const char*>(&w0), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&w1), sizeof(float));
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved {} weights to {}", num_active, filename);
+    return true;
+}
+
+/**
+ * Save metadata to text file
+ * @param filename Output filename
+ * @param num_active Number of active edges
+ * @param MAX_EDGE Maximum number of edges
+ * @param DIM Dimension
+ * @param CORR_DIM Correlation dimension
+ * @param M Number of patches per frame
+ * @param P Patch size
+ * @param N Number of frames
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_metadata(const std::string& filename, int num_active, int MAX_EDGE, int DIM, 
+                         int CORR_DIM, int M, int P, int N,
+                         std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    file << "num_active=" << num_active << "\n";
+    file << "MAX_EDGE=" << MAX_EDGE << "\n";
+    file << "DIM=" << DIM << "\n";
+    file << "CORR_DIM=" << CORR_DIM << "\n";
+    file << "M=" << M << "\n";
+    file << "P=" << P << "\n";
+    file << "N=" << N << "\n";
+    
+    file.close();
+    if (logger) {
+        logger->info("Saved metadata to {}: num_active={}, MAX_EDGE={}, DIM={}, CORR_DIM={}, M={}, P={}, N={}", 
+                    filename, num_active, MAX_EDGE, DIM, CORR_DIM, M, P, N);
+    }
+    return true;
+}
+
+} // namespace ba_file_io
+

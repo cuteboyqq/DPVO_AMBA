@@ -32,10 +32,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         logger->info("\033[32m========================================\033[0m");
     }
     
-    // Save intermediate BA values for step-by-step comparison (only for first BA call)
-    static int ba_call_count = 0;
-    ba_call_count++;
-    bool save_intermediates = (ba_call_count == 1);
+    // Save intermediate BA values for step-by-step comparison at a specific frame
+    // Match the target frame used in update() - change TARGET_FRAME here to match dpvo.cpp
+    static const int TARGET_FRAME = 77;  // Must match TARGET_FRAME in dpvo.cpp
+    // bundleAdjustment() is a member function, so we can access m_counter directly
+    bool save_intermediates = (m_counter == TARGET_FRAME);
 
     const int M = m_cfg.PATCHES_PER_FRAME;
     const int P = m_P;
@@ -84,6 +85,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     const int p = P;
     const int center_idx = (p / 2) * P + (p / 2); // center pixel index in patch
+    
+    // Debug: Log coords from BA's reproject() call for comparison
+    if (logger && m_counter == TARGET_FRAME) {
+        logger->info("BA: Coords from second reproject() call (first 3 edges):");
+        for (int e = 0; e < std::min(3, num_active); e++) {
+            float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
+            float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
+            logger->info("  Edge[{}]: coords=({:.6f}, {:.6f})", e, cx, cy);
+        }
+    }
     std::vector<float> r(num_active * 2); // [num_active, 2]
     std::vector<float> v(num_active, 1.0f); // validity mask
 
@@ -99,6 +110,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         // Validate inputs before computing residual
         float target_x = m_pg.m_target[e * 2 + 0];
         float target_y = m_pg.m_target[e * 2 + 1];
+        
+        // Debug: Log first few edges to diagnose target mismatch (always log for debugging)
+        // Expected: residual = targets - coords should equal delta from update model
+        // If coords match Python but residuals don't, then targets must be different
+        if (logger && e < 5) {
+            float residual_x = target_x - cx;
+            float residual_y = target_y - cy;
+            logger->info("BA: Edge[{}] - target=({:.6f}, {:.6f}), coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f})",
+                        e, target_x, target_y, cx, cy, residual_x, residual_y);
+        }
         
         if (!std::isfinite(cx) || !std::isfinite(cy) || 
             !std::isfinite(target_x) || !std::isfinite(target_y)) {
@@ -163,6 +184,24 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         }
     }
     
+    // Compute bounds from intrinsics (matching Python: W = 2 * max(cx), H = 2 * max(cy))
+    // Python: bounds = [0.0, 0.0, W - 1.0, H - 1.0] where W = 2 * max(intrinsics[:, 2]), H = 2 * max(intrinsics[:, 3])
+    float max_cx = 0.0f;
+    float max_cy = 0.0f;
+    for (int i = 0; i < n; i++) {
+        max_cx = std::max(max_cx, m_pg.m_intrinsics[i][2]);  // cx
+        max_cy = std::max(max_cy, m_pg.m_intrinsics[i][3]);  // cy
+    }
+    float bounds_W = 2.0f * max_cx;  // W = 2 * max(cx)
+    float bounds_H = 2.0f * max_cy;   // H = 2 * max(cy)
+    float bounds_xmax = bounds_W - 1.0f;  // bounds[2] = W - 1.0
+    float bounds_ymax = bounds_H - 1.0f;  // bounds[3] = H - 1.0
+    
+    if (logger && m_counter == TARGET_FRAME) {
+        logger->info("BA: Computed bounds from intrinsics - max_cx={:.2f}, max_cy={:.2f}, W={:.1f}, H={:.1f}, bounds=[0.0, 0.0, {:.1f}, {:.1f}]",
+                     max_cx, max_cy, bounds_W, bounds_H, bounds_xmax, bounds_ymax);
+    }
+    
     // Continue with remaining validity checks (this was outside the loop, moved here)
     for (int e = 0; e < num_active; e++) {
         // Extract coordinates at patch center for bounds check
@@ -170,11 +209,17 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
         
         // Reject projections outside image bounds
-        // CRITICAL: Reprojected coordinates are at 1/4 resolution (feature map resolution)
-        // Use feature map dimensions, not full image dimensions
-        // bounds = (xmin, ymin, xmax, ymax) = (0, 0, m_fmap1_W, m_fmap1_H)
-        if (cx < 0.0f || cy < 0.0f || cx >= m_fmap1_W || cy >= m_fmap1_H) {
+        // CRITICAL: Match Python BA bounds check exactly
+        // Python: bounds = [0.0, 0.0, W-1.0, H-1.0], checks: cx > 0.0, cy > 0.0, cx < W-1.0, cy < H-1.0
+        // C++: Use computed bounds from intrinsics, check: cx > 0.0, cy > 0.0, cx < bounds_xmax, cy < bounds_ymax
+        bool out_of_bounds = (cx <= 0.0f || cy <= 0.0f || cx >= bounds_xmax || cy >= bounds_ymax);
+        if (out_of_bounds) {
             v[e] = 0.0f;
+            // Debug: Log out-of-bounds edges for comparison with Python
+            if (logger && m_counter == TARGET_FRAME && e < 10) {
+                logger->info("BA: Edge[{}] out-of-bounds - cx={:.2f}, cy={:.2f}, bounds=[0.0, 0.0, {:.1f}, {:.1f}]",
+                            e, cx, cy, bounds_xmax, bounds_ymax);
+            }
         }
         
         // Also use validity from transformWithJacobians
@@ -202,12 +247,31 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     if (save_intermediates) {
         std::ofstream r_file("ba_step1_residuals.bin", std::ios::binary);
         std::ofstream v_file("ba_step1_validity.bin", std::ios::binary);
-        if (r_file.is_open() && v_file.is_open()) {
+        // Also save coords at center that BA actually uses for residual computation
+        std::vector<float> coords_center_ba(num_active * 2);
+        for (int e = 0; e < num_active; e++) {
+            coords_center_ba[e * 2 + 0] = coords[e * 2 * P * P + 0 * P * P + center_idx];
+            coords_center_ba[e * 2 + 1] = coords[e * 2 * P * P + 1 * P * P + center_idx];
+        }
+        std::ofstream coords_center_file("ba_step1_coords_center.bin", std::ios::binary);
+        
+        if (r_file.is_open() && v_file.is_open() && coords_center_file.is_open()) {
+            // Debug: Log what we're saving (first 3 edges)
+            if (logger) {
+                logger->info("BA: Saving STEP 1 residuals (first 3 edges):");
+                for (int e = 0; e < std::min(3, num_active); e++) {
+                    logger->info("  Edge[{}]: coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f}), validity={:.1f}", 
+                                e, coords_center_ba[e * 2 + 0], coords_center_ba[e * 2 + 1],
+                                r[e * 2 + 0], r[e * 2 + 1], v[e]);
+                }
+            }
             r_file.write(reinterpret_cast<const char*>(r.data()), sizeof(float) * num_active * 2);
             v_file.write(reinterpret_cast<const char*>(v.data()), sizeof(float) * num_active);
+            coords_center_file.write(reinterpret_cast<const char*>(coords_center_ba.data()), sizeof(float) * num_active * 2);
             r_file.close();
             v_file.close();
-            if (logger) logger->info("BA: Saved STEP 1 - residuals and validity mask");
+            coords_center_file.close();
+            if (logger) logger->info("BA: Saved STEP 1 - residuals, validity mask, and coords at center");
         }
     }
     
@@ -309,13 +373,26 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         Ejk[e] = wJjT[e] * Jz_mat;
     }
     
+    // Save STEP 3: Hessian blocks (including Ejk for comparison)
+    if (save_intermediates) {
+        std::ofstream Ejk_file("ba_step3_Ejk.bin", std::ios::binary);
+        if (Ejk_file.is_open()) {
+            Ejk_file.write(reinterpret_cast<const char*>(Ejk.data()), sizeof(float) * num_active * 6 * 1);
+            Ejk_file.close();
+            if (logger) logger->info("BA: Saved STEP 3 - Ejk blocks (size: {}x{}x{})", num_active, 6, 1);
+        }
+    }
+    
     // Save STEP 2: Weighted Jacobians
     if (save_intermediates) {
         std::ofstream wJiT_file("ba_step2_wJiT.bin", std::ios::binary);
         std::ofstream wJjT_file("ba_step2_wJjT.bin", std::ios::binary);
         std::ofstream wJzT_file("ba_step2_wJzT.bin", std::ios::binary);
         std::ofstream weights_masked_file("ba_step2_weights_masked.bin", std::ios::binary);
-        if (wJiT_file.is_open() && wJjT_file.is_open() && wJzT_file.is_open() && weights_masked_file.is_open()) {
+        std::ofstream Ji_center_file("ba_step2_Ji_center.bin", std::ios::binary);
+        std::ofstream Jj_center_file("ba_step2_Jj_center.bin", std::ios::binary);
+        if (wJiT_file.is_open() && wJjT_file.is_open() && wJzT_file.is_open() && weights_masked_file.is_open() &&
+            Ji_center_file.is_open() && Jj_center_file.is_open()) {
             // Eigen matrices are column-major, but Python expects row-major
             // Write row by row to match Python's expected format
             for (int e = 0; e < num_active; e++) {
@@ -342,10 +419,23 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 }
             }
             weights_masked_file.write(reinterpret_cast<const char*>(weights_masked.data()), sizeof(float) * num_active * 2);
+            // Save Ji_center and Jj_center for debugging (row-major: [num_active, 2, 6])
+            for (int e = 0; e < num_active; e++) {
+                for (int i = 0; i < 2; i++) {
+                    for (int j = 0; j < 6; j++) {
+                        float val_ji = Ji_center[e * 2 * 6 + i * 6 + j];
+                        float val_jj = Jj_center[e * 2 * 6 + i * 6 + j];
+                        Ji_center_file.write(reinterpret_cast<const char*>(&val_ji), sizeof(float));
+                        Jj_center_file.write(reinterpret_cast<const char*>(&val_jj), sizeof(float));
+                    }
+                }
+            }
             wJiT_file.close();
             wJjT_file.close();
             wJzT_file.close();
             weights_masked_file.close();
+            Ji_center_file.close();
+            Jj_center_file.close();
             if (logger) logger->info("BA: Saved STEP 2 - weighted Jacobians and masked weights");
         }
     }
@@ -551,29 +641,43 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         int i = ii_new[e];
         int j = jj_new[e];
         
-        // Python's safe_scatter_add_mat filters: v = (ii >= 0) & (jj >= 0) & (ii < n) & (jj < m)
-        // So edges where i < 0 OR j < 0 OR i >= n OR j >= m are skipped from Hessian assembly
-        // This is correct: edges connecting to fixed poses don't contribute to adjustable pose Hessian
-        if (i < 0 || i >= n_adjusted || j < 0 || j >= n_adjusted) {
-            if (logger && e < 10) {
-                int i_source = m_pg.m_kk[e] / M;
-                logger->debug("BA: Edge[{}] skipped from Hessian - i_source={}, j={}, ii_new={}, jj_new={}, n_adjusted={} (this is normal for edges to fixed poses)",
-                             e, i_source, m_pg.m_jj[e], i, j, n_adjusted);
-            }
-            if (i < 0) edges_to_fixed_i++;
-            if (j < 0) edges_to_fixed_j++;
-            continue;
+        // Python's safe_scatter_add_mat filters each block type separately:
+        //   Bii: v = (ii >= 0) & (ii >= 0) & (ii < n) & (ii < n)  -> only check i
+        //   Bij: v = (ii >= 0) & (jj >= 0) & (ii < n) & (jj < n)  -> check both i and j
+        //   Bji: v = (jj >= 0) & (ii >= 0) & (jj < n) & (ii < n)  -> check both j and i
+        //   Bjj: v = (jj >= 0) & (jj >= 0) & (jj < n) & (jj < n)  -> only check j
+        // So edges where one pose is fixed can still contribute to diagonal blocks (Bii/Bjj)
+        // of the adjustable pose.
+        
+        // Bii: add if i is adjustable (i >= 0 && i < n_adjusted)
+        if (i >= 0 && i < n_adjusted) {
+            B.block<6, 6>(6 * i, 6 * i) += Bii[e];
+            edge_count_per_pose[i]++;
         }
         
-        edges_both_adjustable++;
-        edge_count_per_pose[i]++;
-        edge_count_per_pose[j]++;
+        // Bij: add if both i and j are adjustable
+        if (i >= 0 && i < n_adjusted && j >= 0 && j < n_adjusted) {
+            B.block<6, 6>(6 * i, 6 * j) += Bij[e];
+        }
         
-        // Scatter-add blocks (only for edges where both poses are adjustable)
-        B.block<6, 6>(6 * i, 6 * i) += Bii[e];
-        B.block<6, 6>(6 * i, 6 * j) += Bij[e];
-        B.block<6, 6>(6 * j, 6 * i) += Bji[e];
-        B.block<6, 6>(6 * j, 6 * j) += Bjj[e];
+        // Bji: add if both j and i are adjustable
+        if (j >= 0 && j < n_adjusted && i >= 0 && i < n_adjusted) {
+            B.block<6, 6>(6 * j, 6 * i) += Bji[e];
+        }
+        
+        // Bjj: add if j is adjustable (j >= 0 && j < n_adjusted)
+        if (j >= 0 && j < n_adjusted) {
+            B.block<6, 6>(6 * j, 6 * j) += Bjj[e];
+            edge_count_per_pose[j]++;
+        }
+        
+        // Count edge types for debugging
+        if (i >= 0 && i < n_adjusted && j >= 0 && j < n_adjusted) {
+            edges_both_adjustable++;
+        } else {
+            if (i < 0) edges_to_fixed_i++;
+            if (j < 0) edges_to_fixed_j++;
+        }
     }
     
     if (logger) {
@@ -605,20 +709,92 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Step 8: Assemble pose-structure coupling E [n, m, 6, 1]
     // ---------------------------------------------------------
     // E is reshaped to [6n, m] for matrix operations
+    // NOTE: Python's safe_scatter_add_mat filters edges based ONLY on indices:
+    //   Eik: v = (ii >= 0) & (kk >= 0) & (ii < n) & (kk < m)  -> only check i and k
+    //   Ejk: v = (jj >= 0) & (kk >= 0) & (jj < n) & (kk < m)  -> only check j and k
+    // It does NOT filter by the validity mask v from residual checks.
+    // The validity mask is already applied to weights when computing wJiT/wJjT,
+    // so Eik/Ejk already have the validity mask incorporated.
+    // We should NOT filter by v[e] here - only filter by indices to match Python.
     Eigen::MatrixXf E = Eigen::MatrixXf::Zero(6 * n_adjusted, m);
     
+    // Debug: Track which edges contribute to specific E entries (for debugging mismatches)
+    std::vector<std::vector<int>> edges_to_E_ik(6 * n_adjusted * m);  // Flattened: [6*n_adjusted*m]
+    std::vector<std::vector<int>> edges_to_E_jk(6 * n_adjusted * m);
+    
     for (int e = 0; e < num_active; e++) {
-        if (v[e] < 0.5f) continue;
-        
         int i = ii_new[e];
         int j = jj_new[e];
         int k = kk_new[e];
         
-        if (i < 0 || i >= n_adjusted || j < 0 || j >= n_adjusted || k < 0 || k >= m) continue;
+        // Eik: add if i is adjustable and k is valid (matches Python's safe_scatter_add_mat for Eik)
+        if (i >= 0 && i < n_adjusted && k >= 0 && k < m) {
+            E.block<6, 1>(6 * i, k) += Eik[e];
+            // Track which edge contributes to each E entry (for debugging)
+            if (save_intermediates && m_counter == TARGET_FRAME) {
+                for (int param = 0; param < 6; param++) {
+                    int flat_idx = (6 * i + param) * m + k;
+                    if (flat_idx < static_cast<int>(edges_to_E_ik.size())) {
+                        edges_to_E_ik[flat_idx].push_back(e);
+                    }
+                }
+            }
+        }
         
-        // Scatter-add Eik and Ejk
-        E.block<6, 1>(6 * i, k) += Eik[e];
-        E.block<6, 1>(6 * j, k) += Ejk[e];
+        // Ejk: add if j is adjustable and k is valid (matches Python's safe_scatter_add_mat for Ejk)
+        if (j >= 0 && j < n_adjusted && k >= 0 && k < m) {
+            E.block<6, 1>(6 * j, k) += Ejk[e];
+            // Track which edge contributes to each E entry (for debugging)
+            if (save_intermediates && m_counter == TARGET_FRAME) {
+                for (int param = 0; param < 6; param++) {
+                    int flat_idx = (6 * j + param) * m + k;
+                    if (flat_idx < static_cast<int>(edges_to_E_jk.size())) {
+                        edges_to_E_jk[flat_idx].push_back(e);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Debug: Log edges contributing to E[0, 1] (pose 0, param 0, struct var 1) if this is target frame
+    if (save_intermediates && logger && m_counter == TARGET_FRAME) {
+        int debug_pose = 0;
+        int debug_param = 0;
+        int debug_struct = 1;
+        int debug_flat_idx = (6 * debug_pose + debug_param) * m + debug_struct;
+        if (debug_flat_idx < static_cast<int>(edges_to_E_ik.size()) && 
+            debug_flat_idx < static_cast<int>(edges_to_E_jk.size())) {
+            logger->info("BA: Edges contributing to E[pose={}, param={}, struct={}]:", 
+                        debug_pose, debug_param, debug_struct);
+            
+            // Convert vector<int> to string for logging
+            std::string eik_edges_str = "[";
+            for (size_t i = 0; i < edges_to_E_ik[debug_flat_idx].size(); i++) {
+                if (i > 0) eik_edges_str += ", ";
+                eik_edges_str += std::to_string(edges_to_E_ik[debug_flat_idx][i]);
+            }
+            eik_edges_str += "]";
+            logger->info("  Eik edges: {}", eik_edges_str);
+            
+            std::string ejk_edges_str = "[";
+            for (size_t i = 0; i < edges_to_E_jk[debug_flat_idx].size(); i++) {
+                if (i > 0) ejk_edges_str += ", ";
+                ejk_edges_str += std::to_string(edges_to_E_jk[debug_flat_idx][i]);
+            }
+            ejk_edges_str += "]";
+            logger->info("  Ejk edges: {}", ejk_edges_str);
+            
+            for (int e : edges_to_E_ik[debug_flat_idx]) {
+                logger->info("    Edge {}: ii_new={}, kk_new={}, Eik[{}]=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})", 
+                            e, ii_new[e], kk_new[e], e,
+                            Eik[e](0, 0), Eik[e](1, 0), Eik[e](2, 0), Eik[e](3, 0), Eik[e](4, 0), Eik[e](5, 0));
+            }
+            for (int e : edges_to_E_jk[debug_flat_idx]) {
+                logger->info("    Edge {}: jj_new={}, kk_new={}, Ejk[{}]=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})", 
+                            e, jj_new[e], kk_new[e], e,
+                            Ejk[e](0, 0), Ejk[e](1, 0), Ejk[e](2, 0), Ejk[e](3, 0), Ejk[e](4, 0), Ejk[e](5, 0));
+            }
+        }
     }
     
     // Save STEP 10: Pose-structure coupling E

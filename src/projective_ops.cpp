@@ -500,122 +500,63 @@ void transformWithJacobians(
                 // ============================================================
                 // Project 3D point [X1_pix, Y1_pix, Z1_pix] to 2D pixel coordinates
                 //
-                // Check if point is behind camera (Z < 0.1) - reject if so
-                // Points behind camera indicate incorrect poses or transform
-                bool is_valid = (Z1_pix >= 0.1f);
+                // CRITICAL: Match Python behavior - allow all coords through, let BA handle validation
+                // Python's transform() function doesn't check bounds or reject points behind camera.
+                // It computes the projection formula even for invalid cases, then BA filters them later.
+                // We should do the same: allow all coords through here, BA will filter them.
                 
                 float u_pix, v_pix;
-                if (is_valid) {
-                    // Compute depth and inverse depth
-                    float z_pix = Z1_pix;      // Actual depth in frame j
-                    float d_pix = 1.0f / z_pix; // Inverse depth
+                
+                // Compute depth and inverse depth
+                // Use a small epsilon to prevent division by zero, but allow negative/small Z through
+                float z_pix = Z1_pix;
+                float d_pix = (std::abs(z_pix) > 1e-6f) ? (1.0f / z_pix) : 0.0f; // Handle near-zero Z
 
-                    // Project to pixel coordinates using pinhole camera model
-                    // Formula: u = fx * (X/Z) + cx, v = fy * (Y/Z) + cy
-                    float u_pix_computed = fx_j * (d_pix * X1_pix) + cx_j;  // X pixel coordinate
-                    float v_pix_computed = fy_j * (d_pix * Y1_pix) + cy_j;  // Y pixel coordinate
-                    
-                    // Check if computed values are finite before bounds check
-                    bool computed_is_finite = std::isfinite(u_pix_computed) && std::isfinite(v_pix_computed);
-                    
-                    // Diagnostic: Log computed values before bounds check
-                    if (log_first_pixel && y == 0 && x == 0 && logger) {
-                        logger->info("transformWithJacobians: Edge[0] projection computation - "
-                                     "z_pix={:.6f}, d_pix={:.6f}, "
-                                     "X1={:.6f}, Y1={:.6f}, Z1={:.6f}, "
-                                     "d_pix*X1={:.6f}, d_pix*Y1={:.6f}, "
-                                     "u_pix_computed={:.2f}, v_pix_computed={:.2f}, "
-                                     "computed_is_finite={}",
-                                     z_pix, d_pix,
-                                     X1_pix, Y1_pix, Z1_pix,
-                                     d_pix * X1_pix, d_pix * Y1_pix,
-                                     u_pix_computed, v_pix_computed,
-                                     computed_is_finite);
-                    }
+                // Project to pixel coordinates using pinhole camera model
+                // Formula: u = fx * (X/Z) + cx, v = fy * (Y/Z) + cy
+                // Python computes this even for negative/small Z, producing large or invalid coords
+                float u_pix_computed = fx_j * (d_pix * X1_pix) + cx_j;  // X pixel coordinate
+                float v_pix_computed = fy_j * (d_pix * Y1_pix) + cy_j;  // Y pixel coordinate
+                
+                // Check if computed values are finite
+                bool computed_is_finite = std::isfinite(u_pix_computed) && std::isfinite(v_pix_computed);
+                
+                // Diagnostic: Log computed values
+                if (log_first_pixel && y == 0 && x == 0 && logger) {
+                    logger->info("transformWithJacobians: Edge[0] projection computation - "
+                                 "z_pix={:.6f}, d_pix={:.6f}, "
+                                 "X1=({:.6f}, {:.6f}, {:.6f}), "
+                                 "u_pix_computed={:.2f}, v_pix_computed={:.2f}, "
+                                 "computed_is_finite={}",
+                                 z_pix, d_pix,
+                                 X1_pix, Y1_pix, Z1_pix,
+                                 u_pix_computed, v_pix_computed,
+                                 computed_is_finite);
+                }
 
-                    // Check if projection is reasonable (within reasonable bounds for feature map)
-                    // Feature map is at 1/4 resolution, so coordinates should be in [0, fmap_W] x [0, fmap_H]
-                    // For typical values: fmap_W=240, fmap_H=132 (for 1920x1080 input)
-                    // Note: We don't have direct access to fmap dimensions here, so use intrinsics-based estimate
-                    // 
-                    // CRITICAL: The principal point (cx, cy) at 1/4 resolution should be approximately at the center
-                    // of the feature map. However, there can be slight mismatches:
-                    // - If cx=240 and fmap_W=240, then cx is at the right edge (not center!)
-                    // - If cy=135 and fmap_H=132, then cy is slightly below center
-                    //
-                    // Better estimate: Use fx/fy to estimate image dimensions, then scale to 1/4 res
-                    // For a pinhole camera: image_width ≈ fx * 2 (if FOV is reasonable), image_height ≈ fy * 2
-                    // At 1/4 resolution: fmap_W ≈ fx/2, fmap_H ≈ fy/2
-                    // But we have cx, cy which are already at 1/4 res, so:
-                    // - If principal point is at center: fmap_W ≈ 2*cx, fmap_H ≈ 2*cy
-                    // - But actual values show: fmap_W ≈ cx (not 2*cx!), fmap_H < cy
-                    //
-                    // Use bounds that match actual feature map dimensions
-                    // For cx=120, cy=66 and fmap_W=240, fmap_H=132:
-                    // - cx is at the center of fmap_W, so fmap_W ≈ 2*cx (e.g., 2*120 = 240)
-                    // - cy is at the center of fmap_H, so fmap_H ≈ 2*cy (e.g., 2*66 = 132)
-                    // 
-                    // IMPORTANT: During camera motion (especially rotation), features can move significantly
-                    // across the image. We need to allow larger bounds to accommodate this motion.
-                    // However, coordinates too far out of bounds indicate incorrect poses or numerical issues.
-                    //
-                    // Strategy: Use fx/fy to estimate maximum possible coordinate range
-                    // For pinhole camera: coordinates can range from -fx to +fx (or more) depending on FOV
-                    // At 1/4 resolution: max coordinate ≈ fx (if principal point is at center)
-                    // But we also need to account for features moving during rotation
-                    // 
-                    // CRITICAL: Bounds must match actual feature map dimensions
-                    // If reprojections are out of bounds, it indicates incorrect poses, not that bounds are too strict
-                    // Allowing invalid reprojections through will cause BA to diverge
-                    // Use reasonable bounds based on feature map size (2*cx, 2*cy) with small margin for sub-pixel accuracy
-                    float margin_u = 20.0f;  // Small margin for sub-pixel accuracy and numerical errors
-                    float margin_v = 20.0f;  // Small margin for sub-pixel accuracy and numerical errors
-                    // Use 2*cx and 2*cy as estimate for feature map dimensions (principal point at center)
-                    float max_u = 2.0f * cx_j + margin_u;  // Feature map width estimate: 2*cx + margin (e.g., 2*120 + 20 = 260)
-                    float max_v = 2.0f * cy_j + margin_v;  // Feature map height estimate: 2*cy + margin (e.g., 2*67.5 + 20 = 155)
-                    // Also check minimum bounds (allow small negative for sub-pixel accuracy)
-                    float min_u = -10.0f;
-                    float min_v = -10.0f;
-                    
-                    bool out_of_bounds = (u_pix_computed < min_u || u_pix_computed > max_u || 
-                                         v_pix_computed < min_v || v_pix_computed > max_v);
-                    
-                    if (out_of_bounds || !computed_is_finite) {
-                        // Projection is way out of bounds or invalid - likely due to bad poses
-                        is_valid = false;
-                        u_pix = std::numeric_limits<float>::quiet_NaN();
-                        v_pix = std::numeric_limits<float>::quiet_NaN();
-                        if (log_first_pixel && y == 0 && x == 0 && logger) {
-                            logger->warn("transformWithJacobians: Edge[0] projection out of reasonable bounds - "
-                                         "u_pix_computed={:.2f}, v_pix_computed={:.2f}, "
-                                         "max_u={:.2f}, max_v={:.2f}, "
-                                         "out_of_bounds={}, computed_is_finite={}. "
-                                         "X1=({:.6f}, {:.6f}, {:.6f}), d_pix={:.6f}. "
-                                         "This suggests poses may be incorrect.",
-                                         u_pix_computed, v_pix_computed,
-                                         max_u, max_v,
-                                         out_of_bounds, computed_is_finite,
-                                         X1_pix, Y1_pix, Z1_pix, d_pix);
-                        }
-                    } else {
-                        u_pix = u_pix_computed;
-                        v_pix = v_pix_computed;
-                        // Diagnostic: Log valid projection
-                        if (log_first_pixel && y == 0 && x == 0 && logger) {
-                            logger->info("transformWithJacobians: Edge[0] projection - "
-                                         "z_pix={:.6f}, d_pix={:.6f}, u_pix={:.2f}, v_pix={:.2f}",
-                                         z_pix, d_pix, u_pix, v_pix);
-                        }
-                    }
-                } else {
-                    // Point is behind camera or too close
+                // Only reject if the computed values are not finite (NaN/Inf)
+                // Allow all finite coords through (even if out of bounds or behind camera) - BA will filter them
+                if (!computed_is_finite) {
+                    // Invalid computed values (NaN/Inf) - mark as invalid
                     u_pix = std::numeric_limits<float>::quiet_NaN();
                     v_pix = std::numeric_limits<float>::quiet_NaN();
                     if (log_first_pixel && y == 0 && x == 0 && logger) {
-                        logger->warn("transformWithJacobians: Edge[0] point behind camera - "
-                                     "Z1={:.6f} < 0.1, X1=({:.2f}, {:.2f}, {:.2f}). "
-                                     "This indicates incorrect poses or transform.",
-                                     Z1_pix, X1_pix, Y1_pix, Z1_pix);
+                        logger->warn("transformWithJacobians: Edge[0] projection has NaN/Inf - "
+                                     "u_pix_computed={:.2f}, v_pix_computed={:.2f}, "
+                                     "X1=({:.6f}, {:.6f}, {:.6f}), d_pix={:.6f}. "
+                                     "This suggests numerical issues.",
+                                     u_pix_computed, v_pix_computed,
+                                     X1_pix, Y1_pix, Z1_pix, d_pix);
+                    }
+                } else {
+                    // Allow all finite coords through (even if out of bounds or behind camera) - BA will filter them
+                    u_pix = u_pix_computed;
+                    v_pix = v_pix_computed;
+                    // Diagnostic: Log projection (including out-of-bounds ones)
+                    if (log_first_pixel && y == 0 && x == 0 && logger) {
+                        logger->info("transformWithJacobians: Edge[0] projection - "
+                                     "z_pix={:.6f}, d_pix={:.6f}, u_pix={:.2f}, v_pix={:.2f}",
+                                     z_pix, d_pix, u_pix, v_pix);
                     }
                 }
 
@@ -623,9 +564,12 @@ void transformWithJacobians(
                 coords_out[base + 0 * P * P + idx] = u_pix;
                 coords_out[base + 1 * P * P + idx] = v_pix;
                 
-                // Validity: Z > 0.2 and projection is valid
+                // Validity: Match Python behavior - mark as valid if coords are finite
+                // Python's transform() marks all finite coords as valid, BA filters them later
+                // We do the same: mark as valid if coords are finite (not NaN/Inf)
                 if (valid_out) {
-                    valid_out[e * P * P + idx] = (is_valid && Z1_pix > 0.2f) ? 1.0f : 0.0f;
+                    bool coords_finite = std::isfinite(u_pix) && std::isfinite(v_pix);
+                    valid_out[e * P * P + idx] = coords_finite ? 1.0f : 0.0f;
                 }
             }
         }

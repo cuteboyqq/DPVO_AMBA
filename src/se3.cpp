@@ -295,22 +295,32 @@ Eigen::Matrix<float, 6, 1> SE3::adjoint(const Eigen::Matrix<float, 6, 1>& v) con
 
 // -----------------------------
 // Adjoint transpose: Ad_g^T(J) for SE3
-// Ad_g^T = [R^T    -R^T * [t]_×]
-//          [0      R^T     ]
+// Python computes: Adj().transpose() where Adj() = [R, tx*R; 0, R]
+// Adj().transpose() = [R^T, 0; (tx*R)^T, R^T] = [R^T, 0; -R^T*tx, R^T]
+// 
+// Previous C++ implementation built: [R^T, -R^T*tx; 0, R^T] (transpose of Python's)
+// This caused Ji mismatch. Fix: compute Adj() first, then transpose to match Python.
 // -----------------------------
 Eigen::Matrix<float, 2, 6> SE3::adjointT(const Eigen::Matrix<float, 2, 6>& J) const {
     Eigen::Matrix3f R_mat = R();
-    Eigen::Matrix3f R_T = R_mat.transpose();
     Eigen::Matrix3f t_skew = skew(t);
-    Eigen::Matrix3f neg_RT_t_skew = -R_T * t_skew;
+    Eigen::Matrix3f tx_R = t_skew * R_mat;  // tx*R where tx = hat(t)
     
-    // Ad_g^T is [6, 6] matrix
-    Eigen::Matrix<float, 6, 6> Ad_T;
-    Ad_T.block<3,3>(0,0) = R_T;
-    Ad_T.block<3,3>(0,3) = neg_RT_t_skew;
-    Ad_T.block<3,3>(3,0) = Eigen::Matrix3f::Zero();
-    Ad_T.block<3,3>(3,3) = R_T;
+    // Build Adj() matrix: [R, tx*R; 0, R] (matching Python lietorch)
+    Eigen::Matrix<float, 6, 6> Adj;
+    Adj.block<3,3>(0,0) = R_mat;
+    Adj.block<3,3>(0,3) = tx_R;
+    Adj.block<3,3>(3,0) = Eigen::Matrix3f::Zero();
+    Adj.block<3,3>(3,3) = R_mat;
     
-    // J * Ad_g^T: [2,6] * [6,6] = [2,6]
-    return J * Ad_T;
+    // Compute Adj().transpose() to match Python: [R^T, 0; -R^T*tx, R^T]
+    Eigen::Matrix<float, 6, 6> Adj_T = Adj.transpose();
+    
+    // Python's adjT computes: (AdjT @ J^T)^T instead of J @ AdjT
+    // This applies the adjoint transpose operator to each row of J
+    // (AdjT @ J^T)^T = J @ AdjT^T = J @ Adj (since AdjT = Adj^T)
+    // But empirically, Python uses: (AdjT @ J^T)^T
+    Eigen::Matrix<float, 6, 2> J_transpose = J.transpose();  // [6, 2]
+    Eigen::Matrix<float, 6, 2> result = Adj_T * J_transpose;  // [6, 6] * [6, 2] = [6, 2]
+    return result.transpose();  // [2, 6]
 }
