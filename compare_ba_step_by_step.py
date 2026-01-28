@@ -1676,38 +1676,33 @@ def compare_final_outputs(poses_py_updated, N):
     q_max_diffs = q_diffs.max(dim=1)[0]  # [N] - max quaternion diff per pose
     q_mean_diffs = q_diffs.mean(dim=1)   # [N] - mean quaternion diff per pose
     
-    # Print table header
-    print("\n📊 Final Pose Comparison Table:")
-    print("   t_max: max translation diff (across x,y,z)")
-    print("   t_mean: mean translation diff (avg of x,y,z)")
-    print("   q_max: max quaternion diff (across 4 components)")
-    print("   q_mean: mean quaternion diff (avg of 4 components)")
-    print("=" * 150)
-    print(f"{'Pose':<6} {'t_max':<12} {'t_mean':<12} {'q_max':<12} {'q_mean':<12} {'Status':<10} {'C++ Translation':<45} {'Python Translation':<45}")
-    print("-" * 150)
-    
-    match_count = 0
-    mismatch_count = 0
     rtol = 1e-2
     atol = 1e-3
+    
+    # ========== TRANSLATION TABLE ==========
+    print("\n📊 Final Pose Comparison - Translation:")
+    print("   t_max: max translation diff (across x,y,z)")
+    print("   t_mean: mean translation diff (avg of x,y,z)")
+    print("=" * 120)
+    print(f"{'Pose':<6} {'t_max':<15} {'t_mean':<15} {'Status':<12} {'C++ Translation (x, y, z)':<50} {'Python Translation (x, y, z)':<50}")
+    print("-" * 120)
+    
+    t_match_count = 0
+    t_mismatch_count = 0
     
     for i in range(N):
         t_max = t_max_diffs[i].item()
         t_mean = t_mean_diffs[i].item()
-        q_max = q_max_diffs[i].item()
-        q_mean = q_mean_diffs[i].item()
         
-        # Check if pose matches
+        # Check if translation matches
         t_match = torch.allclose(poses_cpp_torch[i, :3], poses_py_torch[i, :3], rtol=rtol, atol=atol)
-        q_match = torch.allclose(poses_cpp_torch[i, 3:], poses_py_torch[i, 3:], rtol=rtol, atol=atol)
-        is_match = t_match and q_match
         
-        if is_match:
-            status = "✅ MATCH"
-            match_count += 1
+        if t_match:
+            t_status = "✅ MATCH"
+            t_match_count += 1
         else:
-            status = "❌ DIFF"
-            mismatch_count += 1
+            t_status = "❌ DIFF"
+            t_mismatch_count += 1
         
         # Format translation values
         t_cpp = poses_cpp_torch[i, :3].cpu().numpy()
@@ -1718,12 +1713,60 @@ def compare_final_outputs(poses_py_updated, N):
         # Format differences
         t_max_str = f"{t_max:.6f}" if t_max < 1.0 else f"{t_max:.4f}"
         t_mean_str = f"{t_mean:.6f}" if t_mean < 1.0 else f"{t_mean:.4f}"
+        
+        print(f"{i:<6} {t_max_str:<15} {t_mean_str:<15} {t_status:<12} {t_cpp_str:<50} {t_py_str:<50}")
+    
+    print("=" * 120)
+    
+    # ========== ROTATION TABLE ==========
+    print("\n📊 Final Pose Comparison - Rotation (Quaternion):")
+    print("   q_max: max quaternion diff (across 4 components)")
+    print("   q_mean: mean quaternion diff (avg of 4 components)")
+    print("=" * 140)
+    print(f"{'Pose':<6} {'q_max':<15} {'q_mean':<15} {'Status':<12} {'C++ Rotation (qx, qy, qz, qw)':<60} {'Python Rotation (qx, qy, qz, qw)':<60}")
+    print("-" * 140)
+    
+    q_match_count = 0
+    q_mismatch_count = 0
+    
+    for i in range(N):
+        q_max = q_max_diffs[i].item()
+        q_mean = q_mean_diffs[i].item()
+        
+        # Check if rotation matches
+        q_match = torch.allclose(poses_cpp_torch[i, 3:], poses_py_torch[i, 3:], rtol=rtol, atol=atol)
+        
+        if q_match:
+            q_status = "✅ MATCH"
+            q_match_count += 1
+        else:
+            q_status = "❌ DIFF"
+            q_mismatch_count += 1
+        
+        # Format quaternion/rotation values
+        q_cpp = poses_cpp_torch[i, 3:].cpu().numpy()
+        q_py = poses_py_torch[i, 3:].cpu().numpy()
+        q_cpp_str = f"[{q_cpp[0]:8.4f}, {q_cpp[1]:8.4f}, {q_cpp[2]:8.4f}, {q_cpp[3]:8.4f}]"
+        q_py_str = f"[{q_py[0]:8.4f}, {q_py[1]:8.4f}, {q_py[2]:8.4f}, {q_py[3]:8.4f}]"
+        
+        # Format differences
         q_max_str = f"{q_max:.6f}" if q_max < 1.0 else f"{q_max:.4f}"
         q_mean_str = f"{q_mean:.6f}" if q_mean < 1.0 else f"{q_mean:.4f}"
         
-        print(f"{i:<6} {t_max_str:<12} {t_mean_str:<12} {q_max_str:<12} {q_mean_str:<12} {status:<10} {t_cpp_str:<45} {t_py_str:<45}")
+        print(f"{i:<6} {q_max_str:<15} {q_mean_str:<15} {q_status:<12} {q_cpp_str:<60} {q_py_str:<60}")
     
-    print("=" * 150)
+    print("=" * 140)
+    
+    # Overall match count (both translation and rotation must match)
+    match_count = 0
+    mismatch_count = 0
+    for i in range(N):
+        t_match = torch.allclose(poses_cpp_torch[i, :3], poses_py_torch[i, :3], rtol=rtol, atol=atol)
+        q_match = torch.allclose(poses_cpp_torch[i, 3:], poses_py_torch[i, 3:], rtol=rtol, atol=atol)
+        if t_match and q_match:
+            match_count += 1
+        else:
+            mismatch_count += 1
     
     # Print summary statistics
     print(f"\n📈 Pose Comparison Summary:")
