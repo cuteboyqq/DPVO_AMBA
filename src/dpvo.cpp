@@ -15,6 +15,7 @@
 #include "correlation_kernel.hpp"
 #include "ba_file_io.hpp"  // BA file I/O utilities
 #include "correlation_file_io.hpp"  // Correlation file I/O utilities
+#include "update_file_io.hpp"  // Update model file I/O utilities
 #include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -1026,10 +1027,10 @@ void DPVO::update()
     // Save correlation inputs and outputs for comparison with Python when TARGET_FRAME matches
     if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
         // Get correlation parameters - must match correlation_kernel.cpp
-        // Note: correlation_kernel.cpp computeCorrelation uses R=2, D=2*R+1=5 (matches Python)
-        // This matches the values in correlation_kernel.cpp line 697-698 (updated to R=2, D=5)
-        const int R = 2;  // Correlation radius (matches Python)
-        const int D = 2 * R + 1;  // Correlation window diameter (D = 5 for R=2)
+        // Note: Python uses altcorr.corr(..., 3), so radius=3
+        // correlation_kernel.cpp computeCorrelation uses the radius parameter passed in
+        const int R = 3;  // Correlation radius (matches Python: altcorr.corr(..., 3))
+        const int D = 2 * R + 1;  // Correlation window diameter (D = 7 for R=3, matches Python output)
         
         correlation_file_io::save_correlation_data(
             m_counter,
@@ -1295,24 +1296,45 @@ void DPVO::update()
             logger->info("DPVO::update: Input data ready - net_input size={}, inp_input size={}, corr_input size={}",
                          m_reshape_net_input.size(), m_reshape_inp_input.size(), m_reshape_corr_input.size());
         }
-        // Save metadata for update model inputs/outputs when TARGET_FRAME matches
+        // Save metadata and inputs for update model when TARGET_FRAME matches
         if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
             const int CORR_DIM = 882;
             const int DIM = 384;
             std::string frame_suffix = std::to_string(TARGET_FRAME);
-            std::string metadata_filename = "update_metadata_frame" + frame_suffix + ".txt";
             
-            std::ofstream meta_file(metadata_filename);
-            if (meta_file.is_open()) {
-                meta_file << "frame=" << m_counter << "\n";
-                meta_file << "num_active=" << num_active << "\n";
-                meta_file << "MAX_EDGE=" << m_maxEdge << "\n";
-                meta_file << "DIM=" << DIM << "\n";
-                meta_file << "CORR_DIM=" << CORR_DIM << "\n";
-                meta_file.close();
-                if (logger) {
-                    logger->info("[DPVO::update] Saved update model metadata to {}", metadata_filename);
-                }
+            // Save metadata
+            std::string metadata_filename = "update_metadata_frame" + frame_suffix + ".txt";
+            update_file_io::save_metadata(metadata_filename, m_counter, num_active, m_maxEdge, 
+                                         DIM, CORR_DIM, logger);
+            
+            // Save update model inputs for Python comparison
+            std::string net_input_filename = "update_net_input_frame" + frame_suffix + ".bin";
+            std::string inp_input_filename = "update_inp_input_frame" + frame_suffix + ".bin";
+            std::string corr_input_filename = "update_corr_input_frame" + frame_suffix + ".bin";
+            std::string ii_input_filename = "update_ii_input_frame" + frame_suffix + ".bin";
+            std::string jj_input_filename = "update_jj_input_frame" + frame_suffix + ".bin";
+            std::string kk_input_filename = "update_kk_input_frame" + frame_suffix + ".bin";
+            
+            // Save float inputs
+            update_file_io::save_net_input(net_input_filename, m_reshape_net_input.data(), 
+                                          DIM, m_maxEdge, logger);
+            update_file_io::save_inp_input(inp_input_filename, m_reshape_inp_input.data(), 
+                                          DIM, m_maxEdge, logger);
+            update_file_io::save_corr_input(corr_input_filename, m_reshape_corr_input.data(), 
+                                           CORR_DIM, m_maxEdge, logger);
+            
+            // Save index inputs (convert from float to int32)
+            update_file_io::save_index_input(ii_input_filename, m_reshape_ii_input.data(), 
+                                             m_maxEdge, logger, "ii");
+            update_file_io::save_index_input(jj_input_filename, m_reshape_jj_input.data(), 
+                                             m_maxEdge, logger, "jj");
+            update_file_io::save_index_input(kk_input_filename, m_reshape_kk_input.data(), 
+                                             m_maxEdge, logger, "kk");
+            
+            if (logger) {
+                logger->info("[DPVO::update] Saved update model inputs for frame {}: {}, {}, {}, {}, {}, {}", 
+                            TARGET_FRAME, net_input_filename, inp_input_filename, corr_input_filename,
+                            ii_input_filename, jj_input_filename, kk_input_filename);
             }
         }
         
@@ -1360,6 +1382,32 @@ void DPVO::update()
         if (inference_success)
         {
             if (logger) logger->info("DPVO::update: runInference returned true, extracting outputs");
+            
+            // Save update model outputs when TARGET_FRAME matches
+            if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
+                const int DIM = 384;
+                std::string frame_suffix = std::to_string(TARGET_FRAME);
+                std::string net_out_filename = "update_net_out_cpp_frame" + frame_suffix + ".bin";
+                std::string d_out_filename = "update_d_out_cpp_frame" + frame_suffix + ".bin";
+                std::string w_out_filename = "update_w_out_cpp_frame" + frame_suffix + ".bin";
+                
+                // Save outputs using utility functions
+                if (pred.netOutBuff != nullptr) {
+                    update_file_io::save_net_output(net_out_filename, pred.netOutBuff, DIM, m_maxEdge, logger);
+                }
+                if (pred.dOutBuff != nullptr) {
+                    update_file_io::save_d_output(d_out_filename, pred.dOutBuff, m_maxEdge, logger);
+                }
+                if (pred.wOutBuff != nullptr) {
+                    update_file_io::save_w_output(w_out_filename, pred.wOutBuff, m_maxEdge, logger);
+                }
+                
+                if (logger) {
+                    logger->info("[DPVO::update] Saved update model outputs for frame {}: {}, {}, {}", 
+                                TARGET_FRAME, net_out_filename, d_out_filename, w_out_filename);
+                }
+            }
+            
             // Extract outputs: net_out [1, 384, 384, 1], d_out [1, 2, 384, 1], w_out [1, 2, 384, 1]
             // d_out contains delta: [1, 2, 384, 1] -> [num_edges, 2]
             // w_out contains weight: [1, 2, 384, 1] -> we'll use first channel

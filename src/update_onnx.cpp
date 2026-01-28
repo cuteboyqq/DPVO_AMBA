@@ -2,8 +2,6 @@
 #include "onnx_env.hpp"
 #include "dla_config.hpp"
 #include "logger.hpp"
-#include "update_file_io.hpp"  // Update model file I/O utilities
-#include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -319,38 +317,6 @@ bool DPVOUpdateONNX::runInference(float* netData, float* inpData, float* corrDat
         std::memcpy(pred.wOutBuff, w_out_data, m_wOutBufferSize * sizeof(float));
         
         pred.isProcessed = true;
-        
-        // Save inputs and outputs for comparison with Python when TARGET_FRAME matches
-        if (TARGET_FRAME >= 0 && frameIdx == TARGET_FRAME) {
-            std::string frame_suffix = std::to_string(TARGET_FRAME);
-            
-            // Save inputs
-            update_file_io::save_float_array("update_net_input_frame" + frame_suffix + ".bin",
-                                             input_data[0].data(), input_data[0].size(), logger, "net_input");
-            update_file_io::save_float_array("update_inp_input_frame" + frame_suffix + ".bin",
-                                             input_data[1].data(), input_data[1].size(), logger, "inp_input");
-            update_file_io::save_float_array("update_corr_input_frame" + frame_suffix + ".bin",
-                                             input_data[2].data(), input_data[2].size(), logger, "corr_input");
-            update_file_io::save_int32_array("update_ii_input_frame" + frame_suffix + ".bin",
-                                            ii_int32.data(), ii_int32.size(), logger, "ii_input");
-            update_file_io::save_int32_array("update_jj_input_frame" + frame_suffix + ".bin",
-                                            jj_int32.data(), jj_int32.size(), logger, "jj_input");
-            update_file_io::save_int32_array("update_kk_input_frame" + frame_suffix + ".bin",
-                                            kk_int32.data(), kk_int32.size(), logger, "kk_input");
-            
-            // Save outputs
-            update_file_io::save_output("update_net_out_cpp_frame" + frame_suffix + ".bin",
-                                       pred.netOutBuff, m_netOutBufferSize, logger, "net_out");
-            update_file_io::save_output("update_d_out_cpp_frame" + frame_suffix + ".bin",
-                                       pred.dOutBuff, m_dOutBufferSize, logger, "d_out");
-            update_file_io::save_output("update_w_out_cpp_frame" + frame_suffix + ".bin",
-                                       pred.wOutBuff, m_wOutBufferSize, logger, "w_out");
-            
-            if (logger) {
-                logger->info("[DPVOUpdateONNX] Saved inputs and outputs for frame {} (TARGET_FRAME={})", 
-                            frameIdx, TARGET_FRAME);
-            }
-        }
         
         if (logger) {
             logger->info("\033[33mDPVOUpdateONNX: Inference successful. Frame: {}\033[0m", frameIdx);

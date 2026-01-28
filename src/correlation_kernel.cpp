@@ -269,8 +269,9 @@ void patchify_cpu_safe(
 //
 // Correlation Window:
 //   - Radius R = 3 (searches ±3 pixels around reprojected location)
-//   - Window size D = 2*R + 2 = 8
-//   - For each pixel in patch, computes correlation at 8×8 offsets
+//   - Window size D = 2*R + 1 = 7 (matches Python's final output after bilinear interpolation)
+//   - For each pixel in patch, computes correlation at 7×7 offsets
+//   - Note: Python's CUDA kernel uses D = 2*R + 2 = 8 internally, then reduces to D = 7 via bilinear interpolation
 //
 // Coordinate Scaling:
 //   - Reprojected coords are at 1/4 resolution
@@ -319,7 +320,9 @@ void computeCorrelationSingle(
     }
     
     const int R = radius;
-    const int D = 2 * R + 2;  // Correlation window diameter (D = 8 for R=3)
+    // Note: Python's CUDA kernel uses D = 2*R + 2 internally, then reduces to D = 2*R + 1 via bilinear interpolation
+    // C++ directly computes D = 2*R + 1 to match Python's final output (no bilinear interpolation needed)
+    const int D = 2 * R + 1;  // Correlation window diameter (D = 7 for R=3, matches Python final output)
     
     // gmap structure: created by patchify_cpu_safe with radius=1, so D_gmap=3 (matches Python)
     const int D_gmap = 3;  // D_gmap = 2*radius + 1 = 3 (matches Python: .view(..., P, P) where P=3)
@@ -548,6 +551,8 @@ void computeCorrelationSingle(
                         }
                         
                         // Compute correlation: dot product over features (matches CUDA)
+                        // Note: Python's grid_sample returns 0 for out-of-bounds coordinates
+                        // C++ matches this behavior by checking bounds and leaving sum=0.0f for out-of-bounds
                         float sum = 0.0f;
                         bool in_bounds = within_bounds(i1, j1, fmap_H, fmap_W);
                         if (in_bounds) {
@@ -695,7 +700,9 @@ void computeCorrelation(
     }
     
     const int R = 3;  // Correlation radius (matches Python: altcorr.corr(..., 3))
-    const int D = 2 * R + 2;  // Correlation window diameter (D = 8 for R=3)
+    // Note: Python's CUDA kernel uses D = 2*R + 2 internally, then reduces to D = 2*R + 1 via bilinear interpolation
+    // C++ directly computes D = 2*R + 1 to match Python's final output (no bilinear interpolation needed)
+    const int D = 2 * R + 1;  // Correlation window diameter (D = 7 for R=3, matches Python final output)
     
     // Map indices (matches Python: ii1 = kk % (M * pmem), jj1 = jj % mem)
     std::vector<int> ii1(num_active);
