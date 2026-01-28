@@ -21,10 +21,30 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <cmath>
 #include <fstream>
+#include <sys/stat.h>  // For mkdir
+#include <sys/types.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// Helper function to get bin_file directory path and ensure it exists
+static std::string get_bin_file_path(const std::string& filename) {
+    const std::string bin_dir = "bin_file";
+    
+    // Create directory if it doesn't exist
+    struct stat info;
+    if (stat(bin_dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        #ifdef _WIN32
+        mkdir(bin_dir.c_str());
+        #else
+        mkdir(bin_dir.c_str(), 0755);
+        #endif
+    }
+    
+    return bin_dir + "/" + filename;
+}
 
 static_assert(sizeof(((PatchGraph*)0)->m_index[0]) ==
               sizeof(int) * PatchGraph::M,
@@ -971,6 +991,16 @@ void DPVO::update()
                 logger->info("  Edge[{}]: coords=({:.6f}, {:.6f})", e, cx, cy);
             }
         }
+        
+        // Save full reproject outputs for Python comparison
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        std::string reproject_coords_filename = get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin");
+        ba_file_io::save_reprojected_coords_full(reproject_coords_filename, coords.data(), 
+                                                 num_active, P, logger);
+        if (logger) {
+            logger->info("[DPVO::update] Saved reproject outputs for frame {}: {}", 
+                        TARGET_FRAME, reproject_coords_filename);
+        }
     }
 
     // -------------------------------------------------
@@ -1303,17 +1333,17 @@ void DPVO::update()
             std::string frame_suffix = std::to_string(TARGET_FRAME);
             
             // Save metadata
-            std::string metadata_filename = "update_metadata_frame" + frame_suffix + ".txt";
+            std::string metadata_filename = get_bin_file_path("update_metadata_frame" + frame_suffix + ".txt");
             update_file_io::save_metadata(metadata_filename, m_counter, num_active, m_maxEdge, 
                                          DIM, CORR_DIM, logger);
             
             // Save update model inputs for Python comparison
-            std::string net_input_filename = "update_net_input_frame" + frame_suffix + ".bin";
-            std::string inp_input_filename = "update_inp_input_frame" + frame_suffix + ".bin";
-            std::string corr_input_filename = "update_corr_input_frame" + frame_suffix + ".bin";
-            std::string ii_input_filename = "update_ii_input_frame" + frame_suffix + ".bin";
-            std::string jj_input_filename = "update_jj_input_frame" + frame_suffix + ".bin";
-            std::string kk_input_filename = "update_kk_input_frame" + frame_suffix + ".bin";
+            std::string net_input_filename = get_bin_file_path("update_net_input_frame" + frame_suffix + ".bin");
+            std::string inp_input_filename = get_bin_file_path("update_inp_input_frame" + frame_suffix + ".bin");
+            std::string corr_input_filename = get_bin_file_path("update_corr_input_frame" + frame_suffix + ".bin");
+            std::string ii_input_filename = get_bin_file_path("update_ii_input_frame" + frame_suffix + ".bin");
+            std::string jj_input_filename = get_bin_file_path("update_jj_input_frame" + frame_suffix + ".bin");
+            std::string kk_input_filename = get_bin_file_path("update_kk_input_frame" + frame_suffix + ".bin");
             
             // Save float inputs
             update_file_io::save_net_input(net_input_filename, m_reshape_net_input.data(), 
@@ -1387,9 +1417,9 @@ void DPVO::update()
             if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
                 const int DIM = 384;
                 std::string frame_suffix = std::to_string(TARGET_FRAME);
-                std::string net_out_filename = "update_net_out_cpp_frame" + frame_suffix + ".bin";
-                std::string d_out_filename = "update_d_out_cpp_frame" + frame_suffix + ".bin";
-                std::string w_out_filename = "update_w_out_cpp_frame" + frame_suffix + ".bin";
+                std::string net_out_filename = get_bin_file_path("update_net_out_cpp_frame" + frame_suffix + ".bin");
+                std::string d_out_filename = get_bin_file_path("update_d_out_cpp_frame" + frame_suffix + ".bin");
+                std::string w_out_filename = get_bin_file_path("update_w_out_cpp_frame" + frame_suffix + ".bin");
                 
                 // Save outputs using utility functions
                 if (pred.netOutBuff != nullptr) {
@@ -1613,20 +1643,20 @@ void DPVO::update()
         const int P = m_P;
         
         // Save BA inputs using utility functions
-        ba_file_io::save_poses("ba_poses.bin", m_pg.m_poses, N, logger);
-        ba_file_io::save_patches("ba_patches.bin", m_pg.m_patches, N, M, P, logger);
-        ba_file_io::save_intrinsics("ba_intrinsics.bin", m_pg.m_intrinsics, N, logger);
-        ba_file_io::save_edge_indices("ba_ii.bin", "ba_jj.bin", "ba_kk.bin", 
+        ba_file_io::save_poses(get_bin_file_path("ba_poses.bin"), m_pg.m_poses, N, logger);
+        ba_file_io::save_patches(get_bin_file_path("ba_patches.bin"), m_pg.m_patches, N, M, P, logger);
+        ba_file_io::save_intrinsics(get_bin_file_path("ba_intrinsics.bin"), m_pg.m_intrinsics, N, logger);
+        ba_file_io::save_edge_indices(get_bin_file_path("ba_ii.bin"), get_bin_file_path("ba_jj.bin"), get_bin_file_path("ba_kk.bin"), 
                                       m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
-        ba_file_io::save_reprojected_coords_center("ba_reprojected_coords.bin", coords.data(), 
+        ba_file_io::save_reprojected_coords_center(get_bin_file_path("ba_reprojected_coords.bin"), coords.data(), 
                                                    num_active, P, logger);
-        ba_file_io::save_targets("ba_targets.bin", m_pg.m_target, num_active, logger);
-        ba_file_io::save_weights("ba_weights.bin", m_pg.m_weight, num_active, logger);
+        ba_file_io::save_targets(get_bin_file_path("ba_targets.bin"), m_pg.m_target, num_active, logger);
+        ba_file_io::save_weights(get_bin_file_path("ba_weights.bin"), m_pg.m_weight, num_active, logger);
         
         // Save metadata
         const int CORR_DIM = 882;  // 2*49*P*P = 2*49*3*3 = 882 for P=3
         const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
-        ba_file_io::save_metadata("test_metadata.txt", num_active, MAX_EDGE, m_DIM, 
+        ba_file_io::save_metadata(get_bin_file_path("test_metadata.txt"), num_active, MAX_EDGE, m_DIM, 
                                   CORR_DIM, M, P, N, logger);
     }
     
@@ -1642,7 +1672,7 @@ void DPVO::update()
             
             const int N = m_pg.m_n;
             // Save BA outputs (updated poses) using utility function
-            ba_file_io::save_poses("ba_poses_cpp.bin", m_pg.m_poses, N, logger);
+            ba_file_io::save_poses(get_bin_file_path("ba_poses_cpp.bin"), m_pg.m_poses, N, logger);
         }
         
         // Sync optimized poses from sliding window (m_pg.m_poses) back to historical buffer (m_allPoses)
@@ -2187,6 +2217,20 @@ void DPVO::reproject(
     float* intrinsics_flat = &m_pg.m_intrinsics[0][0];
 
     const int P = m_P;
+    
+    // Save patches right before reproject to ensure consistency with reproject output
+    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
+        auto logger = spdlog::get("dpvo");
+        const int N = m_pg.m_n;
+        const int M = m_cfg.PATCHES_PER_FRAME;
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        std::string patches_filename = get_bin_file_path("reproject_patches_frame" + frame_suffix + ".bin");
+        ba_file_io::save_patches(patches_filename, m_pg.m_patches, N, M, P, logger);
+        if (logger) {
+            logger->info("[DPVO::reproject] Saved patches for reproject comparison (frame {}): {}", 
+                        TARGET_FRAME, patches_filename);
+        }
+    }
     
     // Allocate temporary buffers if Jacobians are not provided
     // This allows the function to work even when Jacobians are not needed

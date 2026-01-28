@@ -9,6 +9,7 @@ runs Python ONNX inference with the same inputs, and compares the outputs.
 import numpy as np
 import onnxruntime as ort
 import sys
+import os
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
@@ -34,7 +35,8 @@ def load_binary_file(filename: str, dtype: np.dtype = np.float32) -> np.ndarray:
 
 def load_metadata(frame: int) -> Dict[str, int]:
     """Load update model metadata from text file."""
-    metadata_file = f"update_metadata_frame{frame}.txt"
+    bin_dir = "bin_file"
+    metadata_file = os.path.join(bin_dir, f"update_metadata_frame{frame}.txt")
     if not Path(metadata_file).exists():
         raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
     
@@ -217,13 +219,14 @@ def main() -> int:
     # Load C++ inputs
     print("\n📥 Loading C++ inputs...")
     frame_suffix = str(frame)
+    bin_dir = "bin_file"
     try:
-        net_input_cpp = load_binary_file(f"update_net_input_frame{frame_suffix}.bin")
-        inp_input_cpp = load_binary_file(f"update_inp_input_frame{frame_suffix}.bin")
-        corr_input_cpp = load_binary_file(f"update_corr_input_frame{frame_suffix}.bin")
-        ii_input_cpp = load_binary_file(f"update_ii_input_frame{frame_suffix}.bin", dtype=np.int32)
-        jj_input_cpp = load_binary_file(f"update_jj_input_frame{frame_suffix}.bin", dtype=np.int32)
-        kk_input_cpp = load_binary_file(f"update_kk_input_frame{frame_suffix}.bin", dtype=np.int32)
+        net_input_cpp = load_binary_file(os.path.join(bin_dir, f"update_net_input_frame{frame_suffix}.bin"))
+        inp_input_cpp = load_binary_file(os.path.join(bin_dir, f"update_inp_input_frame{frame_suffix}.bin"))
+        corr_input_cpp = load_binary_file(os.path.join(bin_dir, f"update_corr_input_frame{frame_suffix}.bin"))
+        ii_input_cpp = load_binary_file(os.path.join(bin_dir, f"update_ii_input_frame{frame_suffix}.bin"), dtype=np.int32)
+        jj_input_cpp = load_binary_file(os.path.join(bin_dir, f"update_jj_input_frame{frame_suffix}.bin"), dtype=np.int32)
+        kk_input_cpp = load_binary_file(os.path.join(bin_dir, f"update_kk_input_frame{frame_suffix}.bin"), dtype=np.int32)
         
         print(f"  ✅ Loaded all input files")
         print(f"    net_input: {net_input_cpp.shape} (expected: {1 * DIM * MAX_EDGE * 1})")
@@ -294,17 +297,18 @@ def main() -> int:
     
     # Save Python outputs
     print("\n💾 Saving Python outputs...")
-    net_out_py.flatten().astype(np.float32).tofile(f"update_net_out_py_frame{frame_suffix}.bin")
-    d_out_py.flatten().astype(np.float32).tofile(f"update_d_out_py_frame{frame_suffix}.bin")
-    w_out_py.flatten().astype(np.float32).tofile(f"update_w_out_py_frame{frame_suffix}.bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    net_out_py.flatten().astype(np.float32).tofile(os.path.join(bin_dir, f"update_net_out_py_frame{frame_suffix}.bin"))
+    d_out_py.flatten().astype(np.float32).tofile(os.path.join(bin_dir, f"update_d_out_py_frame{frame_suffix}.bin"))
+    w_out_py.flatten().astype(np.float32).tofile(os.path.join(bin_dir, f"update_w_out_py_frame{frame_suffix}.bin"))
     print("  ✅ Saved Python outputs")
     
     # Load C++ outputs
     print("\n📥 Loading C++ outputs...")
     try:
-        net_out_cpp = load_binary_file(f"update_net_out_cpp_frame{frame_suffix}.bin")
-        d_out_cpp = load_binary_file(f"update_d_out_cpp_frame{frame_suffix}.bin")
-        w_out_cpp = load_binary_file(f"update_w_out_cpp_frame{frame_suffix}.bin")
+        net_out_cpp = load_binary_file(os.path.join(bin_dir, f"update_net_out_cpp_frame{frame_suffix}.bin"))
+        d_out_cpp = load_binary_file(os.path.join(bin_dir, f"update_d_out_cpp_frame{frame_suffix}.bin"))
+        w_out_cpp = load_binary_file(os.path.join(bin_dir, f"update_w_out_cpp_frame{frame_suffix}.bin"))
         print("  ✅ Loaded all C++ output files")
     except FileNotFoundError as e:
         print(f"❌ Error: {e}")

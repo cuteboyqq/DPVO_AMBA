@@ -403,8 +403,9 @@ def parse_arguments() -> Tuple[str, str, str, str, str, bool]:
     # Optional: C++ output file names (default to frame0)
     # Skip --video flag when parsing file names
     args_without_flags = [arg for arg in sys.argv[4:] if arg != "--video"]
-    fnet_cpp_bin = args_without_flags[0] if len(args_without_flags) > 0 else "fnet_frame0.bin"
-    inet_cpp_bin = args_without_flags[1] if len(args_without_flags) > 1 else "inet_frame0.bin"
+    bin_dir = "bin_file"
+    fnet_cpp_bin = args_without_flags[0] if len(args_without_flags) > 0 else os.path.join(bin_dir, "fnet_frame0.bin")
+    inet_cpp_bin = args_without_flags[1] if len(args_without_flags) > 1 else os.path.join(bin_dir, "inet_frame0.bin")
     
     return image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin, is_video
 
@@ -532,31 +533,40 @@ def save_python_outputs(fnet_py_dpvo: np.ndarray, fnet_py_cpp_bgr: np.ndarray, f
     """Save all Python outputs to binary files."""
     print("💾 Saving Python outputs to binary files...")
     
+    bin_dir = "bin_file"
+    os.makedirs(bin_dir, exist_ok=True)
+    
     # Save Python DPVO outputs (primary - matches Python DPVO repository)
     fnet_py_dpvo_chw = fnet_py_dpvo[0]  # Remove batch dimension: [C, H, W]
-    fnet_py_dpvo_chw.tofile('fnet_py_dpvo_frame0.bin')
-    print(f"  ✅ Saved fnet_py_dpvo_frame0.bin: shape={fnet_py_dpvo_chw.shape} (CHW), size={fnet_py_dpvo_chw.nbytes} bytes")
+    fnet_py_dpvo_path = os.path.join(bin_dir, 'fnet_py_dpvo_frame0.bin')
+    fnet_py_dpvo_chw.tofile(fnet_py_dpvo_path)
+    print(f"  ✅ Saved {fnet_py_dpvo_path}: shape={fnet_py_dpvo_chw.shape} (CHW), size={fnet_py_dpvo_chw.nbytes} bytes")
     
     inet_py_dpvo_chw = inet_py_dpvo[0]  # Remove batch dimension: [C, H, W]
-    inet_py_dpvo_chw.tofile('inet_py_dpvo_frame0.bin')
-    print(f"  ✅ Saved inet_py_dpvo_frame0.bin: shape={inet_py_dpvo_chw.shape} (CHW), size={inet_py_dpvo_chw.nbytes} bytes")
+    inet_py_dpvo_path = os.path.join(bin_dir, 'inet_py_dpvo_frame0.bin')
+    inet_py_dpvo_chw.tofile(inet_py_dpvo_path)
+    print(f"  ✅ Saved {inet_py_dpvo_path}: shape={inet_py_dpvo_chw.shape} (CHW), size={inet_py_dpvo_chw.nbytes} bytes")
     
     # Also save C++ preprocessing outputs for comparison
     fnet_py_cpp_bgr_chw = fnet_py_cpp_bgr[0]
-    fnet_py_cpp_bgr_chw.tofile('fnet_py_cpp_bgr_frame0.bin')
-    print(f"  ✅ Saved fnet_py_cpp_bgr_frame0.bin: shape={fnet_py_cpp_bgr_chw.shape} (CHW), size={fnet_py_cpp_bgr_chw.nbytes} bytes")
+    fnet_py_cpp_bgr_path = os.path.join(bin_dir, 'fnet_py_cpp_bgr_frame0.bin')
+    fnet_py_cpp_bgr_chw.tofile(fnet_py_cpp_bgr_path)
+    print(f"  ✅ Saved {fnet_py_cpp_bgr_path}: shape={fnet_py_cpp_bgr_chw.shape} (CHW), size={fnet_py_cpp_bgr_chw.nbytes} bytes")
     
     fnet_py_cpp_rgb_chw = fnet_py_cpp_rgb[0]
-    fnet_py_cpp_rgb_chw.tofile('fnet_py_cpp_rgb_frame0.bin')
-    print(f"  ✅ Saved fnet_py_cpp_rgb_frame0.bin: shape={fnet_py_cpp_rgb_chw.shape} (CHW), size={fnet_py_cpp_rgb_chw.nbytes} bytes")
+    fnet_py_cpp_rgb_path = os.path.join(bin_dir, 'fnet_py_cpp_rgb_frame0.bin')
+    fnet_py_cpp_rgb_chw.tofile(fnet_py_cpp_rgb_path)
+    print(f"  ✅ Saved {fnet_py_cpp_rgb_path}: shape={fnet_py_cpp_rgb_chw.shape} (CHW), size={fnet_py_cpp_rgb_chw.nbytes} bytes")
     
     inet_py_cpp_bgr_chw = inet_py_cpp_bgr[0]
-    inet_py_cpp_bgr_chw.tofile('inet_py_cpp_bgr_frame0.bin')
-    print(f"  ✅ Saved inet_py_cpp_bgr_frame0.bin: shape={inet_py_cpp_bgr_chw.shape} (CHW), size={inet_py_cpp_bgr_chw.nbytes} bytes")
+    inet_py_cpp_bgr_path = os.path.join(bin_dir, 'inet_py_cpp_bgr_frame0.bin')
+    inet_py_cpp_bgr_chw.tofile(inet_py_cpp_bgr_path)
+    print(f"  ✅ Saved {inet_py_cpp_bgr_path}: shape={inet_py_cpp_bgr_chw.shape} (CHW), size={inet_py_cpp_bgr_chw.nbytes} bytes")
     
     inet_py_cpp_rgb_chw = inet_py_cpp_rgb[0]
-    inet_py_cpp_rgb_chw.tofile('inet_py_cpp_rgb_frame0.bin')
-    print(f"  ✅ Saved inet_py_cpp_rgb_frame0.bin: shape={inet_py_cpp_rgb_chw.shape} (CHW), size={inet_py_cpp_rgb_chw.nbytes} bytes")
+    inet_py_cpp_rgb_path = os.path.join(bin_dir, 'inet_py_cpp_rgb_frame0.bin')
+    inet_py_cpp_rgb_chw.tofile(inet_py_cpp_rgb_path)
+    print(f"  ✅ Saved {inet_py_cpp_rgb_path}: shape={inet_py_cpp_rgb_chw.shape} (CHW), size={inet_py_cpp_rgb_chw.nbytes} bytes")
     print()
     
     return fnet_py_dpvo_chw, inet_py_dpvo_chw
@@ -846,8 +856,8 @@ def print_summary(fnet_match_dpvo: bool, inet_match_dpvo: bool, fnet_match_cpp_b
         print("  🔍 Check the differences above. There may be other preprocessing differences.")
         print()
         print("📝 NOTE: Python DPVO outputs are saved to:")
-        print("  📄 fnet_py_dpvo_frame0.bin")
-        print("  📄 inet_py_dpvo_frame0.bin")
+        print("  📄 bin_file/fnet_py_dpvo_frame0.bin")
+        print("  📄 bin_file/inet_py_dpvo_frame0.bin")
         print("  💡 These can be compared with Python DPVO repository outputs.")
         return 1
 

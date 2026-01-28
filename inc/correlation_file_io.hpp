@@ -106,7 +106,7 @@ inline void save_correlation_data(
     }
     
     // Save coords [num_active, 2, P, P]
-    std::string coords_file = "corr_frame" + std::to_string(frame_num) + "_coords.bin";
+    std::string coords_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_coords.bin";
     save_float_array(coords_file, coords, num_active * 2 * P * P, logger);
     
     // Save indices
@@ -119,13 +119,13 @@ inline void save_correlation_data(
         ii_int32[i] = static_cast<int32_t>(ii[i]);
     }
     
-    std::string kk_file = "corr_frame" + std::to_string(frame_num) + "_kk.bin";
+    std::string kk_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_kk.bin";
     save_int32_array(kk_file, kk_int32.data(), num_active, logger);
     
-    std::string jj_file = "corr_frame" + std::to_string(frame_num) + "_jj.bin";
+    std::string jj_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_jj.bin";
     save_int32_array(jj_file, jj_int32.data(), num_active, logger);
     
-    std::string ii_file = "corr_frame" + std::to_string(frame_num) + "_ii.bin";
+    std::string ii_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_ii.bin";
     save_int32_array(ii_file, ii_int32.data(), num_active, logger);
     
     // Save gmap - extract only the patches we need (based on kk indices)
@@ -149,7 +149,7 @@ inline void save_correlation_data(
             std::memcpy(dst, src, sizeof(float) * gmap_patch_stride);
         }
     }
-    std::string gmap_file = "corr_frame" + std::to_string(frame_num) + "_gmap.bin";
+    std::string gmap_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_gmap.bin";
     save_float_array(gmap_file, gmap_slices.data(), num_active * feature_dim * D_gmap * D_gmap, logger);
     
     // Save fmap1 slices - extract frames based on jj indices
@@ -169,7 +169,7 @@ inline void save_correlation_data(
             std::memcpy(dst, src, sizeof(float) * fmap1_frame_stride);
         }
     }
-    std::string fmap1_file = "corr_frame" + std::to_string(frame_num) + "_fmap1.bin";
+    std::string fmap1_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap1.bin";
     save_float_array(fmap1_file, fmap1_slices.data(), num_active * feature_dim * fmap1_H * fmap1_W, logger);
     
     // Save fmap2 slices - extract frames based on jj indices
@@ -188,15 +188,15 @@ inline void save_correlation_data(
             std::memcpy(dst, src, sizeof(float) * fmap2_frame_stride);
         }
     }
-    std::string fmap2_file = "corr_frame" + std::to_string(frame_num) + "_fmap2.bin";
+    std::string fmap2_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap2.bin";
     save_float_array(fmap2_file, fmap2_slices.data(), num_active * feature_dim * fmap2_H * fmap2_W, logger);
     
     // Save correlation output [num_active, D, D, P, P, 2]
-    std::string corr_file = "corr_frame" + std::to_string(frame_num) + "_corr.bin";
+    std::string corr_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_corr.bin";
     save_float_array(corr_file, corr, num_active * D * D * P * P * 2, logger);
     
     // Save metadata (parameters)
-    std::string meta_file = "corr_frame" + std::to_string(frame_num) + "_meta.bin";
+    std::string meta_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_meta.bin";
     std::ofstream meta(meta_file, std::ios::binary);
     if (meta.is_open()) {
         int32_t params[] = {

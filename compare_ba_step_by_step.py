@@ -18,6 +18,9 @@ from dpvo import projective_ops as pops
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+# Global bin_file directory path
+bin_dir = "bin_file"
+
 def load_binary_file(filename, dtype=np.float32, warn_if_missing=False):
     """Load binary file as numpy array"""
     if not os.path.exists(filename):
@@ -315,9 +318,11 @@ def print_comparison_table(name, cpp_tensor, py_tensor, max_edges=5):
 
 def load_metadata():
     """Load metadata from test_metadata.txt and infer from file sizes"""
+    global bin_dir
     metadata = {}
-    if os.path.exists("test_metadata.txt"):
-        with open("test_metadata.txt", "r") as f:
+    metadata_file = os.path.join(bin_dir, "test_metadata.txt")
+    if os.path.exists(metadata_file):
+        with open(metadata_file, "r") as f:
             for line in f:
                 if "=" in line:
                     key, value = line.strip().split("=")
@@ -328,13 +333,13 @@ def load_metadata():
     N = metadata.get("N", 10)
     
     # Infer N from file sizes
-    poses_data = load_binary_file("ba_poses.bin")
+    poses_data = load_binary_file(os.path.join(bin_dir, "ba_poses.bin"))
     if poses_data is not None:
         N = len(poses_data) // 7
     
     # Always infer num_active from actual file sizes (most reliable)
     num_active = metadata.get("num_active", 10)  # Default fallback
-    coords_data = load_binary_file("ba_reprojected_coords.bin")
+    coords_data = load_binary_file(os.path.join(bin_dir, "ba_reprojected_coords.bin"))
     if coords_data is not None:
         num_active_from_coords = len(coords_data) // 2
         if num_active != num_active_from_coords:
@@ -357,8 +362,10 @@ def load_ba_inputs(M, P, N, num_active):
         weights_torch: Weights [1, num_active, 2]
         bounds: Image bounds tensor [4]
     """
+    global bin_dir
+    
     # Load poses [N, 7]
-    poses_data = load_binary_file("ba_poses.bin")
+    poses_data = load_binary_file(os.path.join(bin_dir, "ba_poses.bin"))
     if poses_data is None:
         raise FileNotFoundError("Failed to load ba_poses.bin")
     poses_np = poses_data.reshape(N, 7)
@@ -366,23 +373,23 @@ def load_ba_inputs(M, P, N, num_active):
     poses_se3 = SE3(poses_torch)
     
     # Load patches [N*M, 3, P, P]
-    patches_data = load_binary_file("ba_patches.bin")
+    patches_data = load_binary_file(os.path.join(bin_dir, "ba_patches.bin"))
     if patches_data is None:
         raise FileNotFoundError("Failed to load ba_patches.bin")
     patches_np = patches_data.reshape(N * M, 3, P, P)
     patches_torch = torch.from_numpy(patches_np.copy()).to(device).float().unsqueeze(0)
     
     # Load intrinsics [N, 4]
-    intrinsics_data = load_binary_file("ba_intrinsics.bin")
+    intrinsics_data = load_binary_file(os.path.join(bin_dir, "ba_intrinsics.bin"))
     if intrinsics_data is None:
         raise FileNotFoundError("Failed to load ba_intrinsics.bin")
     intrinsics_np = intrinsics_data.reshape(N, 4)
     intrinsics_torch = torch.from_numpy(intrinsics_np.copy()).to(device).float().unsqueeze(0)
     
     # Load indices
-    ii_np = load_int32_file("ba_ii.bin")
-    jj_np = load_int32_file("ba_jj.bin")
-    kk_np = load_int32_file("ba_kk.bin")
+    ii_np = load_int32_file(os.path.join(bin_dir, "ba_ii.bin"))
+    jj_np = load_int32_file(os.path.join(bin_dir, "ba_jj.bin"))
+    kk_np = load_int32_file(os.path.join(bin_dir, "ba_kk.bin"))
     if ii_np is None or jj_np is None or kk_np is None:
         raise FileNotFoundError("Failed to load index files")
     
@@ -409,8 +416,8 @@ def load_ba_inputs(M, P, N, num_active):
     ii_torch = kk_torch // M  # Source frame index (extracted from kk, matching C++)
     
     # Load targets and weights
-    targets_data = load_binary_file("ba_targets.bin")
-    weights_data = load_binary_file("ba_weights.bin")
+    targets_data = load_binary_file(os.path.join(bin_dir, "ba_targets.bin"))
+    weights_data = load_binary_file(os.path.join(bin_dir, "ba_weights.bin"))
     if targets_data is None or weights_data is None:
         raise FileNotFoundError("Failed to load targets/weights")
     
@@ -575,7 +582,7 @@ def step1_forward_projection(poses_se3, patches_torch, intrinsics_torch, ii_torc
                 print(f"       Intrinsics j: fx={intr_j[0]:.2f}, fy={intr_j[1]:.2f}, cx={intr_j[2]:.2f}, cy={intr_j[3]:.2f}")
     
     # Compare coords center
-    coords_cpp_data = load_binary_file("ba_reprojected_coords.bin")
+    coords_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_reprojected_coords.bin"))
     if coords_cpp_data is not None:
         # Infer num_active from C++ file size
         num_active_cpp = len(coords_cpp_data) // 2
@@ -775,7 +782,7 @@ def step1_forward_projection(poses_se3, patches_torch, intrinsics_torch, ii_torc
                 
                 # Check how many mismatched edges are likely invalid (out of bounds or large residuals)
                 # Load validity mask if available
-                v_cpp_data = load_binary_file("ba_step1_validity.bin", warn_if_missing=True)
+                v_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step1_validity.bin"), warn_if_missing=True)
                 if v_cpp_data is not None and len(v_cpp_data) > max(mismatch_indices):
                     invalid_count = 0
                     for idx in mismatch_indices:
@@ -823,7 +830,7 @@ def step2_compute_residuals(targets_torch, coords_py, P, num_active, v_py):
     print(f"\n  🔍 Comparing targets (INPUT data - computed before BA):")
     print(f"     Targets = reprojected_coords + delta (from update model)")
     print(f"     These are saved by dpvo.cpp BEFORE calling BA, so they should match")
-    targets_cpp_data = load_binary_file("ba_targets.bin", warn_if_missing=True)
+    targets_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_targets.bin"), warn_if_missing=True)
     if targets_cpp_data is not None:
         num_active_targets = len(targets_cpp_data) // 2
         targets_cpp = targets_cpp_data.reshape(num_active_targets, 2)
@@ -854,7 +861,7 @@ def step2_compute_residuals(targets_torch, coords_py, P, num_active, v_py):
         if num_active_targets != num_active:
             coords_py_center_np = coords_center[0, :num_active_targets].cpu().numpy()
         # Load C++ coords for comparison
-        coords_cpp_data = load_binary_file("ba_reprojected_coords.bin", warn_if_missing=True)
+        coords_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_reprojected_coords.bin"), warn_if_missing=True)
         if coords_cpp_data is not None:
             P_cpp = 3  # Assuming P=3
             center_idx = (P_cpp // 2) * P_cpp + (P_cpp // 2)
@@ -874,7 +881,7 @@ def step2_compute_residuals(targets_torch, coords_py, P, num_active, v_py):
     # NOTE: C++ saves MASKED residuals (residuals * validity) at line 238-239 in ba.cpp
     # So we should compare with Python's masked residuals, not raw residuals
     # But for now, let's compare raw residuals and note the difference
-    r_cpp_data = load_binary_file("ba_step1_residuals.bin", warn_if_missing=True)
+    r_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step1_residuals.bin"), warn_if_missing=True)
     if r_cpp_data is not None:
         # Infer num_active from C++ file size (it's [num_active, 2])
         num_active_cpp = len(r_cpp_data) // 2
@@ -892,7 +899,7 @@ def step2_compute_residuals(targets_torch, coords_py, P, num_active, v_py):
         compare_tensors("residuals (raw, before masking)", r_cpp, r_py_np, show_table=True, max_edges=3)
     
     # Compare validity mask
-    v_cpp_data = load_binary_file("ba_step1_validity.bin", warn_if_missing=True)
+    v_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step1_validity.bin"), warn_if_missing=True)
     if v_cpp_data is not None:
         v_cpp = v_cpp_data
         v_py_np = v_py[0].cpu().numpy()
@@ -962,10 +969,10 @@ def step4_build_weighted_jacobians(weights_py_masked, Ji_py, Jj_py, Jz_py, num_a
     print(f"  Python wJzT shape: {wJzT_py.shape}")
     
     # Compare with C++ STEP 2 weighted Jacobians
-    wJiT_cpp_data = load_binary_file("ba_step2_wJiT.bin", warn_if_missing=True)
-    wJjT_cpp_data = load_binary_file("ba_step2_wJjT.bin", warn_if_missing=True)
-    wJzT_cpp_data = load_binary_file("ba_step2_wJzT.bin", warn_if_missing=True)
-    weights_masked_cpp_data = load_binary_file("ba_step2_weights_masked.bin", warn_if_missing=True)
+    wJiT_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step2_wJiT.bin"), warn_if_missing=True)
+    wJjT_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step2_wJjT.bin"), warn_if_missing=True)
+    wJzT_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step2_wJzT.bin"), warn_if_missing=True)
+    weights_masked_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step2_weights_masked.bin"), warn_if_missing=True)
     
     if wJiT_cpp_data is not None:
         wJiT_cpp = wJiT_cpp_data.reshape(num_active, 6, 2)
@@ -1056,9 +1063,9 @@ def step5_compute_hessian_blocks(wJiT_py, wJjT_py, Ji_py, Jj_py, Jz_py, num_acti
     print(f"  Python Eik shape: {Eik_py.shape}")
     
     # Compare with C++ STEP 3 Hessian blocks
-    Bii_cpp_data = load_binary_file("ba_step3_Bii.bin")
-    Bij_cpp_data = load_binary_file("ba_step3_Bij.bin")
-    Eik_cpp_data = load_binary_file("ba_step3_Eik.bin")
+    Bii_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step3_Bii.bin"))
+    Bij_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step3_Bij.bin"))
+    Eik_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step3_Eik.bin"))
     
     if Bii_cpp_data is not None:
         Bii_cpp = Bii_cpp_data.reshape(num_active, 6, 6)
@@ -1095,7 +1102,7 @@ def step5_compute_hessian_blocks(wJiT_py, wJjT_py, Ji_py, Jj_py, Jz_py, num_acti
         compare_tensors("Eik", Eik_cpp, Eik_py_np, show_table=True, max_edges=2)
     
     # Also compare Ejk
-    Ejk_cpp_data = load_binary_file("ba_step3_Ejk.bin", warn_if_missing=True)
+    Ejk_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step3_Ejk.bin"), warn_if_missing=True)
     if Ejk_cpp_data is not None:
         Ejk_cpp = Ejk_cpp_data.reshape(num_active, 6, 1)
         Ejk_py_np = Ejk_py[0].cpu().numpy()
@@ -1127,9 +1134,9 @@ def step6_compute_gradients(wJiT_py, wJjT_py, wJzT_py, r_py_masked, num_active):
     print(f"  Python vi[0,0] (first edge): {vi_py[0,0].squeeze().cpu().numpy()}")
     
     # Compare with C++ STEP 4 gradients
-    vi_cpp_data = load_binary_file("ba_step4_vi.bin")
-    vj_cpp_data = load_binary_file("ba_step4_vj.bin")
-    w_vec_cpp_data = load_binary_file("ba_step4_w_vec.bin")
+    vi_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step4_vi.bin"))
+    vj_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step4_vj.bin"))
+    w_vec_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step4_w_vec.bin"))
     
     if vi_cpp_data is not None:
         vi_cpp = vi_cpp_data.reshape(num_active, 6)
@@ -1240,7 +1247,7 @@ def step9_assemble_hessian_b(Bii_py, Bij_py, Bji_py, Bjj_py, ii_py_adjusted, jj_
     print(f"  Python B stats: min={B_py.min().item():.6f}, max={B_py.max().item():.6f}, mean={B_py.mean().item():.6f}")
     
     # Compare with C++ STEP 9 assembled Hessian B
-    B_cpp_data = load_binary_file("ba_step9_B.bin", warn_if_missing=True)
+    B_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step9_B.bin"), warn_if_missing=True)
     if B_cpp_data is not None:
         B_cpp = B_cpp_data.reshape(6 * n_adjusted_py, 6 * n_adjusted_py)
         B_py_reshaped = B_py[0].permute(0, 2, 1, 3).contiguous().view(6 * n_adjusted_py, 6 * n_adjusted_py).cpu().numpy()
@@ -1306,7 +1313,7 @@ def step10_assemble_coupling_e(Eik_py, Ejk_py, ii_py_adjusted, jj_py_adjusted, k
     print(f"  Python E shape: {E_py.shape}")
     
     # Compare with C++ STEP 10 pose-structure coupling E
-    E_cpp_data = load_binary_file("ba_step10_E.bin", warn_if_missing=True)
+    E_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step10_E.bin"), warn_if_missing=True)
     if E_cpp_data is not None:
         E_cpp = E_cpp_data.reshape(6 * n_adjusted_py, m_py)
         E_py_reshaped = E_py[0].permute(0, 2, 1, 3).contiguous().view(6 * n_adjusted_py, m_py).cpu().numpy()
@@ -1337,7 +1344,7 @@ def step10_assemble_coupling_e(Eik_py, Ejk_py, ii_py_adjusted, jj_py_adjusted, k
         if len(edges_Ejk) > 0:
             print(f"      Ejk[edges_Ejk[0]]: {Ejk_py[0, edges_Ejk[0]].cpu().numpy().flatten()}")
             # Also check C++'s Ejk for this edge
-            Ejk_cpp_data = load_binary_file("ba_step3_Ejk.bin", warn_if_missing=True)
+            Ejk_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step3_Ejk.bin"), warn_if_missing=True)
             if Ejk_cpp_data is not None:
                 Ejk_cpp = Ejk_cpp_data.reshape(len(Ejk_cpp_data) // 6, 6, 1)
                 if edges_Ejk[0].item() < len(Ejk_cpp):
@@ -1394,7 +1401,7 @@ def step11_structure_hessian_c(wJzT_py, Jz_py, kk_py_new, m_py):
     print(f"  Python C stats: min={C_py.min().item():.6f}, max={C_py.max().item():.6f}, mean={C_py.mean().item():.6f}")
     
     # Compare with C++ STEP 11 structure Hessian C
-    C_cpp_data = load_binary_file("ba_step11_C.bin", warn_if_missing=True)
+    C_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step11_C.bin"), warn_if_missing=True)
     if C_cpp_data is not None:
         C_cpp = C_cpp_data
         C_py_np = C_py[0, :, 0, 0].cpu().numpy()
@@ -1427,8 +1434,8 @@ def step12_assemble_gradients(vi_py, vj_py, wJzT_py, r_py_masked, ii_py_adjusted
     print(f"  Python v_grad[0,0] (first pose): {v_py_grad[0,0,0].squeeze().cpu().numpy()}")
     
     # Compare with C++ STEP 11 assembled gradients
-    v_grad_cpp_data = load_binary_file("ba_step11_v_grad.bin", warn_if_missing=True)
-    w_grad_cpp_data = load_binary_file("ba_step11_w_grad.bin", warn_if_missing=True)
+    v_grad_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step11_v_grad.bin"), warn_if_missing=True)
+    w_grad_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step11_w_grad.bin"), warn_if_missing=True)
     
     if v_grad_cpp_data is not None:
         v_grad_cpp = v_grad_cpp_data
@@ -1464,7 +1471,7 @@ def step13_levenberg_marquardt(C_py, lmbda_val=1e-4):
     print(f"  Python Q stats: min={Q_py.min().item():.6f}, max={Q_py.max().item():.6f}, mean={Q_py.mean().item():.6f}")
     
     # Compare with C++ STEP 13 Q
-    Q_cpp_data = load_binary_file("ba_step13_Q.bin", warn_if_missing=True)
+    Q_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step13_Q.bin"), warn_if_missing=True)
     if Q_cpp_data is not None:
         Q_cpp = Q_cpp_data
         Q_py_np = Q_py[0, :, 0, 0].cpu().numpy()
@@ -1495,8 +1502,8 @@ def step14_schur_complement(B_py, E_py, Q_py, v_py_grad, w_py_grad, n_adjusted_p
     print(f"  Python y.norm(): {y_py.norm().item():.6f}")
     
     # Compare with C++ STEP 14 Schur complement S and RHS y
-    S_cpp_data = load_binary_file("ba_step14_S.bin", warn_if_missing=True)
-    y_cpp_data = load_binary_file("ba_step14_y.bin", warn_if_missing=True)
+    S_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step14_S.bin"), warn_if_missing=True)
+    y_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step14_y.bin"), warn_if_missing=True)
     
     if S_cpp_data is not None:
         S_cpp = S_cpp_data.reshape(6 * n_adjusted_py, 6 * n_adjusted_py)
@@ -1536,7 +1543,7 @@ def step15_solve_pose_increments(S_py, y_py, ep=100.0, n_adjusted_py=None):
     
     # Compare with C++ STEP 15 solution dX
     if n_adjusted_py is not None:
-        dX_cpp_data = load_binary_file("ba_step15_dX.bin")
+        dX_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step15_dX.bin"))
         if dX_cpp_data is not None:
             dX_cpp = dX_cpp_data
             dX_py_np = dX_py_reshaped[0].cpu().numpy()
@@ -1603,7 +1610,7 @@ def step16_back_substitute(Q_py, w_py_grad, E_py, dX_py, n_adjusted_py, m_py):
         raise ValueError(f"dZ shape mismatch: expected m={m_py}, got {dZ_py.shape[1]}")
     
     # Compare with C++ STEP 16 solution dZ
-    dZ_cpp_data = load_binary_file("ba_step16_dZ.bin")
+    dZ_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step16_dZ.bin"))
     if dZ_cpp_data is not None:
         dZ_cpp = dZ_cpp_data
         dZ_py_np = dZ_py[0, :, 0, 0].cpu().numpy()
@@ -1658,7 +1665,7 @@ def compare_final_outputs(poses_py_updated, N):
     print("=" * 80)
     
     # Load C++ BA outputs
-    poses_cpp_data = load_binary_file("ba_poses_cpp.bin")
+    poses_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_poses_cpp.bin"))
     if poses_cpp_data is None:
         print("\n⚠️  C++ poses file not found (ba_poses_cpp.bin)")
         return
@@ -1858,7 +1865,7 @@ def main():
     
     # Compare C++ STEP 1 residuals (already masked) with Python STEP 3 masked residuals
     # C++ zeros residuals for invalid edges before saving, so we should compare with Python's masked residuals
-    r_cpp_data = load_binary_file("ba_step1_residuals.bin", warn_if_missing=True)
+    r_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step1_residuals.bin"), warn_if_missing=True)
     if r_cpp_data is not None:
         num_active_cpp = len(r_cpp_data) // 2
         r_cpp = r_cpp_data.reshape(num_active_cpp, 2)
@@ -1869,7 +1876,7 @@ def main():
             r_py_raw_np = r_py_raw_np[:num_active_cpp]
         
         # Load coords that C++ BA actually uses (from ba_step1_coords_center.bin)
-        coords_cpp_ba_data = load_binary_file("ba_step1_coords_center.bin", warn_if_missing=True)
+        coords_cpp_ba_data = load_binary_file(os.path.join(bin_dir, "ba_step1_coords_center.bin"), warn_if_missing=True)
         if coords_cpp_ba_data is not None:
             coords_cpp_ba = coords_cpp_ba_data.reshape(num_active_cpp, 2)
             # Extract Python coords at center for comparison
@@ -1887,7 +1894,7 @@ def main():
         print("    Since targets and coords match, raw residuals should match too")
         if coords_cpp_ba_data is not None:
             # Load targets for comparison
-            targets_cpp_data = load_binary_file("ba_targets.bin", warn_if_missing=True)
+            targets_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_targets.bin"), warn_if_missing=True)
             if targets_cpp_data is not None:
                 targets_cpp_for_residual = targets_cpp_data[:num_active_cpp * 2].reshape(num_active_cpp, 2)
                 # Compute C++ raw residuals from BA coords
@@ -1906,8 +1913,8 @@ def main():
         compare_tensors("residuals (masked)", r_cpp, r_py_masked_np, show_table=True, max_edges=3)
     
     # Compare raw Jacobians Ji and Jj (before weighting) to identify Ji mismatch root cause
-    Ji_cpp_data = load_binary_file("ba_step2_Ji_center.bin", warn_if_missing=True)
-    Jj_cpp_data = load_binary_file("ba_step2_Jj_center.bin", warn_if_missing=True)
+    Ji_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step2_Ji_center.bin"), warn_if_missing=True)
+    Jj_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step2_Jj_center.bin"), warn_if_missing=True)
     if Ji_cpp_data is not None and Jj_cpp_data is not None:
         num_active_cpp = len(Ji_cpp_data) // (2 * 6)
         Ji_cpp = Ji_cpp_data.reshape(num_active_cpp, 2, 6)

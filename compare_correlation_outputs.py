@@ -184,7 +184,7 @@ def print_comparison_table(results):
     print("="*100)
 
 
-def load_and_reshape_cpp_data(frame_num, meta):
+def load_and_reshape_cpp_data(frame_num, meta, bin_dir="bin_file"):
     """Load and reshape C++ correlation data from binary files."""
     num_active = meta['num_active']
     P = meta['P']
@@ -200,14 +200,14 @@ def load_and_reshape_cpp_data(frame_num, meta):
     print("="*70)
     
     # Load binary files
-    coords_cpp = load_binary_float(f"corr_frame{frame_num}_coords.bin")
-    kk_cpp = load_binary_int32(f"corr_frame{frame_num}_kk.bin")
-    jj_cpp = load_binary_int32(f"corr_frame{frame_num}_jj.bin")
-    ii_cpp = load_binary_int32(f"corr_frame{frame_num}_ii.bin")
-    gmap_cpp = load_binary_float(f"corr_frame{frame_num}_gmap.bin")
-    fmap1_cpp = load_binary_float(f"corr_frame{frame_num}_fmap1.bin")
-    fmap2_cpp = load_binary_float(f"corr_frame{frame_num}_fmap2.bin")
-    corr_cpp = load_binary_float(f"corr_frame{frame_num}_corr.bin")
+    coords_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_coords.bin"))
+    kk_cpp = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_kk.bin"))
+    jj_cpp = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_jj.bin"))
+    ii_cpp = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_ii.bin"))
+    gmap_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_gmap.bin"))
+    fmap1_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap1.bin"))
+    fmap2_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap2.bin"))
+    corr_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_corr.bin"))
     
     # Reshape C++ data
     coords_cpp = coords_cpp.reshape(num_active, 2, P, P)
@@ -274,13 +274,32 @@ def verify_slice_correspondence(kk_cpp, jj_cpp, num_active, M, num_gmap_frames, 
     ii1_computed = kk_cpp % mod_value
     jj1_computed = jj_cpp % num_frames
     
-    # For Python correlation with slices, we use sequential indices [0, 1, 2, ...]
-    ii1_py = torch.arange(num_active, dtype=torch.long, device=device)
-    jj1_py = torch.arange(num_active, dtype=torch.long, device=device)
-    
     # Check if indices are sequential
     ii1_is_sequential = np.allclose(ii1_computed, np.arange(num_active))
     jj1_is_sequential = np.allclose(jj1_computed, np.arange(num_active))
+    
+    # Check if indices are within bounds
+    max_ii1 = ii1_computed.max()
+    max_jj1 = jj1_computed.max()
+    ii1_in_bounds = max_ii1 < num_active
+    jj1_in_bounds = max_jj1 < num_active
+    
+    # Use actual C++ indices if they're within bounds, otherwise use sequential
+    if ii1_in_bounds and jj1_in_bounds:
+        # Use the actual C++ indices - this ensures Python selects the same slices as C++
+        ii1_py = torch.from_numpy(ii1_computed).long().to(device)
+        jj1_py = torch.from_numpy(jj1_computed).long().to(device)
+        print(f"✅ Using C++ indices directly (within bounds)")
+        print(f"   ii1_py will use C++ ii1_computed values")
+        print(f"   jj1_py will use C++ jj1_computed values")
+    else:
+        # Fallback to sequential if out of bounds
+        ii1_py = torch.arange(num_active, dtype=torch.long, device=device)
+        jj1_py = torch.arange(num_active, dtype=torch.long, device=device)
+        print(f"⚠️  WARNING: Some indices are out of bounds!")
+        print(f"   max_ii1: {max_ii1}, num_active: {num_active}, within bounds: {ii1_in_bounds}")
+        print(f"   max_jj1: {max_jj1}, num_active: {num_active}, within bounds: {jj1_in_bounds}")
+        print(f"   Falling back to sequential indices (may cause mismatches)")
     
     print(f"{'Edge':<10} {'C++ ii1':<15} {'C++ jj1':<15} {'Python ii1':<15} {'Python jj1':<15} {'Note':<30}")
     print("-"*70)
@@ -288,9 +307,9 @@ def verify_slice_correspondence(kk_cpp, jj_cpp, num_active, M, num_gmap_frames, 
     for e in range(min(10, num_active)):
         note = ""
         if e < num_active:
-            if ii1_computed[e] != e:
+            if ii1_computed[e] != ii1_py[e].item():
                 note += f"ii1 mismatch! "
-            if jj1_computed[e] != e:
+            if jj1_computed[e] != jj1_py[e].item():
                 note += f"jj1 mismatch! "
         print(f"{e:<10} {ii1_computed[e]:<15} {jj1_computed[e]:<15} {ii1_py[e].item():<15} {jj1_py[e].item():<15} {note:<30}")
     
@@ -300,10 +319,10 @@ def verify_slice_correspondence(kk_cpp, jj_cpp, num_active, M, num_gmap_frames, 
         print(f"⚠️  WARNING: Indices are NOT sequential!")
         print(f"   ii1_is_sequential: {ii1_is_sequential}")
         print(f"   jj1_is_sequential: {jj1_is_sequential}")
-        max_ii1 = ii1_computed.max()
-        max_jj1 = jj1_computed.max()
-        print(f"   max_ii1: {max_ii1}, num_active: {num_active}, within bounds: {max_ii1 < num_active}")
-        print(f"   max_jj1: {max_jj1}, num_active: {num_active}, within bounds: {max_jj1 < num_active}")
+        print(f"   max_ii1: {max_ii1}, num_active: {num_active}, within bounds: {ii1_in_bounds}")
+        print(f"   max_jj1: {max_jj1}, num_active: {num_active}, within bounds: {jj1_in_bounds}")
+        if ii1_in_bounds and jj1_in_bounds:
+            print(f"   ✅ Using C++ indices directly to match C++ behavior")
     else:
         print("✅ Indices are sequential - slices should be in correct order")
     
@@ -312,8 +331,8 @@ def verify_slice_correspondence(kk_cpp, jj_cpp, num_active, M, num_gmap_frames, 
     print(f"  C++ jj range: [{jj_cpp.min()}, {jj_cpp.max()}]")
     print(f"  C++ ii1 (computed) range: [{ii1_computed.min()}, {ii1_computed.max()}]")
     print(f"  C++ jj1 (computed) range: [{jj1_computed.min()}, {jj1_computed.max()}]")
-    print(f"  Python ii1_py (sequential): [0, {num_active-1}]")
-    print(f"  Python jj1_py (sequential): [0, {num_active-1}]")
+    print(f"  Python ii1_py range: [{ii1_py.min().item()}, {ii1_py.max().item()}]")
+    print(f"  Python jj1_py range: [{jj1_py.min().item()}, {jj1_py.max().item()}]")
     
     return ii1_py, jj1_py, ii1_computed, jj1_computed
 
@@ -374,7 +393,7 @@ def validate_coordinates(coords_cpp, fmap1_H, fmap1_W, fmap2_H, fmap2_W, R, P):
     return coords_in_bounds_fmap1
 
 
-def compute_python_correlation(py_tensors, ii1_py, jj1_py, R, fmap1_H, fmap1_W, corr_cpp_torch, P):
+def compute_python_correlation(py_tensors, ii1_py, jj1_py, R, fmap1_H, fmap1_W, fmap2_H, fmap2_W, corr_cpp_torch, P):
     """Compute Python correlation for both pyramid levels."""
     print("\n" + "="*70)
     print("COMPUTING PYTHON CORRELATION")
@@ -410,6 +429,20 @@ def compute_python_correlation(py_tensors, ii1_py, jj1_py, R, fmap1_H, fmap1_W, 
     print(f"   coords_x range: [{coords_x.min().item():.2f}, {coords_x.max().item():.2f}]")
     print(f"   coords_y range: [{coords_y.min().item():.2f}, {coords_y.max().item():.2f}]")
     print(f"   fmap1 bounds: [0, {fmap1_W}) x [0, {fmap1_H})")
+    
+    # Check if Python normalizes coordinates internally (for grid_sample)
+    # grid_sample expects coordinates in [-1, 1] range
+    # Normalization: gx = 2 * (x / (W - 1)) - 1, gy = 2 * (y / (H - 1)) - 1
+    print(f"\n🔍 Coordinate normalization check (for grid_sample):")
+    sample_x = coords_level0[0, 0, 0, 1, 1].item()
+    sample_y = coords_level0[0, 0, 1, 1, 1].item()
+    gx_norm = 2 * (sample_x / (fmap1_W - 1)) - 1
+    gy_norm = 2 * (sample_y / (fmap1_H - 1)) - 1
+    print(f"   Sample coord (raw): x={sample_x:.2f}, y={sample_y:.2f}")
+    print(f"   Normalized for grid_sample: gx={gx_norm:.4f}, gy={gy_norm:.4f}")
+    print(f"   Normalized range should be [-1, 1]: gx in range? {-1 <= gx_norm <= 1}, gy in range? {-1 <= gy_norm <= 1}")
+    print(f"   ⚠️  NOTE: Python's altcorr_corr likely normalizes coordinates internally for grid_sample")
+    print(f"      C++ uses raw pixel coordinates with floor() - this may cause differences!")
     
     # Manual verification for edge 0
     print(f"\n🔍 Manual verification for edge 0:")
@@ -575,7 +608,78 @@ def _print_sample_correlation_values(corr_cpp_final, corr_py_final, D_compare, P
     print("="*100)
 
 
-def print_detailed_analysis(results, corr1_cpp, corr2_cpp, corr_cpp_final, corr1_py_compare, corr2_py_compare, corr_py_final):
+def analyze_mismatch_location(cpp_data, py_data, location, coords_cpp, fmap_H, fmap_W, level=0):
+    """Analyze a specific mismatched location to understand the difference."""
+    # location format: (edge, di, dj, pi, pj)
+    e, di, dj, pi, pj = location
+    lev = level
+    
+    # Handle torch tensors - check if it's 5D or 6D (stacked)
+    if torch.is_tensor(cpp_data):
+        if len(cpp_data.shape) == 6:
+            # 6D: (edge, di, dj, pi, pj, level) - stacked tensor
+            cpp_val = float(cpp_data[e, di, dj, pi, pj, lev].item())
+        else:
+            # 5D: (edge, di, dj, pi, pj) - single level
+            cpp_val = float(cpp_data[e, di, dj, pi, pj].item())
+    else:
+        if len(cpp_data.shape) == 6:
+            cpp_val = float(cpp_data[e, di, dj, pi, pj, lev])
+        else:
+            cpp_val = float(cpp_data[e, di, dj, pi, pj])
+    
+    if torch.is_tensor(py_data):
+        if len(py_data.shape) == 6:
+            py_val = float(py_data[e, di, dj, pi, pj, lev].item())
+        else:
+            py_val = float(py_data[e, di, dj, pi, pj].item())
+    else:
+        if len(py_data.shape) == 6:
+            py_val = float(py_data[e, di, dj, pi, pj, lev])
+        else:
+            py_val = float(py_data[e, di, dj, pi, pj])
+    
+    # Get coordinates for this edge and patch pixel
+    coord_scale = 1.0 if lev == 0 else 0.25
+    if torch.is_tensor(coords_cpp):
+        x_raw = float(coords_cpp[e, 0, pi, pj].item())
+        y_raw = float(coords_cpp[e, 1, pi, pj].item())
+    else:
+        x_raw = float(coords_cpp[e, 0, pi, pj])
+        y_raw = float(coords_cpp[e, 1, pi, pj])
+    x_scaled = x_raw * coord_scale
+    y_scaled = y_raw * coord_scale
+    
+    # C++ sampling location (nearest neighbor)
+    R = 3  # Assuming R=3 for D=7
+    cpp_i = int(np.floor(y_scaled)) + (di - R)
+    cpp_j = int(np.floor(x_scaled)) + (dj - R)
+    
+    # Python would normalize for grid_sample
+    gx_norm = 2 * (x_scaled / (fmap_W - 1)) - 1
+    gy_norm = 2 * (y_scaled / (fmap_H - 1)) - 1
+    
+    # Python grid_sample with offset (normalized)
+    offset_di = (di - R) / (fmap_H - 1) * 2  # Normalized offset
+    offset_dj = (dj - R) / (fmap_W - 1) * 2
+    py_gx = gx_norm + offset_dj
+    py_gy = gy_norm + offset_di
+    
+    # Convert back to pixel coordinates for Python (approximate)
+    py_i_approx = (py_gy + 1) / 2 * (fmap_H - 1)
+    py_j_approx = (py_gx + 1) / 2 * (fmap_W - 1)
+    
+    print(f"\n  Location Analysis: Edge {e}, Window ({di},{dj}), Patch ({pi},{pj}), Level {lev}")
+    print(f"    C++ Value: {cpp_val:.6f}, Python Value: {py_val:.6f}, Diff: {abs(cpp_val - py_val):.6f}")
+    print(f"    Raw coords: x={x_raw:.2f}, y={y_raw:.2f}")
+    print(f"    Scaled coords: x={x_scaled:.2f}, y={y_scaled:.2f} (scale={coord_scale})")
+    print(f"    C++ sampling (nearest): i={cpp_i}, j={cpp_j} (from floor({y_scaled:.2f})+{di-R}, floor({x_scaled:.2f})+{dj-R})")
+    print(f"    Python normalized: gx={gx_norm:.4f}, gy={gy_norm:.4f}")
+    print(f"    Python grid_sample location (approx): i≈{py_i_approx:.2f}, j≈{py_j_approx:.2f}")
+    print(f"    → C++ uses integer pixel ({cpp_i}, {cpp_j}), Python uses bilinear at ({py_i_approx:.2f}, {py_j_approx:.2f})")
+
+
+def print_detailed_analysis(results, corr1_cpp, corr2_cpp, corr_cpp_final, corr1_py_compare, corr2_py_compare, corr_py_final, coords_cpp=None, fmap1_H=None, fmap1_W=None, fmap2_H=None, fmap2_W=None):
     """Print detailed mismatch analysis."""
     print("\n" + "="*100)
     print("DETAILED MISMATCH ANALYSIS")
@@ -619,6 +723,16 @@ def print_detailed_analysis(results, corr1_cpp, corr2_cpp, corr_cpp_final, corr1
             print(f"{'Rank':<10} {'Index':<15} {'Location':<35} {'C++ Value':<20} {'Python Value':<20} {'Difference':<20}")
             print("-"*100)
             
+            # Determine which level and feature map dimensions to use
+            if 'corr1' in name.lower() or (name == 'corr (stacked)' and len(top_indices) > 0):
+                level = 0
+                fmap_H = fmap1_H if fmap1_H else 132
+                fmap_W = fmap1_W if fmap1_W else 240
+            else:
+                level = 1
+                fmap_H = fmap2_H if fmap2_H else 33
+                fmap_W = fmap2_W if fmap2_W else 60
+            
             for rank, idx in enumerate(top_indices[:20], 1):
                 if 'corr1' in name.lower():
                     orig_shape = corr1_cpp.shape
@@ -631,6 +745,75 @@ def print_detailed_analysis(results, corr1_cpp, corr2_cpp, corr_cpp_final, corr1
                 print(f"{rank:<10} {idx:<15} {idx_str:<35} {format_number(cpp_flat[idx]):<20} "
                       f"{format_number(py_flat[idx]):<20} {format_number(diff_flat[idx]):<20}")
             
+            print("="*100)
+            
+            # Analyze top 3 mismatches in detail
+            if coords_cpp is not None and len(top_indices) > 0:
+                print(f"\n{'='*100}")
+                print(f"DETAILED ANALYSIS OF TOP 3 MISMATCHES: {name}")
+                print("="*100)
+                for rank, idx in enumerate(top_indices[:3], 1):
+                    if 'corr1' in name.lower():
+                        orig_shape = corr1_cpp.shape
+                        data_cpp = corr1_cpp
+                        data_py = corr1_py_compare
+                        lev = 0
+                        fmap_H_lev = fmap1_H if fmap1_H else 132
+                        fmap_W_lev = fmap1_W if fmap1_W else 240
+                        orig_idx = np.unravel_index(idx, orig_shape)
+                        location = orig_idx[:5]  # (edge, di, dj, pi, pj)
+                    elif 'corr2' in name.lower():
+                        orig_shape = corr2_cpp.shape
+                        data_cpp = corr2_cpp
+                        data_py = corr2_py_compare
+                        lev = 1
+                        fmap_H_lev = fmap2_H if fmap2_H else 33
+                        fmap_W_lev = fmap2_W if fmap2_W else 60
+                        orig_idx = np.unravel_index(idx, orig_shape)
+                        location = orig_idx[:5]  # (edge, di, dj, pi, pj)
+                    else:
+                        # Stacked tensor - extract level from index
+                        orig_shape = corr_cpp_final.shape
+                        data_cpp = corr_cpp_final
+                        data_py = corr_py_final
+                        orig_idx = np.unravel_index(idx, orig_shape)
+                        if len(orig_idx) == 6:  # (edge, di, dj, pi, pj, level)
+                            lev = int(orig_idx[5])
+                            location = orig_idx[:5]  # (edge, di, dj, pi, pj)
+                        else:
+                            lev = 0
+                            location = orig_idx[:5]
+                        fmap_H_lev = fmap1_H if lev == 0 else (fmap2_H if fmap2_H else 33)
+                        fmap_W_lev = fmap1_W if lev == 0 else (fmap2_W if fmap2_W else 60)
+                    
+                    analyze_mismatch_location(data_cpp, data_py, location, coords_cpp, fmap_H_lev, fmap_W_lev, lev)
+                print("="*100)
+            
+            # Add summary of root cause
+            print(f"\n{'='*100}")
+            print(f"ROOT CAUSE ANALYSIS: {name}")
+            print("="*100)
+            print("Key Differences Between C++ and Python:")
+            print("1. INTERPOLATION METHOD:")
+            print("   • C++: Uses nearest neighbor (floor() + integer indexing)")
+            print("   • Python: Uses bilinear interpolation (grid_sample with 4-point weighted average)")
+            print("   → This causes differences especially for sub-pixel coordinates")
+            print()
+            print("2. COORDINATE HANDLING:")
+            print("   • C++: Uses raw pixel coordinates directly with floor()")
+            print("   • Python: Normalizes coordinates to [-1, 1] for grid_sample")
+            print("   → Normalization: gx = 2 * (x / (W-1)) - 1, gy = 2 * (y / (H-1)) - 1")
+            print()
+            print("3. BOUNDARY HANDLING:")
+            print("   • C++: Explicit bounds checking, sets correlation to 0.0 for out-of-bounds")
+            print("   • Python: grid_sample returns 0 for out-of-bounds coordinates")
+            print("   → Both return 0, but may differ in edge cases")
+            print()
+            print("RECOMMENDATION:")
+            print("To match Python exactly, C++ should:")
+            print("  • Use bilinear interpolation instead of nearest neighbor")
+            print("  • Normalize coordinates to [-1, 1] range")
+            print("  • Use the same 4-point weighted average as grid_sample")
             print("="*100)
 
 
@@ -689,7 +872,7 @@ def print_summary(results, corr_py_final, corr_cpp_final, D_py, D, R, coords_in_
         return True
 
 
-def print_python_input(py_tensors, num_active, ii1_computed, jj1_computed):
+def print_python_input(py_tensors, num_active, ii1_py, jj1_py, ii1_computed, jj1_computed):
     print("\n" + "="*70)
     print("PREPARING PYTHON CORRELATION INPUTS")
     print("="*70)
@@ -699,11 +882,12 @@ def print_python_input(py_tensors, num_active, ii1_computed, jj1_computed):
     print(f"{'fmap1_py':<20} {str(py_tensors['fmap1_py'].shape):<30} {'Pyramid level 0 (with batch dim)':<50}")
     print(f"{'fmap2_py':<20} {str(py_tensors['fmap2_py'].shape):<30} {'Pyramid level 1 (with batch dim)':<50}")
     print(f"{'coords_py':<20} {str(py_tensors['coords_py'].shape):<30} {'Full patch coords [B,M,2,P,P]':<50}")
-    print(f"{'ii1_py':<20} {f'[{num_active}]':<30} {f'Sequential: [0..{num_active-1}]':<50}")
-    print(f"{'jj1_py':<20} {f'[{num_active}]':<30} {f'Sequential: [0..{num_active-1}]':<50}")
+    print(f"{'ii1_py':<20} {f'[{num_active}]':<30} {f'Range: [{ii1_py.min().item()}, {ii1_py.max().item()}]':<50}")
+    print(f"{'jj1_py':<20} {f'[{num_active}]':<30} {f'Range: [{jj1_py.min().item()}, {jj1_py.max().item()}]':<50}")
     print(f"{'C++ ii1':<20} {f'[{num_active}]':<30} {f'Range: [{ii1_computed.min()}, {ii1_computed.max()}]':<50}")
     print(f"{'C++ jj1':<20} {f'[{num_active}]':<30} {f'Range: [{jj1_computed.min()}, {jj1_computed.max()}]':<50}")
     print("="*70)
+
 
 def compare_correlation(frame_num):
     """Compare C++ and Python correlation outputs for a given frame."""
@@ -711,8 +895,10 @@ def compare_correlation(frame_num):
     print(f"Comparing Correlation Outputs for Frame {frame_num}")
     print(f"{'='*60}\n")
     
+    bin_dir = "bin_file"
+    
     # Load metadata
-    meta_file = f"corr_frame{frame_num}_meta.bin"
+    meta_file = os.path.join(bin_dir, f"corr_frame{frame_num}_meta.bin")
     meta = load_metadata(meta_file)
     print(f"Loaded metadata: {meta}")
     
@@ -731,7 +917,7 @@ def compare_correlation(frame_num):
     R = (D - 1) // 2  # Calculate R from D: D = 2*R + 1
     
     # Load and reshape C++ data
-    cpp_data = load_and_reshape_cpp_data(frame_num, meta)
+    cpp_data = load_and_reshape_cpp_data(frame_num, meta, bin_dir)
     
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -746,7 +932,7 @@ def compare_correlation(frame_num):
     )
     
     # Print Python input summary
-    print_python_input(py_tensors, num_active, ii1_computed, jj1_computed)
+    print_python_input(py_tensors, num_active, ii1_py, jj1_py, ii1_computed, jj1_computed)
     
     # Validate coordinates
     coords_in_bounds_fmap1 = validate_coordinates(
@@ -755,7 +941,7 @@ def compare_correlation(frame_num):
     
     # Compute Python correlation
     corr1_py, corr2_py, D_py = compute_python_correlation(
-        py_tensors, ii1_py, jj1_py, R, fmap1_H, fmap1_W, py_tensors['corr_cpp_torch'], P
+        py_tensors, ii1_py, jj1_py, R, fmap1_H, fmap1_W, fmap2_H, fmap2_W, py_tensors['corr_cpp_torch'], P
     )
     
     # Align correlation windows
@@ -774,7 +960,9 @@ def compare_correlation(frame_num):
     # Print detailed analysis
     print_detailed_analysis(
         results, corr1_cpp, corr2_cpp, corr_cpp_final,
-        corr1_py_compare, corr2_py_compare, corr_py_final
+        corr1_py_compare, corr2_py_compare, corr_py_final,
+        coords_cpp=cpp_data['coords'], fmap1_H=fmap1_H, fmap1_W=fmap1_W,
+        fmap2_H=fmap2_H, fmap2_W=fmap2_W
     )
     
     # Print summary

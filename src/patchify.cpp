@@ -17,6 +17,26 @@
 #include <fstream>
 #include <string>
 #include <spdlog/spdlog.h>
+#include <sys/stat.h>  // For mkdir
+#include <sys/types.h>
+
+// Helper function to get bin_file directory path and ensure it exists
+static std::string get_bin_file_path(const std::string& filename) {
+    const std::string bin_dir = "bin_file";
+    
+    // Create directory if it doesn't exist
+    struct stat info;
+    if (stat(bin_dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        #ifdef _WIN32
+        mkdir(bin_dir.c_str());
+        #else
+        mkdir(bin_dir.c_str(), 0755);
+        #endif
+    }
+    
+    return bin_dir + "/" + filename;
+}
 
 // =================================================================================================
 // Patchifier Implementation
@@ -257,19 +277,19 @@ void Patchifier::extractPatchesAfterInference(int H, int W, int fmap_H, int fmap
         std::string frame_suffix = std::to_string(TARGET_FRAME);
         
         // Save coordinates
-        std::string coords_filename = "cpp_coords_frame" + frame_suffix + ".bin";
+        std::string coords_filename = get_bin_file_path("cpp_coords_frame" + frame_suffix + ".bin");
         patchify_file_io::save_coordinates(coords_filename, coords, M, logger_patch);
         
         // Save gmap: [M, 128, P, P] = [4, 128, 3, 3]
-        std::string gmap_filename = "cpp_gmap_frame" + frame_suffix + ".bin";
+        std::string gmap_filename = get_bin_file_path("cpp_gmap_frame" + frame_suffix + ".bin");
         patchify_file_io::save_patch_data(gmap_filename, gmap, M, 128, m_patch_size, logger_patch, "gmap");
         
         // Save imap: [M, 384, 1, 1] = [4, 384, 1, 1]
-        std::string imap_filename = "cpp_imap_frame" + frame_suffix + ".bin";
+        std::string imap_filename = get_bin_file_path("cpp_imap_frame" + frame_suffix + ".bin");
         patchify_file_io::save_patch_data_hw(imap_filename, imap, M, inet_output_channels, 1, 1, logger_patch, "imap");
         
         // Save patches: [M, 3, P, P] = [4, 3, 3, 3]
-        std::string patches_filename = "cpp_patches_frame" + frame_suffix + ".bin";
+        std::string patches_filename = get_bin_file_path("cpp_patches_frame" + frame_suffix + ".bin");
         patchify_file_io::save_patch_data(patches_filename, patches, M, 3, m_patch_size, logger_patch, "patches");
         
         if (logger_patch) {
@@ -423,12 +443,12 @@ void Patchifier::forward(
                 std::string frame_suffix = std::to_string(TARGET_FRAME);
                 
                 // Save fnet output
-                std::string fnet_filename = "fnet_frame" + frame_suffix + ".bin";
+                std::string fnet_filename = get_bin_file_path("fnet_frame" + frame_suffix + ".bin");
                 patchify_file_io::save_model_output(fnet_filename, m_fmap_buffer.data(), 
                                                      fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
                 
                 // Save inet output
-                std::string inet_filename = "inet_frame" + frame_suffix + ".bin";
+                std::string inet_filename = get_bin_file_path("inet_frame" + frame_suffix + ".bin");
                 patchify_file_io::save_model_output(inet_filename, m_imap_buffer.data(), 
                                                      inet_C, inet_H, inet_W, logger_patch, "inet");
                 

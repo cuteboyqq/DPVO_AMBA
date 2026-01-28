@@ -228,6 +228,22 @@ inline bool save_reprojected_coords_center(const std::string& filename, const fl
 }
 
 /**
+ * Save full reprojected coordinates [num_active, 2, P, P]
+ * @param filename Output filename
+ * @param coords Flat array of coordinates [num_active, 2, P, P]
+ * @param num_active Number of active edges
+ * @param P Patch size
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_reprojected_coords_full(const std::string& filename, const float* coords,
+                                         int num_active, int P,
+                                         std::shared_ptr<spdlog::logger> logger = nullptr) {
+    size_t num_elements = static_cast<size_t>(num_active) * 2 * P * P;
+    return save_float_array(filename, coords, num_elements, logger);
+}
+
+/**
  * Save targets [num_active, 2] (reprojected_coords + delta from update model)
  * @param filename Output filename
  * @param targets Flat array [num_active * 2] - accessed as targets[e * 2 + 0] and targets[e * 2 + 1]

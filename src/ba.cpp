@@ -12,10 +12,30 @@
 #include <map>
 #include <set>
 #include <fstream>
+#include <sys/stat.h>  // For mkdir
+#include <sys/types.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// Helper function to get bin_file directory path and ensure it exists
+static std::string get_bin_file_path(const std::string& filename) {
+    const std::string bin_dir = "bin_file";
+    
+    // Create directory if it doesn't exist
+    struct stat info;
+    if (stat(bin_dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        #ifdef _WIN32
+        mkdir(bin_dir.c_str());
+        #else
+        mkdir(bin_dir.c_str(), 0755);
+        #endif
+    }
+    
+    return bin_dir + "/" + filename;
+}
 
 // =================================================================================================
 // Bundle Adjustment Implementation
@@ -245,15 +265,15 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 1: Residuals and validity mask
     if (save_intermediates) {
-        std::ofstream r_file("ba_step1_residuals.bin", std::ios::binary);
-        std::ofstream v_file("ba_step1_validity.bin", std::ios::binary);
+        std::ofstream r_file(get_bin_file_path("ba_step1_residuals.bin"), std::ios::binary);
+        std::ofstream v_file(get_bin_file_path("ba_step1_validity.bin"), std::ios::binary);
         // Also save coords at center that BA actually uses for residual computation
         std::vector<float> coords_center_ba(num_active * 2);
         for (int e = 0; e < num_active; e++) {
             coords_center_ba[e * 2 + 0] = coords[e * 2 * P * P + 0 * P * P + center_idx];
             coords_center_ba[e * 2 + 1] = coords[e * 2 * P * P + 1 * P * P + center_idx];
         }
-        std::ofstream coords_center_file("ba_step1_coords_center.bin", std::ios::binary);
+        std::ofstream coords_center_file(get_bin_file_path("ba_step1_coords_center.bin"), std::ios::binary);
         
         if (r_file.is_open() && v_file.is_open() && coords_center_file.is_open()) {
             // Debug: Log what we're saving (first 3 edges)
@@ -375,7 +395,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 3: Hessian blocks (including Ejk for comparison)
     if (save_intermediates) {
-        std::ofstream Ejk_file("ba_step3_Ejk.bin", std::ios::binary);
+        std::ofstream Ejk_file(get_bin_file_path("ba_step3_Ejk.bin"), std::ios::binary);
         if (Ejk_file.is_open()) {
             Ejk_file.write(reinterpret_cast<const char*>(Ejk.data()), sizeof(float) * num_active * 6 * 1);
             Ejk_file.close();
@@ -385,12 +405,12 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 2: Weighted Jacobians
     if (save_intermediates) {
-        std::ofstream wJiT_file("ba_step2_wJiT.bin", std::ios::binary);
-        std::ofstream wJjT_file("ba_step2_wJjT.bin", std::ios::binary);
-        std::ofstream wJzT_file("ba_step2_wJzT.bin", std::ios::binary);
-        std::ofstream weights_masked_file("ba_step2_weights_masked.bin", std::ios::binary);
-        std::ofstream Ji_center_file("ba_step2_Ji_center.bin", std::ios::binary);
-        std::ofstream Jj_center_file("ba_step2_Jj_center.bin", std::ios::binary);
+        std::ofstream wJiT_file(get_bin_file_path("ba_step2_wJiT.bin"), std::ios::binary);
+        std::ofstream wJjT_file(get_bin_file_path("ba_step2_wJjT.bin"), std::ios::binary);
+        std::ofstream wJzT_file(get_bin_file_path("ba_step2_wJzT.bin"), std::ios::binary);
+        std::ofstream weights_masked_file(get_bin_file_path("ba_step2_weights_masked.bin"), std::ios::binary);
+        std::ofstream Ji_center_file(get_bin_file_path("ba_step2_Ji_center.bin"), std::ios::binary);
+        std::ofstream Jj_center_file(get_bin_file_path("ba_step2_Jj_center.bin"), std::ios::binary);
         if (wJiT_file.is_open() && wJjT_file.is_open() && wJzT_file.is_open() && weights_masked_file.is_open() &&
             Ji_center_file.is_open() && Jj_center_file.is_open()) {
             // Eigen matrices are column-major, but Python expects row-major
@@ -442,12 +462,12 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 3: Hessian blocks
     if (save_intermediates) {
-        std::ofstream Bii_file("ba_step3_Bii.bin", std::ios::binary);
-        std::ofstream Bij_file("ba_step3_Bij.bin", std::ios::binary);
-        std::ofstream Bji_file("ba_step3_Bji.bin", std::ios::binary);
-        std::ofstream Bjj_file("ba_step3_Bjj.bin", std::ios::binary);
-        std::ofstream Eik_file("ba_step3_Eik.bin", std::ios::binary);
-        std::ofstream Ejk_file("ba_step3_Ejk.bin", std::ios::binary);
+        std::ofstream Bii_file(get_bin_file_path("ba_step3_Bii.bin"), std::ios::binary);
+        std::ofstream Bij_file(get_bin_file_path("ba_step3_Bij.bin"), std::ios::binary);
+        std::ofstream Bji_file(get_bin_file_path("ba_step3_Bji.bin"), std::ios::binary);
+        std::ofstream Bjj_file(get_bin_file_path("ba_step3_Bjj.bin"), std::ios::binary);
+        std::ofstream Eik_file(get_bin_file_path("ba_step3_Eik.bin"), std::ios::binary);
+        std::ofstream Ejk_file(get_bin_file_path("ba_step3_Ejk.bin"), std::ios::binary);
         if (Bii_file.is_open() && Bij_file.is_open() && Bji_file.is_open() && 
             Bjj_file.is_open() && Eik_file.is_open() && Ejk_file.is_open()) {
             // Eigen matrices are column-major, but Python expects row-major
@@ -525,9 +545,9 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 4: Gradients
     if (save_intermediates) {
-        std::ofstream vi_file("ba_step4_vi.bin", std::ios::binary);
-        std::ofstream vj_file("ba_step4_vj.bin", std::ios::binary);
-        std::ofstream w_vec_file("ba_step4_w_vec.bin", std::ios::binary);
+        std::ofstream vi_file(get_bin_file_path("ba_step4_vi.bin"), std::ios::binary);
+        std::ofstream vj_file(get_bin_file_path("ba_step4_vj.bin"), std::ios::binary);
+        std::ofstream w_vec_file(get_bin_file_path("ba_step4_w_vec.bin"), std::ios::binary);
         if (vi_file.is_open() && vj_file.is_open() && w_vec_file.is_open()) {
             for (int e = 0; e < num_active; e++) {
                 vi_file.write(reinterpret_cast<const char*>(vi[e].data()), sizeof(float) * 6);
@@ -697,7 +717,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 9: Assembled Hessian B
     if (save_intermediates) {
-        std::ofstream B_file("ba_step9_B.bin", std::ios::binary);
+        std::ofstream B_file(get_bin_file_path("ba_step9_B.bin"), std::ios::binary);
         if (B_file.is_open()) {
             B_file.write(reinterpret_cast<const char*>(B.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
             B_file.close();
@@ -799,7 +819,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 10: Pose-structure coupling E
     if (save_intermediates) {
-        std::ofstream E_file("ba_step10_E.bin", std::ios::binary);
+        std::ofstream E_file(get_bin_file_path("ba_step10_E.bin"), std::ios::binary);
         if (E_file.is_open()) {
             E_file.write(reinterpret_cast<const char*>(E.data()), sizeof(float) * 6 * n_adjusted * m);
             E_file.close();
@@ -829,7 +849,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 11: Structure Hessian C
     if (save_intermediates) {
-        std::ofstream C_file("ba_step11_C.bin", std::ios::binary);
+        std::ofstream C_file(get_bin_file_path("ba_step11_C.bin"), std::ios::binary);
         if (C_file.is_open()) {
             C_file.write(reinterpret_cast<const char*>(C.data()), sizeof(float) * m);
             C_file.close();
@@ -931,8 +951,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 11: Assembled gradients
     if (save_intermediates) {
-        std::ofstream v_grad_file("ba_step11_v_grad.bin", std::ios::binary);
-        std::ofstream w_grad_file("ba_step11_w_grad.bin", std::ios::binary);
+        std::ofstream v_grad_file(get_bin_file_path("ba_step11_v_grad.bin"), std::ios::binary);
+        std::ofstream w_grad_file(get_bin_file_path("ba_step11_w_grad.bin"), std::ios::binary);
         if (v_grad_file.is_open() && w_grad_file.is_open()) {
             v_grad_file.write(reinterpret_cast<const char*>(v_grad.data()), sizeof(float) * 6 * n_adjusted);
             w_grad_file.write(reinterpret_cast<const char*>(w_grad.data()), sizeof(float) * m);
@@ -948,7 +968,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 13: Q (inverse structure Hessian)
     if (save_intermediates) {
-        std::ofstream Q_file("ba_step13_Q.bin", std::ios::binary);
+        std::ofstream Q_file(get_bin_file_path("ba_step13_Q.bin"), std::ios::binary);
         if (Q_file.is_open()) {
             Q_file.write(reinterpret_cast<const char*>(Q.data()), sizeof(float) * m);
             Q_file.close();
@@ -965,8 +985,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 14: Schur complement S and RHS y
     if (save_intermediates) {
-        std::ofstream S_file("ba_step14_S.bin", std::ios::binary);
-        std::ofstream y_file("ba_step14_y.bin", std::ios::binary);
+        std::ofstream S_file(get_bin_file_path("ba_step14_S.bin"), std::ios::binary);
+        std::ofstream y_file(get_bin_file_path("ba_step14_y.bin"), std::ios::binary);
         if (S_file.is_open() && y_file.is_open()) {
             S_file.write(reinterpret_cast<const char*>(S.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
             y_file.write(reinterpret_cast<const char*>(y.data()), sizeof(float) * 6 * n_adjusted);
@@ -1040,8 +1060,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             
             // Save STEP 15-16: Solution dX and dZ
             if (save_intermediates) {
-                std::ofstream dX_file("ba_step15_dX.bin", std::ios::binary);
-                std::ofstream dZ_file("ba_step16_dZ.bin", std::ios::binary);
+                std::ofstream dX_file(get_bin_file_path("ba_step15_dX.bin"), std::ios::binary);
+                std::ofstream dZ_file(get_bin_file_path("ba_step16_dZ.bin"), std::ios::binary);
                 if (dX_file.is_open() && dZ_file.is_open()) {
                     dX_file.write(reinterpret_cast<const char*>(dX.data()), sizeof(float) * dX.size());
                     dZ_file.write(reinterpret_cast<const char*>(dZ.data()), sizeof(float) * dZ.size());

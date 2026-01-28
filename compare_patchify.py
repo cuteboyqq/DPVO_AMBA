@@ -299,8 +299,9 @@ def compare_arrays(arr1, arr2, name, tolerance=1e-5, show_samples=True):
 
 def load_inputs(frame_idx):
     """Load fnet and inet input files"""
-    fnet_bin = f"fnet_frame{frame_idx}.bin"
-    inet_bin = f"inet_frame{frame_idx}.bin"
+    bin_dir = "bin_file"
+    fnet_bin = os.path.join(bin_dir, f"fnet_frame{frame_idx}.bin")
+    inet_bin = os.path.join(bin_dir, f"inet_frame{frame_idx}.bin")
     
     print(f"\n📁 Loading inputs for frame {frame_idx}...")
     print(f"   FNet: {fnet_bin}")
@@ -328,7 +329,8 @@ def load_inputs(frame_idx):
 
 def load_or_generate_coordinates(frame_idx, fmap_H, fmap_W, M=4):
     """Load C++ coordinates if available, otherwise generate new ones"""
-    cpp_coords_bin = f"cpp_coords_frame{frame_idx}.bin"
+    bin_dir = "bin_file"
+    cpp_coords_bin = os.path.join(bin_dir, f"cpp_coords_frame{frame_idx}.bin")
     
     if os.path.exists(cpp_coords_bin):
         print(f"\n📁 Loading C++ coordinates from {cpp_coords_bin}...")
@@ -358,22 +360,31 @@ def load_or_generate_coordinates(frame_idx, fmap_H, fmap_W, M=4):
 
 def save_python_outputs(frame_idx, py_gmap, py_imap_patches, py_patches, coords):
     """Save Python patchify outputs to binary files"""
-    py_gmap.tofile(f"python_gmap_frame{frame_idx}.bin")
-    py_imap_patches.tofile(f"python_imap_frame{frame_idx}.bin")
-    py_patches.tofile(f"python_patches_frame{frame_idx}.bin")
-    coords.tofile(f"python_coords_frame{frame_idx}.bin")
+    bin_dir = "bin_file"
+    os.makedirs(bin_dir, exist_ok=True)
+    
+    py_gmap_path = os.path.join(bin_dir, f"python_gmap_frame{frame_idx}.bin")
+    py_imap_path = os.path.join(bin_dir, f"python_imap_frame{frame_idx}.bin")
+    py_patches_path = os.path.join(bin_dir, f"python_patches_frame{frame_idx}.bin")
+    py_coords_path = os.path.join(bin_dir, f"python_coords_frame{frame_idx}.bin")
+    
+    py_gmap.tofile(py_gmap_path)
+    py_imap_patches.tofile(py_imap_path)
+    py_patches.tofile(py_patches_path)
+    coords.tofile(py_coords_path)
     
     print(f"\n💾 Saved Python outputs:")
-    print(f"   python_gmap_frame{frame_idx}.bin")
-    print(f"   python_imap_frame{frame_idx}.bin")
-    print(f"   python_patches_frame{frame_idx}.bin")
-    print(f"   python_coords_frame{frame_idx}.bin")
+    print(f"   {py_gmap_path}")
+    print(f"   {py_imap_path}")
+    print(f"   {py_patches_path}")
+    print(f"   {py_coords_path}")
 
 def load_cpp_outputs(frame_idx, M=4, P=3):
     """Load and reshape C++ patchify outputs"""
-    cpp_gmap_bin = f"cpp_gmap_frame{frame_idx}.bin"
-    cpp_imap_bin = f"cpp_imap_frame{frame_idx}.bin"
-    cpp_patches_bin = f"cpp_patches_frame{frame_idx}.bin"
+    bin_dir = "bin_file"
+    cpp_gmap_bin = os.path.join(bin_dir, f"cpp_gmap_frame{frame_idx}.bin")
+    cpp_imap_bin = os.path.join(bin_dir, f"cpp_imap_frame{frame_idx}.bin")
+    cpp_patches_bin = os.path.join(bin_dir, f"cpp_patches_frame{frame_idx}.bin")
     
     if not os.path.exists(cpp_gmap_bin):
         return None, None, None
@@ -527,11 +538,11 @@ def main():
         run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap_patches, cpp_patches, py_patches)
     else:
         print(f"\n⚠️  C++ outputs not found. To compare:")
-        print(f"   1. Run C++ code to generate cpp_*_frame{frame_idx}.bin files")
+        print(f"   1. Run C++ code to generate bin_file/cpp_*_frame{frame_idx}.bin files")
         print(f"   2. Re-run this script")
     
     print(f"\n✅ Python patchify completed!")
-    print(f"   Use the saved .bin files to compare with C++ outputs")
+    print(f"   Use the saved .bin files in bin_file/ folder to compare with C++ outputs")
     
     return 0
 
