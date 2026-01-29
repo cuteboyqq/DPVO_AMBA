@@ -1,4 +1,5 @@
 #include "correlation_kernel.hpp"
+#include "correlation_bilinear_helpers.hpp"  // Bilinear interpolation helpers for grid_sample matching
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -320,9 +321,9 @@ void computeCorrelationSingle(
     }
     
     const int R = radius;
-    // Note: Python's CUDA kernel uses D = 2*R + 2 internally, then reduces to D = 2*R + 1 via bilinear interpolation
-    // C++ directly computes D = 2*R + 1 to match Python's final output (no bilinear interpolation needed)
-    const int D = 2 * R + 1;  // Correlation window diameter (D = 7 for R=3, matches Python final output)
+    // Match Python's corr_torch_forward_fp16: compute 8x8 correlation first, then reduce to 7x7 via bilinear wrapper
+    const int D_internal = 2 * R + 2;  // Internal correlation window (D = 8 for R=3, matches Python's 8x8 computation)
+    const int D_output = 2 * R + 1;    // Final output size (D = 7 for R=3, matches Python's final 7x7 output)
     
     // gmap structure: created by patchify_cpu_safe with radius=1, so D_gmap=3 (matches Python)
     const int D_gmap = 3;  // D_gmap = 2*radius + 1 = 3 (matches Python: .view(..., P, P) where P=3)
@@ -331,10 +332,14 @@ void computeCorrelationSingle(
     // Calculate buffer sizes
     const size_t gmap_total_size = static_cast<size_t>(num_gmap_frames) * M * feature_dim * D_gmap * D_gmap;
     const size_t pyramid_total_size = static_cast<size_t>(num_frames) * feature_dim * fmap_H * fmap_W;
-    const size_t corr_total_size = static_cast<size_t>(num_active) * D * D * P * P;
+    const size_t corr_internal_size = static_cast<size_t>(num_active) * D_internal * D_internal * P * P;
+    const size_t corr_output_size = static_cast<size_t>(num_active) * D_output * D_output * P * P;
+    
+    // Allocate temporary buffer for 8x8 correlation
+    std::vector<float> corr_internal(corr_internal_size, 0.0f);
     
     // Zero output (matches CUDA behavior)
-    std::memset(corr_out, 0, sizeof(float) * corr_total_size);
+    std::memset(corr_out, 0, sizeof(float) * corr_output_size);
     
     // Diagnostic logging setup
     auto logger = spdlog::get("dpvo");
@@ -529,106 +534,181 @@ void computeCorrelationSingle(
                     continue;  // Skip correlation computation for invalid coordinates
                 }
                 
-                // For each offset in correlation window (ii, jj) - equivalent to CUDA's D * D loop
-                for (int corr_ii = 0; corr_ii < D; corr_ii++) {
-                    for (int corr_jj = 0; corr_jj < D; corr_jj++) {
-                        // Calculate sampling location in target frame
-                        // CUDA: i1 = floor(y) + (ii - R), j1 = floor(x) + (jj - R)
-                        int i1 = static_cast<int>(std::floor(y)) + (corr_ii - R);
-                        int j1 = static_cast<int>(std::floor(x)) + (corr_jj - R);
+                // Match Python's corr_torch_forward_fp16: compute 8x8 correlation at integer offsets first
+                float x0 = std::floor(x);
+                float y0 = std::floor(y);
+                
+                // Step 1: Compute 8x8 correlation at integer offsets (matching Python's internal computation)
+                // Python uses offsets: torch.arange(-radius, radius + 2) = [-3, -2, -1, 0, 1, 2, 3, 4]
+                for (int corr_ii = 0; corr_ii < D_internal; corr_ii++) {
+                    for (int corr_jj = 0; corr_jj < D_internal; corr_jj++) {
+                        // Calculate correlation window offset (in pixels) - integer offsets
+                        float offset_x = static_cast<float>(corr_jj - R);
+                        float offset_y = static_cast<float>(corr_ii - R);
+                        
+                        // Add offset in pixel space (matching Python: gx = x0 + ox)
+                        float gx = x0 + offset_x;
+                        float gy = y0 + offset_y;
+                        
+                        // Normalize coordinates to [-1, 1] range (matching Python: gx = 2 * gx / (W2 - 1) - 1)
+                        // Python uses align_corners=True, which uses the same normalization formula
+                        float x_norm, y_norm;
+                        normalize_coords_for_grid_sample(gx, gy, fmap_H, fmap_W, x_norm, y_norm);
                         
                         // Diagnostic: Log sampling location for first edge, first pixel, center offset
-                        // Only log if out of bounds (to reduce noise)
                         bool is_center = (corr_ii == R && corr_jj == R);
-                        if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                            bool in_bounds_check = within_bounds(i1, j1, fmap_H, fmap_W);
-                            if (!in_bounds_check) {
-                                // Only warn if out of bounds - this is expected for some reprojected coordinates
-                                logger->warn("computeCorrelationSingle: Edge[0] center sampling out of bounds - "
-                                             "i1={}, j1={}, bounds=({}, {}), scaled_coords=({:.2f}, {:.2f})",
-                                             i1, j1, fmap_H, fmap_W, x, y);
+                        bool is_debug_edge = (e == 0 || e == 4 || e == 29);
+                        if (is_debug_edge && i0 == P/2 && j0 == P/2 && is_center && logger) {
+                            logger->info("computeCorrelationSingle: Edge[{}] center (bilinear, normalized) - "
+                                         "base=({:.2f}, {:.2f}), offset=({:.2f}, {:.2f}), "
+                                         "pixel=({:.2f}, {:.2f}), norm=({:.4f}, {:.4f})",
+                                         e, x, y, offset_x, offset_y, gx, gy, x_norm, y_norm);
+                        }
+                        
+                        // Compute correlation: dot product over features using bilinear interpolation
+                        // This matches Python's grid_sample behavior:
+                        // - Normalizes coordinates to [-1, 1] range
+                        // - Uses bilinear interpolation instead of nearest neighbor
+                        // - Returns 0.0 for out-of-bounds coordinates
+                        float sum = 0.0f;
+                        
+                        // Extract patch feature from gmap (unchanged)
+                        int gmap_i = i0 + gmap_center_offset;
+                        int gmap_j = j0 + gmap_center_offset;
+                        
+                        // Dot product over feature channels
+                        int features_processed = 0;
+                        for (int f = 0; f < feature_dim; f++) {
+                            // fmap1: patch feature from gmap (unchanged - still uses integer indexing)
+                            size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
+                                               static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
+                                               static_cast<size_t>(f) * D_gmap * D_gmap +
+                                               static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
+                            
+                            // Bounds check for gmap access
+                            if (fmap1_idx >= gmap_total_size) {
+                                if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
+                                    logger->warn("computeCorrelationSingle: Edge[0] feature[0] gmap out of bounds - "
+                                                 "fmap1_idx={} (max={})",
+                                                 fmap1_idx, gmap_total_size);
+                                }
+                                continue;
+                            }
+                            
+                            float f1 = gmap[fmap1_idx];
+                            
+                            // fmap2: frame feature from pyramid using bilinear interpolation
+                            // Use normalized coordinates directly (already computed above)
+                            size_t frame_offset = static_cast<size_t>(pyramid_frame) * static_cast<size_t>(feature_dim) * static_cast<size_t>(fmap_H) * static_cast<size_t>(fmap_W);
+                            float f2 = bilinear_sample_grid_sample(
+                                pyramid,
+                                x_norm, y_norm,
+                                fmap_H, fmap_W,
+                                f, feature_dim,
+                                frame_offset
+                            );
+                            
+                            sum += f1 * f2;
+                            features_processed++;
+                            
+                            // Diagnostic: Log first feature values for first edge, first pixel, center offset
+                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
+                                logger->info("computeCorrelationSingle: Edge[0] feature[0] (bilinear, normalized) - "
+                                             "f1_idx={}, f1={:.6f}, f2={:.6f} (bilinear), sum_so_far={:.6f}",
+                                             fmap1_idx, f1, f2, sum);
                             }
                         }
                         
-                        // Compute correlation: dot product over features (matches CUDA)
-                        // Note: Python's grid_sample returns 0 for out-of-bounds coordinates
-                        // C++ matches this behavior by checking bounds and leaving sum=0.0f for out-of-bounds
-                        float sum = 0.0f;
-                        bool in_bounds = within_bounds(i1, j1, fmap_H, fmap_W);
-                        if (in_bounds) {
-                            // Extract patch feature from gmap
-                            int gmap_i = i0 + gmap_center_offset;
-                            int gmap_j = j0 + gmap_center_offset;
-                            
-                            // Dot product over feature channels
-                            int features_processed = 0;
-                            for (int f = 0; f < feature_dim; f++) {
-                                // fmap1: patch feature from gmap
-                                size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
-                                                   static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
-                                                   static_cast<size_t>(f) * D_gmap * D_gmap +
-                                                   static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
-                                
-                                // fmap2: frame feature from pyramid at reprojected location
-                                size_t fmap2_idx = static_cast<size_t>(pyramid_frame) * feature_dim * fmap_H * fmap_W +
-                                                   static_cast<size_t>(f) * fmap_H * fmap_W +
-                                                   static_cast<size_t>(i1) * fmap_W + static_cast<size_t>(j1);
-                                
-                                // Bounds check and compute correlation
-                                if (fmap1_idx < gmap_total_size && fmap2_idx < pyramid_total_size) {
-                                    float f1 = gmap[fmap1_idx];
-                                    float f2 = pyramid[fmap2_idx];
-                                    sum += f1 * f2;
-                                    features_processed++;
-                                    
-                                    // Diagnostic: Log first feature values for first edge, first pixel, center offset
-                                    if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
-                                        logger->info("computeCorrelationSingle: Edge[0] feature[0] - f1_idx={}, f2_idx={}, "
-                                                     "f1={:.6f}, f2={:.6f}, sum_so_far={:.6f}",
-                                                     fmap1_idx, fmap2_idx, f1, f2, sum);
-                                    }
-                                } else {
-                                    // Diagnostic: Log out-of-bounds access
-                                    if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
-                                        logger->warn("computeCorrelationSingle: Edge[0] feature[0] out of bounds - "
-                                                     "fmap1_idx={} (max={}), fmap2_idx={} (max={})",
-                                                     fmap1_idx, gmap_total_size, fmap2_idx, pyramid_total_size);
-                                    }
-                                }
-                            }
-                            
-                            // Diagnostic: Log correlation sum for first edge, first pixel, center offset
-                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                                logger->info("computeCorrelationSingle: Edge[0] center correlation - sum={:.6f}, "
-                                             "features_processed={}/{}",
-                                             sum, features_processed, feature_dim);
-                            }
+                        // Diagnostic: Log correlation sum for first edge, first pixel, center offset
+                        if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
+                            logger->info("computeCorrelationSingle: Edge[0] center correlation (bilinear, normalized) - "
+                                         "sum={:.6f}, features_processed={}/{}",
+                                         sum, features_processed, feature_dim);
                         }
-                        // Note: Out-of-bounds sampling is expected for some reprojected coordinates
-                        // (e.g., when patches from one frame reproject outside the image in another frame)
+                        
+                        // Note: Out-of-bounds sampling returns 0.0 from bilinear_sample_grid_sample
+                        // (matching Python's grid_sample behavior)
                         // The code correctly skips correlation computation for out-of-bounds pixels
                         
-                        // Store correlation (matches CUDA's corr[n][m][ii][jj][i0][j0])
-                        // Output layout: [num_active, D, D, P, P]
-                        size_t out_idx = static_cast<size_t>(e) * D * D * P * P +
-                                         static_cast<size_t>(corr_ii) * D * P * P +
-                                         static_cast<size_t>(corr_jj) * P * P +
-                                         static_cast<size_t>(i0) * P +
-                                         static_cast<size_t>(j0);
+                        // Store correlation in internal 8x8 buffer
+                        // Layout: [num_active, D_internal, D_internal, P, P]
+                        size_t internal_idx = static_cast<size_t>(e) * D_internal * D_internal * P * P +
+                                              static_cast<size_t>(corr_ii) * D_internal * P * P +
+                                              static_cast<size_t>(corr_jj) * P * P +
+                                              static_cast<size_t>(i0) * P +
+                                              static_cast<size_t>(j0);
                         
-                        if (out_idx < corr_total_size) {
-                            corr_out[out_idx] = sum;
+                        if (internal_idx < corr_internal_size) {
+                            corr_internal[internal_idx] = sum;
                             
                             // Diagnostic: Log stored value for first edge, first pixel, center offset
                             if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                                logger->info("computeCorrelationSingle: Edge[0] stored correlation - out_idx={}, value={:.6f}",
-                                             out_idx, sum);
+                                logger->info("computeCorrelationSingle: Edge[0] stored 8x8 correlation - internal_idx={}, value={:.6f}",
+                                             internal_idx, sum);
                             }
                         } else {
                             if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                                logger->error("computeCorrelationSingle: Edge[0] out_idx={} >= corr_total_size={}",
-                                              out_idx, corr_total_size);
+                                logger->error("computeCorrelationSingle: Edge[0] internal_idx={} >= corr_internal_size={}",
+                                              internal_idx, corr_internal_size);
                             }
+                        }
+                    }
+                }
+                
+                // Step 2: Apply bilinear wrapper interpolation to reduce from 8x8 to 7x7 (matching Python)
+                // Python's formula: out[i,j] = (1-dx)*(1-dy)*corr[i,j] + dx*(1-dy)*corr[i,j+1] + (1-dx)*dy*corr[i+1,j] + dx*dy*corr[i+1,j+1]
+                // Python converts dx and dy to half precision: dx = dx.half(), dy = dy.half()
+                float dx_raw = x - x0;  // Fractional part of x
+                float dy_raw = y - y0;  // Fractional part of y
+                
+                // Convert to half precision and back to float32 (matching Python's .half() conversion)
+                float dx = float_to_half_to_float(dx_raw);
+                float dy = float_to_half_to_float(dy_raw);
+                
+                for (int out_ii = 0; out_ii < D_output; out_ii++) {
+                    for (int out_jj = 0; out_jj < D_output; out_jj++) {
+                        // Bilinear interpolation from 8x8 internal buffer
+                        // Interpolate from: corr[out_ii, out_jj], corr[out_ii, out_jj+1], corr[out_ii+1, out_jj], corr[out_ii+1, out_jj+1]
+                        size_t idx00 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
+                                       static_cast<size_t>(out_ii) * D_internal * P * P +
+                                       static_cast<size_t>(out_jj) * P * P +
+                                       static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
+                        size_t idx01 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
+                                       static_cast<size_t>(out_ii) * D_internal * P * P +
+                                       static_cast<size_t>(out_jj + 1) * P * P +
+                                       static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
+                        size_t idx10 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
+                                       static_cast<size_t>(out_ii + 1) * D_internal * P * P +
+                                       static_cast<size_t>(out_jj) * P * P +
+                                       static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
+                        size_t idx11 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
+                                       static_cast<size_t>(out_ii + 1) * D_internal * P * P +
+                                       static_cast<size_t>(out_jj + 1) * P * P +
+                                       static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
+                        
+                        // Bilinear interpolation weights
+                        float w00 = (1.0f - dx) * (1.0f - dy);
+                        float w01 = dx * (1.0f - dy);
+                        float w10 = (1.0f - dx) * dy;
+                        float w11 = dx * dy;
+                        
+                        // Get values from internal buffer (with bounds checking)
+                        float v00 = (idx00 < corr_internal_size) ? corr_internal[idx00] : 0.0f;
+                        float v01 = (idx01 < corr_internal_size) ? corr_internal[idx01] : 0.0f;
+                        float v10 = (idx10 < corr_internal_size) ? corr_internal[idx10] : 0.0f;
+                        float v11 = (idx11 < corr_internal_size) ? corr_internal[idx11] : 0.0f;
+                        
+                        // Interpolate
+                        float interpolated = w00 * v00 + w01 * v01 + w10 * v10 + w11 * v11;
+                        
+                        // Store in output buffer (7x7)
+                        size_t out_idx = static_cast<size_t>(e) * D_output * D_output * P * P +
+                                         static_cast<size_t>(out_ii) * D_output * P * P +
+                                         static_cast<size_t>(out_jj) * P * P +
+                                         static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
+                        
+                        if (out_idx < corr_output_size) {
+                            corr_out[out_idx] = interpolated;
                         }
                     }
                 }
@@ -643,7 +723,7 @@ void computeCorrelationSingle(
         float min_corr = std::numeric_limits<float>::max();
         double sum_corr = 0.0;
         
-        for (size_t i = 0; i < corr_total_size; i++) {
+        for (size_t i = 0; i < corr_output_size; i++) {
             float val = corr_out[i];
             if (val != 0.0f) {
                 nonzero_count++;
@@ -653,10 +733,10 @@ void computeCorrelationSingle(
             sum_corr += val;
         }
         
-        float mean_corr = corr_total_size > 0 ? static_cast<float>(sum_corr / corr_total_size) : 0.0f;
+        float mean_corr = corr_output_size > 0 ? static_cast<float>(sum_corr / corr_output_size) : 0.0f;
         logger->info("computeCorrelationSingle: Output stats - size={}, nonzero={}, zero={}, "
                      "min={:.6f}, max={:.6f}, mean={:.6f}",
-                     corr_total_size, nonzero_count, corr_total_size - nonzero_count,
+                     corr_output_size, nonzero_count, corr_output_size - nonzero_count,
                      min_corr, max_corr, mean_corr);
     }
 }
@@ -700,9 +780,8 @@ void computeCorrelation(
     }
     
     const int R = 3;  // Correlation radius (matches Python: altcorr.corr(..., 3))
-    // Note: Python's CUDA kernel uses D = 2*R + 2 internally, then reduces to D = 2*R + 1 via bilinear interpolation
-    // C++ directly computes D = 2*R + 1 to match Python's final output (no bilinear interpolation needed)
-    const int D = 2 * R + 1;  // Correlation window diameter (D = 7 for R=3, matches Python final output)
+    // computeCorrelationSingle now computes 8x8 correlation and reduces to 7x7 via bilinear wrapper (matching Python)
+    const int D_output = 2 * R + 1;  // Final output size (D = 7 for R=3, matches Python's final 7x7 output)
     
     // Map indices (matches Python: ii1 = kk % (M * pmem), jj1 = jj % mem)
     std::vector<int> ii1(num_active);
@@ -723,8 +802,8 @@ void computeCorrelation(
     }
     
     // Allocate temporary buffers for individual correlation volumes
-    // Each correlation volume: [num_active, D, D, P, P]
-    const size_t corr_single_size = static_cast<size_t>(num_active) * D * D * P * P;
+    // Each correlation volume: [num_active, D_output, D_output, P, P] where D_output = 7
+    const size_t corr_single_size = static_cast<size_t>(num_active) * D_output * D_output * P * P;
     std::vector<float> corr1(corr_single_size);
     std::vector<float> corr2(corr_single_size);
     
@@ -758,28 +837,28 @@ void computeCorrelation(
     // Output layout: [num_active, D, D, P, P, 2] (channel last)
     // This interleaves the two correlation volumes along the channel dimension
     for (int e = 0; e < num_active; e++) {
-        for (int corr_ii = 0; corr_ii < D; corr_ii++) {
-            for (int corr_jj = 0; corr_jj < D; corr_jj++) {
+        for (int corr_ii = 0; corr_ii < D_output; corr_ii++) {
+            for (int corr_jj = 0; corr_jj < D_output; corr_jj++) {
                 for (int i0 = 0; i0 < P; i0++) {
                     for (int j0 = 0; j0 < P; j0++) {
                         // Source indices in corr1 and corr2: [e, corr_ii, corr_jj, i0, j0]
-                        size_t src_idx = static_cast<size_t>(e) * D * D * P * P +
-                                        static_cast<size_t>(corr_ii) * D * P * P +
+                        size_t src_idx = static_cast<size_t>(e) * D_output * D_output * P * P +
+                                        static_cast<size_t>(corr_ii) * D_output * P * P +
                                         static_cast<size_t>(corr_jj) * P * P +
                                         static_cast<size_t>(i0) * P +
                                         static_cast<size_t>(j0);
                         
                         // Destination indices in stacked output: [e, corr_ii, corr_jj, i0, j0, c]
                         // Channel 0: corr1, Channel 1: corr2
-                        size_t dst_idx_c0 = static_cast<size_t>(e) * D * D * P * P * 2 +
-                                            static_cast<size_t>(corr_ii) * D * P * P * 2 +
+                        size_t dst_idx_c0 = static_cast<size_t>(e) * D_output * D_output * P * P * 2 +
+                                            static_cast<size_t>(corr_ii) * D_output * P * P * 2 +
                                             static_cast<size_t>(corr_jj) * P * P * 2 +
                                             static_cast<size_t>(i0) * P * 2 +
                                             static_cast<size_t>(j0) * 2 +
                                             0;  // Channel 0
                         
-                        size_t dst_idx_c1 = static_cast<size_t>(e) * D * D * P * P * 2 +
-                                            static_cast<size_t>(corr_ii) * D * P * P * 2 +
+                        size_t dst_idx_c1 = static_cast<size_t>(e) * D_output * D_output * P * P * 2 +
+                                            static_cast<size_t>(corr_ii) * D_output * P * P * 2 +
                                             static_cast<size_t>(corr_jj) * P * P * 2 +
                                             static_cast<size_t>(i0) * P * 2 +
                                             static_cast<size_t>(j0) * 2 +
@@ -796,7 +875,7 @@ void computeCorrelation(
     }
     
     // Log statistics (matches original logging)
-    const size_t corr_total_size = static_cast<size_t>(num_active) * D * D * P * P * 2;
+    const size_t corr_total_size = static_cast<size_t>(num_active) * D_output * D_output * P * P * 2;
     
     auto logger = spdlog::get("dpvo");
     if (!logger) {
@@ -855,8 +934,8 @@ void computeCorrelation(
             float edge_max = std::numeric_limits<float>::lowest();
             double edge_sum = 0.0;
             
-            size_t edge_start = static_cast<size_t>(e) * D * D * P * P * 2;
-            size_t edge_size = D * D * P * P * 2;
+            size_t edge_start = static_cast<size_t>(e) * D_output * D_output * P * P * 2;
+            size_t edge_size = D_output * D_output * P * P * 2;
             
             for (size_t i = 0; i < edge_size && (edge_start + i) < corr_total_size; i++) {
                 float val = corr_out[edge_start + i];
