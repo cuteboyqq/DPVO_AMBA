@@ -803,21 +803,21 @@ def compute_python_gij(poses_batch, i, j, poses_cpp):
         gij_py[:3] = gij_py_data[:3]  # Translation
         gij_py[3:6] = gij_py_data[4:7]  # qx, qy, qz
         gij_py[6] = gij_py_data[3]  # qw
-    else:
-        # Manual computation using scipy
-        if R is None:
-            raise RuntimeError("Cannot compute Gij without lietorch or scipy")
-        # Compute Gij manually using the same poses_cpp that C++ used
-        Ti = se3_to_matrix(ti_py)
-        Tj = se3_to_matrix(tj_py)
-        Gij_mat = Tj @ np.linalg.inv(Ti)
-        # Extract translation and rotation
-        gij_t = Gij_mat[:3, 3]
-        gij_R = Gij_mat[:3, :3]
-        # Convert rotation matrix to quaternion
-        rot = R.from_matrix(gij_R)
-        gij_q = rot.as_quat()  # [x, y, z, w]
-        gij_py = np.concatenate([gij_t, gij_q])
+    # else:
+    #     # Manual computation using scipy
+    #     if R is None:
+    #         raise RuntimeError("Cannot compute Gij without lietorch or scipy")
+    #     # Compute Gij manually using the same poses_cpp that C++ used
+    #     Ti = se3_to_matrix(ti_py)
+    #     Tj = se3_to_matrix(tj_py)
+    #     Gij_mat = Tj @ np.linalg.inv(Ti)
+    #     # Extract translation and rotation
+    #     gij_t = Gij_mat[:3, 3]
+    #     gij_R = Gij_mat[:3, :3]
+    #     # Convert rotation matrix to quaternion
+    #     rot = R.from_matrix(gij_R)
+    #     gij_q = rot.as_quat()  # [x, y, z, w]
+    #     gij_py = np.concatenate([gij_t, gij_q])
     
     print(f"✅ Computed Python Gij")
     print(f"   Gij: {gij_py}")
