@@ -14,10 +14,9 @@
 #ifndef __JSON_LOG__
 #define __JSON_LOG__
 
-#include "json.hpp"
 #include <fstream>
 #include <vector>
-#include "nlohmann/json.hpp"  // Make sure this path is correct
+#include <nlohmann/json.hpp>  // Use system-installed version (3.12.0)
 // DEPRECATED: bounding_box.hpp removed
 // #include "bounding_box.hpp"
 #include "dataStructures.h"

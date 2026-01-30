@@ -1,4 +1,6 @@
 #include "projective_ops.hpp"
+#include "ba_file_io.hpp"
+#include "target_frame.hpp"
 #include <algorithm>
 #include <cmath>
 #include <spdlog/spdlog.h>
@@ -228,7 +230,9 @@ void transformWithJacobians(
     float* Ji_out,          // [num_edges, 2, P, P, 6] flattened - Jacobian w.r.t. pose i
     float* Jj_out,          // [num_edges, 2, P, P, 6] flattened - Jacobian w.r.t. pose j
     float* Jz_out,          // [num_edges, 2, P, P, 1] flattened - Jacobian w.r.t. inverse depth
-    float* valid_out)       // [num_edges, P, P] flattened - Validity mask (1=valid, 0=invalid)
+    float* valid_out,       // [num_edges, P, P] flattened - Validity mask (1=valid, 0=invalid)
+    int frame_num,          // Optional: frame number for saving intermediate values
+    bool save_intermediates) // Optional: whether to save Ti, Tj, Gij, Jacobians
 {
     // ========================================================================
     // MAIN LOOP: Process each edge (connection between patch and frame)
@@ -270,6 +274,24 @@ void transformWithJacobians(
         const SE3& Ti = poses[i];
         const SE3& Tj = poses[j];
         SE3 Gij = Tj * Ti.inverse();  // Transform from frame i to frame j
+
+        // Save intermediate SE3 values if requested
+        if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
+            auto logger = spdlog::get("dpvo");
+            if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+                logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+                logger = spdlog::stdout_color_mt("dpvo");
+                logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+            }
+            std::string frame_suffix = std::to_string(frame_num);
+            std::string edge_suffix = std::to_string(e);
+            ba_file_io::save_se3_object("reproject_Ti_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Ti, logger);
+            ba_file_io::save_se3_object("reproject_Tj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Tj, logger);
+            ba_file_io::save_se3_object("reproject_Gij_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Gij, logger);
+        }
 
         // ====================================================================
         // STEP 2: Get camera intrinsics for both frames
@@ -421,8 +443,11 @@ void transformWithJacobians(
 #endif
         }
         
-        // Diagnostic: Log first edge, first pixel
+        // Diagnostic: Log first edge, first pixel AND edge 4, center pixel
         bool log_first_pixel = (e == 0);
+        bool log_edge4_center = (e == 4);
+        int center_y = P / 2;  // Center pixel y coordinate
+        int center_x = P / 2;  // Center pixel x coordinate
         
         // Base index for this edge's coordinates
         int base = e * 2 * P * P;
@@ -449,6 +474,18 @@ void transformWithJacobians(
                                  intr_j[0], intr_j[1], intr_j[2], intr_j[3]);
                 }
                 
+                // Diagnostic: Log Edge 4 center pixel values
+                if (log_edge4_center && y == center_y && x == center_x && logger) {
+                    logger->info("transformWithJacobians: Edge[4] pixel[{}/{}] - i={}, patch_idx={}, k={}, j={}, "
+                                 "px_pix={:.6f}, py_pix={:.6f}, pd_pix={:.6f}, "
+                                 "intr_i=[{:.6f}, {:.6f}, {:.6f}, {:.6f}], "
+                                 "intr_j=[{:.6f}, {:.6f}, {:.6f}, {:.6f}]",
+                                 center_y, center_x, i, patch_idx, k, j,
+                                 px_pix, py_pix, pd_pix,
+                                 intr_i[0], intr_i[1], intr_i[2], intr_i[3],
+                                 intr_j[0], intr_j[1], intr_j[2], intr_j[3]);
+                }
+                
 
                 // Inverse projection: returns homogeneous coordinates [X, Y, Z, W]
                 // where X, Y are normalized coordinates, Z=1, W=inverse_depth
@@ -460,6 +497,12 @@ void transformWithJacobians(
                 // Diagnostic: Log inverse projection
                 if (log_first_pixel && y == 0 && x == 0 && logger) {
                     logger->info("transformWithJacobians: Edge[0] inverse_proj - X0={:.6f}, Y0={:.6f}, Z0={:.6f}, W0={:.6f}",
+                                 X0_pix, Y0_pix, Z0_pix, W0_pix);
+                }
+                
+                // Diagnostic: Log Edge 4 center pixel inverse projection
+                if (log_edge4_center && y == center_y && x == center_x && logger) {
+                    logger->info("transformWithJacobians: Edge[4] inverse_proj - X0={:.6f}, Y0={:.6f}, Z0={:.6f}, W0={:.6f}",
                                  X0_pix, Y0_pix, Z0_pix, W0_pix);
                 }
 
@@ -484,6 +527,23 @@ void transformWithJacobians(
                     Eigen::Vector3f t_j = poses[j].t;
                     logger->info("transformWithJacobians: Edge[0] transform - "
                                  "pose_i.t=({:.3f}, {:.3f}, {:.3f}), pose_j.t=({:.3f}, {:.3f}, {:.3f}), "
+                                 "Gij.t=({:.6f}, {:.6f}, {:.6f}), "
+                                 "p0_vec=({:.6f}, {:.6f}, {:.6f}), p1_vec=({:.6f}, {:.6f}, {:.6f}), "
+                                 "X1=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
+                                 t_i.x(), t_i.y(), t_i.z(),
+                                 t_j.x(), t_j.y(), t_j.z(),
+                                 Gij.t.x(), Gij.t.y(), Gij.t.z(),
+                                 p0_vec.x(), p0_vec.y(), p0_vec.z(),
+                                 p1_vec.x(), p1_vec.y(), p1_vec.z(),
+                                 X1_pix, Y1_pix, Z1_pix, H1_pix);
+                }
+                
+                // Diagnostic: Log Edge 4 center pixel transform
+                if (log_edge4_center && y == center_y && x == center_x && logger) {
+                    Eigen::Vector3f t_i = poses[i].t;
+                    Eigen::Vector3f t_j = poses[j].t;
+                    logger->info("transformWithJacobians: Edge[4] transform - "
+                                 "pose_i.t=({:.6f}, {:.6f}, {:.6f}), pose_j.t=({:.6f}, {:.6f}, {:.6f}), "
                                  "Gij.t=({:.6f}, {:.6f}, {:.6f}), "
                                  "p0_vec=({:.6f}, {:.6f}, {:.6f}), p1_vec=({:.6f}, {:.6f}, {:.6f}), "
                                  "X1=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
@@ -533,6 +593,19 @@ void transformWithJacobians(
                                  u_pix_computed, v_pix_computed,
                                  computed_is_finite);
                 }
+                
+                // Diagnostic: Log Edge 4 center pixel projection computation
+                if (log_edge4_center && y == center_y && x == center_x && logger) {
+                    logger->info("transformWithJacobians: Edge[4] projection computation - "
+                                 "z_pix={:.6f}, d_pix={:.6f}, "
+                                 "X1=({:.6f}, {:.6f}, {:.6f}), "
+                                 "u_pix_computed={:.6f}, v_pix_computed={:.6f}, "
+                                 "computed_is_finite={}",
+                                 z_pix, d_pix,
+                                 X1_pix, Y1_pix, Z1_pix,
+                                 u_pix_computed, v_pix_computed,
+                                 computed_is_finite);
+                }
 
                 // Only reject if the computed values are not finite (NaN/Inf)
                 // Allow all finite coords through (even if out of bounds or behind camera) - BA will filter them
@@ -563,6 +636,16 @@ void transformWithJacobians(
                 // Store coordinates
                 coords_out[base + 0 * P * P + idx] = u_pix;
                 coords_out[base + 1 * P * P + idx] = v_pix;
+                
+                // Diagnostic: Log Edge 4 center pixel final stored coordinates
+                if (log_edge4_center && y == center_y && x == center_x && logger) {
+                    logger->info("transformWithJacobians: Edge[4] final stored coords - "
+                                 "u_pix={:.6f}, v_pix={:.6f}, "
+                                 "stored at coords_out[{}]={:.6f}, coords_out[{}]={:.6f}",
+                                 u_pix, v_pix,
+                                 base + 0 * P * P + idx, coords_out[base + 0 * P * P + idx],
+                                 base + 1 * P * P + idx, coords_out[base + 1 * P * P + idx]);
+                }
                 
                 // Validity: Match Python behavior - mark as valid if coords are finite
                 // Python's transform() marks all finite coords as valid, BA filters them later
@@ -664,6 +747,24 @@ void transformWithJacobians(
         Eigen::Matrix4f Gij_mat = Gij.matrix();
         Eigen::Vector4f t_col = Gij_mat.col(3);  // Translation column [tx, ty, tz, 1]
         Eigen::Matrix<float, 2, 1> Jz = Jp * t_col;
+
+        // Save intermediate Jacobians if requested
+        if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
+            auto logger = spdlog::get("dpvo");
+            if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+                logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+                logger = spdlog::stdout_color_mt("dpvo");
+                logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+            }
+            std::string frame_suffix = std::to_string(frame_num);
+            std::string edge_suffix = std::to_string(e);
+            ba_file_io::save_eigen_matrix("reproject_Ji_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Ji, logger);
+            ba_file_io::save_eigen_matrix("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Jj, logger);
+            ba_file_io::save_eigen_matrix("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Jz, logger);
+        }
 
         // ====================================================================
         // STEP 12: Store Jacobians for all patch pixels

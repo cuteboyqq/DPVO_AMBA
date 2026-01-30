@@ -65,7 +65,9 @@ void transformWithJacobians(
     float* Ji_out,
     float* Jj_out,
     float* Jz_out,
-    float* valid_out
+    float* valid_out,
+    int frame_num = -1,  // Optional: frame number for saving intermediate values
+    bool save_intermediates = false  // Optional: whether to save Ti, Tj, Gij, Jacobians
 );
 
 /**

@@ -56,9 +56,17 @@ inline float float_to_half_to_float(float f) {
         half_bits |= ((exp + 15) << 10);  // Add bias 15
         
         // Round mantissa from 23 bits to 10 bits
+        // Use IEEE 754 round-to-nearest-even (RNE) to match Python's .half() behavior
         uint32_t mantissa_half = mantissa >> 13;  // Keep top 10 bits
-        // Round to nearest (round half up)
-        if ((mantissa >> 12) & 0x1) {  // Check if we need to round up
+        uint32_t round_bit = (mantissa >> 12) & 0x1;  // Bit 12 (the bit we're rounding)
+        uint32_t sticky_bits = mantissa & 0x1FFF;  // Bits 0-11 (bits below bit 12)
+        bool has_sticky_bits = (sticky_bits != 0);
+        
+        // Round to nearest, ties to even (RNE)
+        // Round up if:
+        //   1. round_bit is 1 AND (has_sticky_bits OR mantissa_half is odd)
+        // This ensures ties (round_bit=1, no sticky bits) round to even
+        if (round_bit && (has_sticky_bits || (mantissa_half & 0x1))) {
             mantissa_half++;
             if (mantissa_half >= (1 << 10)) {  // Overflow in mantissa
                 mantissa_half = 0;

@@ -441,20 +441,43 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
         
         // Compute time scaling factor: fac = (c-b) / (b-a)
         // Python: *_, a,b,c = [1]*3 + self.tlist
-        //         fac = (c-b) / (b-a)
+        //         This pads tlist with three 1s, then takes the last 3 elements
+        //         Note: In Python, when motion model runs, self.tlist contains timestamps up to self.n-1
+        //         In C++, m_tlist already contains the current timestamp (added at line 350)
+        //         So m_tlist.size() = n_use + 1, and we need to use the last 3 elements
+        //         which correspond to frames n_use-2, n_use-1, and n_use
         float fac = 1.0f;  // Default to 1.0 if timestamps not available
-        if (m_tlist.size() >= 3) {
-            // Get last 3 timestamps: a, b, c
-            int64_t a = (m_tlist.size() >= 3) ? m_tlist[m_tlist.size() - 3] : timestamp;
-            int64_t b = (m_tlist.size() >= 2) ? m_tlist[m_tlist.size() - 2] : timestamp;
-            int64_t c = timestamp;
-            
-            int64_t dt1 = b - a;  // Time between frame n-2 and n-1
-            int64_t dt2 = c - b;  // Time between frame n-1 and n
-            
-            if (dt1 > 0) {
-                fac = static_cast<float>(dt2) / static_cast<float>(dt1);
-            }
+        int64_t a, b, c;
+        
+        // m_tlist contains timestamps for frames 0 to n_use (inclusive)
+        // Python's tlist at this point contains timestamps for frames 0 to n_use-1
+        // So we simulate Python's [1]*3 + tlist by using m_tlist with padding logic
+        if (m_tlist.size() == 1) {
+            // One timestamp (frame 0): [1, 1, 1, t0] -> a=1, b=1, c=t0
+            a = 1;
+            b = 1;
+            c = m_tlist[0];
+        } else if (m_tlist.size() == 2) {
+            // Two timestamps (frames 0,1): [1, 1, 1, t0, t1] -> a=1, b=t0, c=t1
+            a = 1;
+            b = m_tlist[0];
+            c = m_tlist[1];
+        } else {
+            // Three or more timestamps: take last 3 from m_tlist
+            // m_tlist = [t0, t1, ..., t_{n_use-2}, t_{n_use-1}, t_{n_use}]
+            // Python's [1, 1, 1] + [t0, t1, ..., t_{n_use-1}] -> last 3 are t_{n_use-3}, t_{n_use-2}, t_{n_use-1}
+            // But we have t_{n_use} in m_tlist, so we use t_{n_use-2}, t_{n_use-1}, t_{n_use}
+            a = m_tlist[m_tlist.size() - 3];
+            b = m_tlist[m_tlist.size() - 2];
+            c = m_tlist[m_tlist.size() - 1];  // Current timestamp
+        }
+        
+        // Compute fac = (c-b) / (b-a)
+        int64_t dt1 = b - a;  // Time between frame n-2 and n-1
+        int64_t dt2 = c - b;  // Time between frame n-1 and n
+        
+        if (dt1 > 0) {
+            fac = static_cast<float>(dt2) / static_cast<float>(dt1);
         }
         
         // Compute relative motion: (P1 * P2.inv()).log()
@@ -970,12 +993,49 @@ void DPVO::update()
     // -------------------------------------------------
     if (logger) logger->info("\033[32m--- Step 3.1: Reprojection ---\033[0m");
     
+    // Save poses, intrinsics, and edge indices right before reproject() to verify what C++ actually uses
+    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
+        const int N = m_pg.m_n;
+        const int M = m_cfg.PATCHES_PER_FRAME;
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        std::string reproject_poses_filename = get_bin_file_path("reproject_poses_frame" + frame_suffix + ".bin");
+        std::string reproject_intrinsics_filename = get_bin_file_path("reproject_intrinsics_frame" + frame_suffix + ".bin");
+        std::string reproject_ii_filename = get_bin_file_path("reproject_ii_frame" + frame_suffix + ".bin");
+        std::string reproject_jj_filename = get_bin_file_path("reproject_jj_frame" + frame_suffix + ".bin");
+        std::string reproject_kk_filename = get_bin_file_path("reproject_kk_frame" + frame_suffix + ".bin");
+        ba_file_io::save_poses(reproject_poses_filename, m_pg.m_poses, N, logger);
+        ba_file_io::save_intrinsics(reproject_intrinsics_filename, m_pg.m_intrinsics, N, logger);
+        ba_file_io::save_edge_indices(reproject_ii_filename, reproject_jj_filename, reproject_kk_filename,
+                                      m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
+        if (logger) {
+            logger->info("[DPVO::update] Saved poses, intrinsics, and edge indices for reproject comparison (frame {}): {}, {}, {}, {}, {}", 
+                        TARGET_FRAME, reproject_poses_filename, reproject_intrinsics_filename,
+                        reproject_ii_filename, reproject_jj_filename, reproject_kk_filename);
+        }
+    }
+    
     std::vector<float> coords(num_active * 2 * P * P); // [num_active, 2, P, P]
     reproject(
         m_pg.m_ii, m_pg.m_jj, m_pg.m_kk,
         num_active,
         coords.data()
     );
+    
+    // Log Edge 4's center pixel values RIGHT AFTER reproject() returns to verify they match what was logged inside transformWithJacobians
+    // CRITICAL: Always log this (not just when TARGET_FRAME matches) to debug coordinate modification
+    if (num_active > 4 && logger) {
+        int center_y = P / 2;
+        int center_x = P / 2;
+        int edge4_x_idx = 4 * 2 * P * P + 0 * P * P + center_y * P + center_x;
+        int edge4_y_idx = 4 * 2 * P * P + 1 * P * P + center_y * P + center_x;
+        float edge4_x_after_reproject = coords[edge4_x_idx];
+        float edge4_y_after_reproject = coords[edge4_y_idx];
+        logger->info("[DPVO::update] Edge[4] pixel[{}/{}] coords RIGHT AFTER reproject() returns - "
+                     "coords[{}]={:.6f}, coords[{}]={:.6f} (should match transformWithJacobians log), "
+                     "TARGET_FRAME={}, m_counter={}",
+                     center_y, center_x, edge4_x_idx, edge4_x_after_reproject, 
+                     edge4_y_idx, edge4_y_after_reproject, TARGET_FRAME, m_counter);
+    }
     
     // Store coords for comparison with BA's reproject call
     // This will help verify that both reproject() calls produce the same coords
@@ -995,6 +1055,34 @@ void DPVO::update()
         // Save full reproject outputs for Python comparison
         std::string frame_suffix = std::to_string(TARGET_FRAME);
         std::string reproject_coords_filename = get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin");
+        
+        // Log Edge 4's center pixel values right before saving to verify they match what was logged inside transformWithJacobians
+        // CRITICAL: Always log this (not just when TARGET_FRAME matches) to debug coordinate modification
+        if (num_active > 4 && logger) {
+            int center_y = P / 2;
+            int center_x = P / 2;
+            int edge4_x_idx = 4 * 2 * P * P + 0 * P * P + center_y * P + center_x;
+            int edge4_y_idx = 4 * 2 * P * P + 1 * P * P + center_y * P + center_x;
+            float edge4_x_before_save = coords[edge4_x_idx];
+            float edge4_y_before_save = coords[edge4_y_idx];
+            
+            // Get the value right after reproject for comparison
+            float edge4_x_after_reproject = 0.0f;
+            float edge4_y_after_reproject = 0.0f;
+            // We can't access the previous log value, so we'll compare with transformWithJacobians log value
+            // The transformWithJacobians log shows: u_pix=147.612701, v_pix=79.520638 (for frame 61)
+            
+            logger->info("[DPVO::update] Edge[4] pixel[{}/{}] coords BEFORE saving to file - "
+                         "coords[{}]={:.6f}, coords[{}]={:.6f}, "
+                         "TARGET_FRAME={}, m_counter={}",
+                         center_y, center_x, edge4_x_idx, edge4_x_before_save, 
+                         edge4_y_idx, edge4_y_before_save, TARGET_FRAME, m_counter);
+            
+            // Check if coordinates changed since reproject() returned
+            // We'll compare with the value logged right after reproject() returns
+            // (This will be logged in the previous log message)
+        }
+        
         ba_file_io::save_reprojected_coords_full(reproject_coords_filename, coords.data(), 
                                                  num_active, P, logger);
         if (logger) {
@@ -1082,6 +1170,21 @@ void DPVO::update()
     
     printf("[DPVO::update] computeCorrelation returned\n");
     fflush(stdout);
+    
+    // CRITICAL: Check if computeCorrelation modified coords (it shouldn't, but let's verify)
+    if (num_active > 4 && logger) {
+        int center_y = P / 2;
+        int center_x = P / 2;
+        int edge4_x_idx = 4 * 2 * P * P + 0 * P * P + center_y * P + center_x;
+        int edge4_y_idx = 4 * 2 * P * P + 1 * P * P + center_y * P + center_x;
+        float edge4_x_after_corr = coords[edge4_x_idx];
+        float edge4_y_after_corr = coords[edge4_y_idx];
+        logger->info("[DPVO::update] Edge[4] pixel[{}/{}] coords AFTER computeCorrelation() - "
+                     "coords[{}]={:.6f}, coords[{}]={:.6f}, "
+                     "TARGET_FRAME={}, m_counter={}",
+                     center_y, center_x, edge4_x_idx, edge4_x_after_corr, 
+                     edge4_y_idx, edge4_y_after_corr, TARGET_FRAME, m_counter);
+    }
     
     // Save correlation inputs and outputs for comparison with Python when TARGET_FRAME matches
     if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
@@ -2258,6 +2361,34 @@ void DPVO::reproject(
         if (logger) {
             logger->info("[DPVO::reproject] Saved patches for reproject comparison (frame {}): {}", 
                         TARGET_FRAME, patches_filename);
+            
+            // Debug: Log patch values for Edge 4 to verify what's saved matches what transformWithJacobians will read
+            if (num_edges > 4) {
+                int k4 = kk[4];
+                int i4 = k4 / M;
+                int patch_idx4 = k4 % M;
+                int center_y = P / 2;
+                int center_x = P / 2;
+                
+                // Read from m_pg.m_patches (multi-dimensional array)
+                float px_saved = m_pg.m_patches[i4][patch_idx4][0][center_y][center_x];
+                float py_saved = m_pg.m_patches[i4][patch_idx4][1][center_y][center_x];
+                float pd_saved = m_pg.m_patches[i4][patch_idx4][2][center_y][center_x];
+                
+                // Also read from patches_flat (flattened array) to verify indexing
+                int idx = center_y * P + center_x;
+                float px_flat = patches_flat[((i4 * M + patch_idx4) * 3 + 0) * P * P + idx];
+                float py_flat = patches_flat[((i4 * M + patch_idx4) * 3 + 1) * P * P + idx];
+                float pd_flat = patches_flat[((i4 * M + patch_idx4) * 3 + 2) * P * P + idx];
+                
+                logger->info("[DPVO::reproject] Edge 4 patch values BEFORE transformWithJacobians - "
+                             "kk[4]={}, i={}, patch_idx={}, center_y={}, center_x={}, idx={}, "
+                             "px_md={:.6f}, py_md={:.6f}, pd_md={:.6f}, "
+                             "px_flat={:.6f}, py_flat={:.6f}, pd_flat={:.6f}",
+                             k4, i4, patch_idx4, center_y, center_x, idx,
+                             px_saved, py_saved, pd_saved,
+                             px_flat, py_flat, pd_flat);
+            }
         }
     }
     
@@ -2306,6 +2437,30 @@ void DPVO::reproject(
     //
     // This ensures consistent reprojection behavior throughout the codebase.
     // ========================================================================
+    
+    // Debug: Verify patch values from patches_flat right before calling transformWithJacobians
+    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME && num_edges > 4) {
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            const int M = m_cfg.PATCHES_PER_FRAME;
+            int k4 = kk[4];
+            int i4 = k4 / M;
+            int patch_idx4 = k4 % M;
+            int center_y = P / 2;
+            int center_x = P / 2;
+            int idx = center_y * P + center_x;
+            
+            // Read from patches_flat using the exact indexing formula transformWithJacobians will use
+            float px_from_flat = patches_flat[((i4 * M + patch_idx4) * 3 + 0) * P * P + idx];
+            float py_from_flat = patches_flat[((i4 * M + patch_idx4) * 3 + 1) * P * P + idx];
+            float pd_from_flat = patches_flat[((i4 * M + patch_idx4) * 3 + 2) * P * P + idx];
+            
+            logger->info("[DPVO::reproject] RIGHT BEFORE transformWithJacobians: Edge[4] patch values from patches_flat - "
+                         "kk[4]={}, i={}, patch_idx={}, idx={}, px={:.6f}, py={:.6f}, pd={:.6f}",
+                         k4, i4, patch_idx4, idx, px_from_flat, py_from_flat, pd_from_flat);
+        }
+    }
+    
     pops::transformWithJacobians(
         m_pg.m_poses,         // SE3 poses [N] - camera poses for all frames
         patches_flat,         // Flattened patches [N*M*3*P*P] - 3D patches with inverse depth
@@ -2318,7 +2473,9 @@ void DPVO::reproject(
         Ji_ptr,               // Output: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose i (SE3)
         Jj_ptr,               // Output: [num_edges, 2, P, P, 6] - Jacobian w.r.t. pose j (SE3)
         Jz_ptr,               // Output: [num_edges, 2, P, P, 1] - Jacobian w.r.t. inverse depth
-        valid_ptr             // Output: [num_edges, P, P] - Validity mask (1.0=valid, 0.0=invalid)
+        valid_ptr,            // Output: [num_edges, P, P] - Validity mask (1.0=valid, 0.0=invalid)
+        m_counter,            // Frame number for saving intermediate values
+        (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME)  // Save intermediates if this is the target frame
     );
 
     // Diagnostic: Check output coordinates for NaN/Inf values
@@ -2384,6 +2541,28 @@ void DPVO::reproject(
                              num_edges > 0 ? ii[0] : -1,
                              num_edges > 0 ? jj[0] : -1,
                              num_edges > 0 ? kk[0] : -1);
+            }
+        }
+        
+        // Check Edge 4's center pixel specifically (for debugging mismatch)
+        if (num_edges > 4) {
+            int center_y = m_P / 2;
+            int center_x = m_P / 2;
+            int edge4_x_idx = 4 * 2 * m_P * m_P + 0 * m_P * m_P + center_y * m_P + center_x;
+            int edge4_y_idx = 4 * 2 * m_P * m_P + 1 * m_P * m_P + center_y * m_P + center_x;
+            if (edge4_x_idx < coords_total_size && edge4_y_idx < coords_total_size) {
+                float edge4_x = coords_out[edge4_x_idx];
+                float edge4_y = coords_out[edge4_y_idx];
+                logger->info("DPVO::reproject: Edge[4] pixel[{}/{}] coords from transformWithJacobians - "
+                             "coords_out[{}]={:.6f}, coords_out[{}]={:.6f}, "
+                             "is_finite_x={}, is_finite_y={}, is_nan_x={}, is_nan_y={}, "
+                             "ii[4]={}, jj[4]={}, kk[4]={}",
+                             center_y, center_x, edge4_x_idx, edge4_x, edge4_y_idx, edge4_y,
+                             std::isfinite(edge4_x), std::isfinite(edge4_y),
+                             std::isnan(edge4_x), std::isnan(edge4_y),
+                             num_edges > 4 ? ii[4] : -1,
+                             num_edges > 4 ? jj[4] : -1,
+                             num_edges > 4 ? kk[4] : -1);
             }
         }
         

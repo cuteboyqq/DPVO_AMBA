@@ -338,5 +338,132 @@ inline bool save_metadata(const std::string& filename, int num_active, int MAX_E
     return true;
 }
 
+/**
+ * Save SE3 transforms for reproject intermediate comparison [num_active, 7]
+ * Format: [tx, ty, tz, qx, qy, qz, qw] per edge
+ * @param filename Output filename
+ * @param transforms Array of SE3 transforms
+ * @param num_active Number of active edges
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_se3_transforms(const std::string& filename, const SE3* transforms, int num_active,
+                                std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int e = 0; e < num_active; e++) {
+        Eigen::Vector3f t = transforms[e].t;
+        Eigen::Quaternionf q = transforms[e].q;
+        float transform_data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+        file.write(reinterpret_cast<const char*>(transform_data), sizeof(float) * 7);
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved {} SE3 transforms to {}", num_active, filename);
+    return true;
+}
+
+/**
+ * Save Jacobians for reproject intermediate comparison
+ * @param filename Output filename
+ * @param jacobians Flat array [num_active, 2, 6] for Ji/Jj or [num_active, 2, 1] for Jz
+ * @param num_active Number of active edges
+ * @param jacobian_type "Ji", "Jj", or "Jz"
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_jacobians(const std::string& filename, const float* jacobians, int num_active,
+                          const std::string& jacobian_type,
+                          std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    if (jacobian_type == "Ji" || jacobian_type == "Jj") {
+        // Ji/Jj: [num_active, 2, 6] - Jacobian w.r.t. pose (2 outputs, 6 SE3 params)
+        for (int e = 0; e < num_active; e++) {
+            for (int c = 0; c < 2; c++) {  // c=0 for u, c=1 for v
+                for (int param = 0; param < 6; param++) {  // 6 SE3 parameters
+                    int idx = e * 2 * 6 + c * 6 + param;
+                    file.write(reinterpret_cast<const char*>(&jacobians[idx]), sizeof(float));
+                }
+            }
+        }
+        if (logger) logger->info("Saved {} {} Jacobians [num_active, 2, 6] to {}", num_active, jacobian_type, filename);
+    } else if (jacobian_type == "Jz") {
+        // Jz: [num_active, 2, 1] - Jacobian w.r.t. inverse depth (2 outputs, 1 param)
+        for (int e = 0; e < num_active; e++) {
+            for (int c = 0; c < 2; c++) {  // c=0 for u, c=1 for v
+                int idx = e * 2 * 1 + c * 1;
+                file.write(reinterpret_cast<const char*>(&jacobians[idx]), sizeof(float));
+            }
+        }
+        if (logger) logger->info("Saved {} {} Jacobians [num_active, 2, 1] to {}", num_active, jacobian_type, filename);
+    } else {
+        if (logger) logger->error("Unknown jacobian_type: {} (expected 'Ji', 'Jj', or 'Jz')", jacobian_type);
+        file.close();
+        return false;
+    }
+    
+    file.close();
+    return true;
+}
+
+/**
+ * Save a single SE3 object to binary file [7] format: [tx, ty, tz, qx, qy, qz, qw]
+ * @param filename Output filename
+ * @param se3_obj SE3 object to save
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_se3_object(const std::string& filename, const SE3& se3_obj,
+                           std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    Eigen::Vector3f t = se3_obj.t;
+    Eigen::Quaternionf q = se3_obj.q;
+    float data[7] = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+    file.write(reinterpret_cast<const char*>(data), sizeof(float) * 7);
+    file.close();
+    if (logger) logger->info("Saved SE3 object to {}", filename);
+    return true;
+}
+
+/**
+ * Save an Eigen matrix to binary file (row-major format to match Python)
+ * @param filename Output filename
+ * @param matrix Eigen matrix to save
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename MatrixType>
+inline bool save_eigen_matrix(const std::string& filename, const MatrixType& matrix,
+                             std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    // Eigen matrices are column-major by default. Write row by row to match Python's expected row-major format.
+    for (int r = 0; r < matrix.rows(); ++r) {
+        for (int c = 0; c < matrix.cols(); ++c) {
+            float val = matrix(r, c);
+            file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+        }
+    }
+    file.close();
+    if (logger) logger->info("Saved Eigen matrix ({}x{}) to {}", matrix.rows(), matrix.cols(), filename);
+    return true;
+}
+
 } // namespace ba_file_io
 

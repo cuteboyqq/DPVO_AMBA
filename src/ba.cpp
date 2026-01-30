@@ -2,8 +2,8 @@
 #include "dpvo.hpp"
 #include "projective_ops.hpp"
 #include "eigen_common.h"
-#include "eigen/Eigen/Dense"
-#include "eigen/Eigen/Cholesky"
+#include "Eigen/Dense"
+#include "Eigen/Cholesky"
 #include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <spdlog/spdlog.h>
 #include <algorithm>
