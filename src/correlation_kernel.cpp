@@ -1,5 +1,7 @@
 #include "correlation_kernel.hpp"
 #include "correlation_bilinear_helpers.hpp"  // Bilinear interpolation helpers for grid_sample matching
+#include "correlation_file_io.hpp"  // For saving 8x8 buffer
+#include "target_frame.hpp"  // TARGET_FRAME constant
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -300,7 +302,8 @@ void computeCorrelationSingle(
     int feature_dim,             // Feature dimension (128 for FNet)
     float coord_scale,          // Scale factor for coordinates (1.0 for pyramid0, 0.25 for pyramid1)
     int radius,                  // Correlation radius (typically 3)
-    float* corr_out)            // Output: [num_active, D, D, P, P]
+    float* corr_out,             // Output: [num_active, D, D, P, P]
+    float* corr_8x8_out)         // Optional: Output 8x8 internal buffer [num_active, 8, 8, P, P] for debugging
 {
     // Translated from CUDA corr_forward_kernel
     // CUDA signature: corr_forward_kernel(int R, fmap1, fmap2, coords, us, vs, corr)
@@ -390,28 +393,6 @@ void computeCorrelationSingle(
                 }
             }
         }
-        
-        logger->info("computeCorrelationSingle: Input coords array check (first {} edges) - "
-                     "total_samples={}, valid={}, NaN={}, Inf={}, "
-                     "valid_range=[{:.2f}, {:.2f}], coord_scale={:.2f}",
-                     std::min(num_active, 3), (std::min(num_active, 3) * P * P * 2),
-                     valid_count, nan_count, inf_count, min_val, max_val, coord_scale);
-        
-        // Check first edge's first pixel specifically
-        if (num_active > 0) {
-            int first_x_idx = 0 * 2 * P * P + 0 * P * P + 0 * P + 0;
-            int first_y_idx = 0 * 2 * P * P + 1 * P * P + 0 * P + 0;
-            if (first_x_idx < coords_total_size && first_y_idx < coords_total_size) {
-                float first_x = coords[first_x_idx];
-                float first_y = coords[first_y_idx];
-                logger->info("computeCorrelationSingle: First edge[0] pixel[0][0] coords from input array - "
-                             "coords[{}]={:.6f}, coords[{}]={:.6f}, "
-                             "is_finite_x={}, is_finite_y={}, is_nan_x={}, is_nan_y={}",
-                             first_x_idx, first_x, first_y_idx, first_y,
-                             std::isfinite(first_x), std::isfinite(first_y),
-                             std::isnan(first_x), std::isnan(first_y));
-            }
-        }
     }
     
     // Main loop: For each active edge (equivalent to CUDA's B * M * H * W * D * D threads)
@@ -426,21 +407,10 @@ void computeCorrelationSingle(
         int patch_idx = ii1_val % M;
         int pyramid_frame = jj1_val;
         
-        // Diagnostic: Log first edge indices
-        if (e == 0 && logger) {
-            logger->info("computeCorrelationSingle: Edge[0] - ii1={}, jj1={}, gmap_frame={}, patch_idx={}, pyramid_frame={}",
-                         ii1_val, jj1_val, gmap_frame, patch_idx, pyramid_frame);
-        }
-        
         // Validate indices
         if (patch_idx < 0 || patch_idx >= M || 
             gmap_frame < 0 || gmap_frame >= num_gmap_frames ||
             pyramid_frame < 0 || pyramid_frame >= num_frames) {
-            if (e == 0 && logger) {
-                logger->warn("computeCorrelationSingle: Edge[0] invalid indices - patch_idx={} (M={}), "
-                             "gmap_frame={} (max={}), pyramid_frame={} (max={})",
-                             patch_idx, M, gmap_frame, num_gmap_frames, pyramid_frame, num_frames);
-            }
             continue;
         }
         
@@ -455,12 +425,6 @@ void computeCorrelationSingle(
                 int coords_total_size = num_active * 2 * P * P;
                 if (coord_x_idx < 0 || coord_x_idx >= coords_total_size || 
                     coord_y_idx < 0 || coord_y_idx >= coords_total_size) {
-                    if (e == 0 && i0 == 0 && j0 == 0 && logger) {
-                        logger->error("computeCorrelationSingle: Edge[0] pixel[0][0] - Invalid coord indices! "
-                                     "coord_x_idx={}, coord_y_idx={}, coords_total_size={}, "
-                                     "num_active={}, P={}",
-                                     coord_x_idx, coord_y_idx, coords_total_size, num_active, P);
-                    }
                     continue;  // Skip this pixel if indices are invalid
                 }
                 
@@ -476,67 +440,27 @@ void computeCorrelationSingle(
                 // Check if coordinates are NaN/Inf after scaling
                 bool is_nan_after_scale = !std::isfinite(x) || !std::isfinite(y);
                 
-                // Diagnostic: Log coordinates for first edge, first pixel with detailed info
-                if (e == 0 && i0 == 0 && j0 == 0 && logger) {
-                    logger->info("computeCorrelationSingle: Edge[0] pixel[0][0] - "
-                                 "ii1={}, jj1={}, gmap_frame={}, patch_idx={}, pyramid_frame={}, "
-                                 "coord_x_idx={}, coord_y_idx={}, "
-                                 "raw_coords=({:.6f}, {:.6f}), "
-                                 "coord_scale={:.2f}, "
-                                 "scaled=({:.6f}, {:.6f}), "
-                                 "is_nan_before_scale={}, is_nan_after_scale={}, "
-                                 "fmap_H={}, fmap_W={}",
-                                 ii1_val, jj1_val, gmap_frame, patch_idx, pyramid_frame,
-                                 coord_x_idx, coord_y_idx,
-                                 raw_x, raw_y,
-                                 coord_scale,
-                                 x, y,
-                                 is_nan_before_scale, is_nan_after_scale,
-                                 fmap_H, fmap_W);
-                    
-                    // Also check center pixel of first edge
-                    if (P > 1) {
-                        int center_i0 = P / 2;
-                        int center_j0 = P / 2;
-                        int center_x_idx = e * 2 * P * P + 0 * P * P + center_i0 * P + center_j0;
-                        int center_y_idx = e * 2 * P * P + 1 * P * P + center_i0 * P + center_j0;
-                        if (center_x_idx < coords_total_size && center_y_idx < coords_total_size) {
-                            float center_x = coords[center_x_idx];
-                            float center_y = coords[center_y_idx];
-                            logger->info("computeCorrelationSingle: Edge[0] pixel[center] - "
-                                         "center_coords=({:.6f}, {:.6f}), is_finite={}",
-                                         center_x, center_y, std::isfinite(center_x) && std::isfinite(center_y));
-                        }
-                    }
-                    
-                    // Check if all coordinates for this edge are NaN
-                    int nan_count = 0;
-                    int total_count = 0;
-                    for (int py = 0; py < P; py++) {
-                        for (int px = 0; px < P; px++) {
-                            int px_idx = e * 2 * P * P + 0 * P * P + py * P + px;
-                            int py_idx = e * 2 * P * P + 1 * P * P + py * P + px;
-                            if (px_idx < coords_total_size && py_idx < coords_total_size) {
-                                total_count++;
-                                if (!std::isfinite(coords[px_idx]) || !std::isfinite(coords[py_idx])) {
-                                    nan_count++;
-                                }
-                            }
-                        }
-                    }
-                    logger->info("computeCorrelationSingle: Edge[0] coordinate statistics - "
-                                 "NaN_count={}/{}, all_nan={}",
-                                 nan_count, total_count, (nan_count == total_count));
-                }
-                
                 // Skip this pixel if coordinates are invalid
                 if (is_nan_after_scale) {
                     continue;  // Skip correlation computation for invalid coordinates
                 }
                 
+                // Match Python's corr_torch_forward_fp16: convert coordinates to half precision BEFORE floor
+                // Python does: coords = coords.half(), then x0 = torch.floor(x)
+                // This is critical for matching Python's behavior, especially for coordinates very close to integers
+                // (e.g., 30.999988556 becomes 31.000000 after half precision, changing floor from 30 to 31)
+                float x_half = float_to_half_to_float(x);
+                float y_half = float_to_half_to_float(y);
+                
+                // Check if half-precision conversion produced infinity (huge out-of-bounds coordinates overflow)
+                // Python's grid_sample with infinity coordinates produces NaN, so we skip these cases
+                if (!std::isfinite(x_half) || !std::isfinite(y_half)) {
+                    continue;  // Skip correlation computation for coordinates that overflow to infinity
+                }
+                
                 // Match Python's corr_torch_forward_fp16: compute 8x8 correlation at integer offsets first
-                float x0 = std::floor(x);
-                float y0 = std::floor(y);
+                float x0 = std::floor(x_half);
+                float y0 = std::floor(y_half);
                 
                 // Step 1: Compute 8x8 correlation at integer offsets (matching Python's internal computation)
                 // Python uses offsets: torch.arange(-radius, radius + 2) = [-3, -2, -1, 0, 1, 2, 3, 4]
@@ -555,15 +479,7 @@ void computeCorrelationSingle(
                         float x_norm, y_norm;
                         normalize_coords_for_grid_sample(gx, gy, fmap_H, fmap_W, x_norm, y_norm);
                         
-                        // Diagnostic: Log sampling location for first edge, first pixel, center offset
                         bool is_center = (corr_ii == R && corr_jj == R);
-                        bool is_debug_edge = (e == 0 || e == 4 || e == 29);
-                        if (is_debug_edge && i0 == P/2 && j0 == P/2 && is_center && logger) {
-                            logger->info("computeCorrelationSingle: Edge[{}] center (bilinear, normalized) - "
-                                         "base=({:.2f}, {:.2f}), offset=({:.2f}, {:.2f}), "
-                                         "pixel=({:.2f}, {:.2f}), norm=({:.4f}, {:.4f})",
-                                         e, x, y, offset_x, offset_y, gx, gy, x_norm, y_norm);
-                        }
                         
                         // Compute correlation: dot product over features using bilinear interpolation
                         // This matches Python's grid_sample behavior:
@@ -587,11 +503,6 @@ void computeCorrelationSingle(
                             
                             // Bounds check for gmap access
                             if (fmap1_idx >= gmap_total_size) {
-                                if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
-                                    logger->warn("computeCorrelationSingle: Edge[0] feature[0] gmap out of bounds - "
-                                                 "fmap1_idx={} (max={})",
-                                                 fmap1_idx, gmap_total_size);
-                                }
                                 continue;
                             }
                             
@@ -610,20 +521,6 @@ void computeCorrelationSingle(
                             
                             sum += f1 * f2;
                             features_processed++;
-                            
-                            // Diagnostic: Log first feature values for first edge, first pixel, center offset
-                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && f == 0 && logger) {
-                                logger->info("computeCorrelationSingle: Edge[0] feature[0] (bilinear, normalized) - "
-                                             "f1_idx={}, f1={:.6f}, f2={:.6f} (bilinear), sum_so_far={:.6f}",
-                                             fmap1_idx, f1, f2, sum);
-                            }
-                        }
-                        
-                        // Diagnostic: Log correlation sum for first edge, first pixel, center offset
-                        if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                            logger->info("computeCorrelationSingle: Edge[0] center correlation (bilinear, normalized) - "
-                                         "sum={:.6f}, features_processed={}/{}",
-                                         sum, features_processed, feature_dim);
                         }
                         
                         // Note: Out-of-bounds sampling returns 0.0 from bilinear_sample_grid_sample
@@ -640,26 +537,17 @@ void computeCorrelationSingle(
                         
                         if (internal_idx < corr_internal_size) {
                             corr_internal[internal_idx] = sum;
-                            
-                            // Diagnostic: Log stored value for first edge, first pixel, center offset
-                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                                logger->info("computeCorrelationSingle: Edge[0] stored 8x8 correlation - internal_idx={}, value={:.6f}",
-                                             internal_idx, sum);
-                            }
-                        } else {
-                            if (e == 0 && i0 == 0 && j0 == 0 && is_center && logger) {
-                                logger->error("computeCorrelationSingle: Edge[0] internal_idx={} >= corr_internal_size={}",
-                                              internal_idx, corr_internal_size);
-                            }
                         }
                     }
                 }
                 
                 // Step 2: Apply bilinear wrapper interpolation to reduce from 8x8 to 7x7 (matching Python)
                 // Python's formula: out[i,j] = (1-dx)*(1-dy)*corr[i,j] + dx*(1-dy)*corr[i,j+1] + (1-dx)*dy*corr[i+1,j] + dx*dy*corr[i+1,j+1]
-                // Python converts dx and dy to half precision: dx = dx.half(), dy = dy.half()
-                float dx_raw = x - x0;  // Fractional part of x
-                float dy_raw = y - y0;  // Fractional part of y
+                // Python converts coords to half precision first, then computes dx/dy from half-precision coords
+                // dx = (coords[:, :, 0] - torch.floor(coords[:, :, 0])).half()
+                // So we need to compute dx/dy from half-precision coordinates
+                float dx_raw = x_half - x0;  // Fractional part of x (from half-precision x)
+                float dy_raw = y_half - y0;  // Fractional part of y (from half-precision y)
                 
                 // Convert to half precision and back to float32 (matching Python's .half() conversion)
                 float dx = float_to_half_to_float(dx_raw);
@@ -732,12 +620,11 @@ void computeCorrelationSingle(
             }
             sum_corr += val;
         }
-        
-        float mean_corr = corr_output_size > 0 ? static_cast<float>(sum_corr / corr_output_size) : 0.0f;
-        logger->info("computeCorrelationSingle: Output stats - size={}, nonzero={}, zero={}, "
-                     "min={:.6f}, max={:.6f}, mean={:.6f}",
-                     corr_output_size, nonzero_count, corr_output_size - nonzero_count,
-                     min_corr, max_corr, mean_corr);
+    }
+    
+    // Save 8x8 internal buffer if requested (for debugging)
+    if (corr_8x8_out != nullptr) {
+        std::memcpy(corr_8x8_out, corr_internal.data(), sizeof(float) * corr_internal_size);
     }
 }
 
@@ -763,7 +650,10 @@ void computeCorrelation(
     int fmap1_H, int fmap1_W,   // Dimensions for pyramid0 (1/4 resolution)
     int fmap2_H, int fmap2_W,   // Dimensions for pyramid1 (1/16 resolution)
     int feature_dim,            // Feature dimension (128 for FNet)
-    float* corr_out)            // Output: [num_active, D, D, P, P, 2] - Correlation volumes
+    float* corr_out,            // Output: [num_active, D, D, P, P, 2] - Correlation volumes
+    int frame_num,              // Optional: Frame number for saving 8x8 debug buffers
+    float* corr1_8x8_out,       // Optional: Output 8x8 buffer for level 0 [num_active, 8, 8, P, P]
+    float* corr2_8x8_out)       // Optional: Output 8x8 buffer for level 1 [num_active, 8, 8, P, P]
 {
     // Validate inputs
     if (gmap == nullptr || pyramid0 == nullptr || pyramid1 == nullptr || 
@@ -807,6 +697,12 @@ void computeCorrelation(
     std::vector<float> corr1(corr_single_size);
     std::vector<float> corr2(corr_single_size);
     
+    // Allocate buffers for 8x8 internal correlation (for debugging)
+    const int D_internal = 2 * R + 2;  // 8x8 internal
+    const size_t corr_8x8_size = static_cast<size_t>(num_active) * D_internal * D_internal * P * P;
+    std::vector<float> corr1_8x8(corr_8x8_size);
+    std::vector<float> corr2_8x8(corr_8x8_size);
+    
     // Call computeCorrelationSingle for pyramid0 (matches Python: corr1 = altcorr.corr(..., coords / 1, ...))
     computeCorrelationSingle(
         gmap, pyramid0, coords,
@@ -817,7 +713,8 @@ void computeCorrelation(
         feature_dim,
         1.0f,  // coord_scale = 1.0 (coords / 1)
         R,     // radius = 3
-        corr1.data()
+        corr1.data(),
+        corr1_8x8.data()  // Save 8x8 internal buffer
     );
     
     // Call computeCorrelationSingle for pyramid1 (matches Python: corr2 = altcorr.corr(..., coords / 4, ...))
@@ -830,8 +727,17 @@ void computeCorrelation(
         feature_dim,
         0.25f, // coord_scale = 0.25 (coords / 4)
         R,     // radius = 3
-        corr2.data()
+        corr2.data(),
+        corr2_8x8.data()  // Save 8x8 internal buffer
     );
+    
+    // Copy 8x8 buffers to output if requested
+    if (corr1_8x8_out != nullptr) {
+        std::memcpy(corr1_8x8_out, corr1_8x8.data(), sizeof(float) * corr_8x8_size);
+    }
+    if (corr2_8x8_out != nullptr) {
+        std::memcpy(corr2_8x8_out, corr2_8x8.data(), sizeof(float) * corr_8x8_size);
+    }
     
     // Stack corr1 and corr2 together (matches Python: torch.stack([corr1, corr2], -1))
     // Output layout: [num_active, D, D, P, P, 2] (channel last)

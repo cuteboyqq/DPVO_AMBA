@@ -96,7 +96,8 @@ void computeCorrelationSingle(
     int feature_dim,             // Feature dimension (128 for FNet)
     float coord_scale,          // Scale factor for coordinates (1.0 for pyramid0, 0.25 for pyramid1)
     int radius,                  // Correlation radius (typically 3)
-    float* corr_out);            // Output: [num_active, D, D, P, P] (matches CUDA kernel output)
+    float* corr_out,             // Output: [num_active, D, D, P, P] (matches CUDA kernel output)
+    float* corr_8x8_out = nullptr);  // Optional: Output 8x8 internal buffer [num_active, 8, 8, P, P] for debugging
 
 // Combined correlation for both pyramid levels (matches Python: torch.stack([corr1, corr2], -1).view(1, len(ii), -1))
 // Output: [num_active, D, D, P, P, 2] (channel last) or flattened to [num_active, D*D*P*P*2]
@@ -116,4 +117,7 @@ void computeCorrelation(
     int fmap1_H, int fmap1_W,    // Dimensions for pyramid0 (1/4 resolution)
     int fmap2_H, int fmap2_W,    // Dimensions for pyramid1 (1/16 resolution)
     int feature_dim,             // Feature dimension (128 for FNet)
-    float* corr_out);            // Output: [num_active, D, D, P, P, 2]
+    float* corr_out,             // Output: [num_active, D, D, P, P, 2]
+    int frame_num = -1,          // Optional: Frame number for saving 8x8 debug buffers
+    float* corr1_8x8_out = nullptr,  // Optional: Output 8x8 buffer for level 0 [num_active, 8, 8, P, P]
+    float* corr2_8x8_out = nullptr);  // Optional: Output 8x8 buffer for level 1 [num_active, 8, 8, P, P]

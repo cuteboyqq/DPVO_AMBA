@@ -1032,6 +1032,20 @@ void DPVO::update()
     printf("[DPVO::update] About to call computeCorrelation, num_active=%d\n", num_active);
     fflush(stdout);
     
+    // Allocate buffers for 8x8 internal correlation (for debugging when TARGET_FRAME matches)
+    const int D_internal = 2 * R + 2;  // 8x8 internal (R is already declared above)
+    const size_t corr_8x8_size = static_cast<size_t>(num_active) * D_internal * D_internal * P * P;
+    std::vector<float> corr1_8x8, corr2_8x8;
+    float* corr1_8x8_ptr = nullptr;
+    float* corr2_8x8_ptr = nullptr;
+    
+    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
+        corr1_8x8.resize(corr_8x8_size);
+        corr2_8x8.resize(corr_8x8_size);
+        corr1_8x8_ptr = corr1_8x8.data();
+        corr2_8x8_ptr = corr2_8x8.data();
+    }
+    
     computeCorrelation(
 		m_gmap,
 		m_fmap1,          // pyramid0 - full buffer [m_mem][128][fmap1_H][fmap1_W]
@@ -1048,8 +1062,23 @@ void DPVO::update()
 		m_fmap1_H, m_fmap1_W,  // Dimensions for pyramid0 (fmap1)
 		m_fmap2_H, m_fmap2_W,  // Dimensions for pyramid1 (fmap2) - CRITICAL: different from fmap1!
 		128,
-		corr.data()
+		corr.data(),
+		m_counter,        // frame_num
+		corr1_8x8_ptr,   // 8x8 buffer for level 0
+		corr2_8x8_ptr    // 8x8 buffer for level 1
 	);
+    
+    // Save 8x8 internal correlation buffers for debugging
+    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME && corr1_8x8_ptr != nullptr) {
+        std::string corr1_8x8_file = "bin_file/corr_frame" + std::to_string(m_counter) + "_8x8_level0.bin";
+        std::string corr2_8x8_file = "bin_file/corr_frame" + std::to_string(m_counter) + "_8x8_level1.bin";
+        correlation_file_io::save_float_array(corr1_8x8_file, corr1_8x8.data(), corr_8x8_size, logger);
+        correlation_file_io::save_float_array(corr2_8x8_file, corr2_8x8.data(), corr_8x8_size, logger);
+        if (logger) {
+            logger->info("[DPVO::update] Saved 8x8 internal correlation buffers for frame {}: {}, {}", 
+                        m_counter, corr1_8x8_file, corr2_8x8_file);
+        }
+    }
     
     printf("[DPVO::update] computeCorrelation returned\n");
     fflush(stdout);
