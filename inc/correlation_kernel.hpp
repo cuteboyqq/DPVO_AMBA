@@ -72,7 +72,10 @@ void patchify_cpu_safe(
 //
 // Output:
 //   corr_out: [num_active, D, D, P, P, 2] - Correlation volumes
-//             - D: Correlation window diameter = 8 (R=3, D = 2*R + 2)
+//             - D: Correlation window diameter = 7 (R=3, D = 2*R + 1, matches Python's final output)
+//             - Dimension order: [edge, corr_x, corr_y, patch_y, patch_x, level]
+//               where corr_x = horizontal offset (dj), corr_y = vertical offset (di)
+//             - Matches Python's permute(0,1,3,2,4,5) output format: [B, M, corr_x, corr_y, H, W]
 //             - Channel 0: Correlation with pyramid0, Channel 1: Correlation with pyramid1
 //             - Each value is dot product between patch and frame features
 //

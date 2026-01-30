@@ -529,9 +529,11 @@ void computeCorrelationSingle(
                         
                         // Store correlation in internal 8x8 buffer
                         // Layout: [num_active, D_internal, D_internal, P, P]
+                        // Match Python's permute(0,1,3,2,4,5): swap corr_ii and corr_jj to get [corr_x, corr_y] order
+                        // So store as [e, corr_jj, corr_ii, i0, j0] instead of [e, corr_ii, corr_jj, i0, j0]
                         size_t internal_idx = static_cast<size_t>(e) * D_internal * D_internal * P * P +
-                                              static_cast<size_t>(corr_ii) * D_internal * P * P +
-                                              static_cast<size_t>(corr_jj) * P * P +
+                                              static_cast<size_t>(corr_jj) * D_internal * P * P +
+                                              static_cast<size_t>(corr_ii) * P * P +
                                               static_cast<size_t>(i0) * P +
                                               static_cast<size_t>(j0);
                         
@@ -556,22 +558,23 @@ void computeCorrelationSingle(
                 for (int out_ii = 0; out_ii < D_output; out_ii++) {
                     for (int out_jj = 0; out_jj < D_output; out_jj++) {
                         // Bilinear interpolation from 8x8 internal buffer
-                        // Interpolate from: corr[out_ii, out_jj], corr[out_ii, out_jj+1], corr[out_ii+1, out_jj], corr[out_ii+1, out_jj+1]
+                        // Internal buffer is stored as [e, corr_jj, corr_ii, i0, j0] (swapped to match Python's final output)
+                        // Interpolate from: corr[out_jj, out_ii], corr[out_jj+1, out_ii], corr[out_jj, out_ii+1], corr[out_jj+1, out_ii+1]
                         size_t idx00 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
-                                       static_cast<size_t>(out_ii) * D_internal * P * P +
-                                       static_cast<size_t>(out_jj) * P * P +
+                                       static_cast<size_t>(out_jj) * D_internal * P * P +
+                                       static_cast<size_t>(out_ii) * P * P +
                                        static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
                         size_t idx01 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
-                                       static_cast<size_t>(out_ii) * D_internal * P * P +
-                                       static_cast<size_t>(out_jj + 1) * P * P +
+                                       static_cast<size_t>(out_jj + 1) * D_internal * P * P +
+                                       static_cast<size_t>(out_ii) * P * P +
                                        static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
                         size_t idx10 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
-                                       static_cast<size_t>(out_ii + 1) * D_internal * P * P +
-                                       static_cast<size_t>(out_jj) * P * P +
+                                       static_cast<size_t>(out_jj) * D_internal * P * P +
+                                       static_cast<size_t>(out_ii + 1) * P * P +
                                        static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
                         size_t idx11 = static_cast<size_t>(e) * D_internal * D_internal * P * P +
-                                       static_cast<size_t>(out_ii + 1) * D_internal * P * P +
-                                       static_cast<size_t>(out_jj + 1) * P * P +
+                                       static_cast<size_t>(out_jj + 1) * D_internal * P * P +
+                                       static_cast<size_t>(out_ii + 1) * P * P +
                                        static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
                         
                         // Bilinear interpolation weights
@@ -590,9 +593,10 @@ void computeCorrelationSingle(
                         float interpolated = w00 * v00 + w01 * v01 + w10 * v10 + w11 * v11;
                         
                         // Store in output buffer (7x7)
+                        // Match Python's permute(0,1,3,2,4,5): output as [e, corr_jj, corr_ii, i0, j0] = [e, corr_x, corr_y, i0, j0]
                         size_t out_idx = static_cast<size_t>(e) * D_output * D_output * P * P +
-                                         static_cast<size_t>(out_ii) * D_output * P * P +
-                                         static_cast<size_t>(out_jj) * P * P +
+                                         static_cast<size_t>(out_jj) * D_output * P * P +
+                                         static_cast<size_t>(out_ii) * P * P +
                                          static_cast<size_t>(i0) * P + static_cast<size_t>(j0);
                         
                         if (out_idx < corr_output_size) {
@@ -651,6 +655,7 @@ void computeCorrelation(
     int fmap2_H, int fmap2_W,   // Dimensions for pyramid1 (1/16 resolution)
     int feature_dim,            // Feature dimension (128 for FNet)
     float* corr_out,            // Output: [num_active, D, D, P, P, 2] - Correlation volumes
+                                  // Format: [edge, corr_x, corr_y, patch_y, patch_x, level] (matches Python's permute output)
     int frame_num,              // Optional: Frame number for saving 8x8 debug buffers
     float* corr1_8x8_out,       // Optional: Output 8x8 buffer for level 0 [num_active, 8, 8, P, P]
     float* corr2_8x8_out)       // Optional: Output 8x8 buffer for level 1 [num_active, 8, 8, P, P]
@@ -741,31 +746,32 @@ void computeCorrelation(
     
     // Stack corr1 and corr2 together (matches Python: torch.stack([corr1, corr2], -1))
     // Output layout: [num_active, D, D, P, P, 2] (channel last)
+    // Match Python's permute(0,1,3,2,4,5): output as [e, corr_jj, corr_ii, i0, j0, c] = [e, corr_x, corr_y, i0, j0, c]
     // This interleaves the two correlation volumes along the channel dimension
     for (int e = 0; e < num_active; e++) {
-        for (int corr_ii = 0; corr_ii < D_output; corr_ii++) {
-            for (int corr_jj = 0; corr_jj < D_output; corr_jj++) {
+        for (int corr_jj = 0; corr_jj < D_output; corr_jj++) {  // corr_x (horizontal offset)
+            for (int corr_ii = 0; corr_ii < D_output; corr_ii++) {  // corr_y (vertical offset)
                 for (int i0 = 0; i0 < P; i0++) {
                     for (int j0 = 0; j0 < P; j0++) {
-                        // Source indices in corr1 and corr2: [e, corr_ii, corr_jj, i0, j0]
+                        // Source indices in corr1 and corr2: [e, corr_jj, corr_ii, i0, j0] (already swapped in computeCorrelationSingle)
                         size_t src_idx = static_cast<size_t>(e) * D_output * D_output * P * P +
-                                        static_cast<size_t>(corr_ii) * D_output * P * P +
-                                        static_cast<size_t>(corr_jj) * P * P +
+                                        static_cast<size_t>(corr_jj) * D_output * P * P +
+                                        static_cast<size_t>(corr_ii) * P * P +
                                         static_cast<size_t>(i0) * P +
                                         static_cast<size_t>(j0);
                         
-                        // Destination indices in stacked output: [e, corr_ii, corr_jj, i0, j0, c]
+                        // Destination indices in stacked output: [e, corr_jj, corr_ii, i0, j0, c] = [e, corr_x, corr_y, i0, j0, c]
                         // Channel 0: corr1, Channel 1: corr2
                         size_t dst_idx_c0 = static_cast<size_t>(e) * D_output * D_output * P * P * 2 +
-                                            static_cast<size_t>(corr_ii) * D_output * P * P * 2 +
-                                            static_cast<size_t>(corr_jj) * P * P * 2 +
+                                            static_cast<size_t>(corr_jj) * D_output * P * P * 2 +
+                                            static_cast<size_t>(corr_ii) * P * P * 2 +
                                             static_cast<size_t>(i0) * P * 2 +
                                             static_cast<size_t>(j0) * 2 +
                                             0;  // Channel 0
                         
                         size_t dst_idx_c1 = static_cast<size_t>(e) * D_output * D_output * P * P * 2 +
-                                            static_cast<size_t>(corr_ii) * D_output * P * P * 2 +
-                                            static_cast<size_t>(corr_jj) * P * P * 2 +
+                                            static_cast<size_t>(corr_jj) * D_output * P * P * 2 +
+                                            static_cast<size_t>(corr_ii) * P * P * 2 +
                                             static_cast<size_t>(i0) * P * 2 +
                                             static_cast<size_t>(j0) * 2 +
                                             1;  // Channel 1

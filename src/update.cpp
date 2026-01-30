@@ -968,18 +968,20 @@ int DPVOUpdate::reshapeInput(
         if (e < 0 || e >= num_active) {
             continue;
         }
-        // Source layout: corr[e][di][dj][pi][pj][c] = [num_active, D, D, P, P, 2]
+        // Source layout: corr[e][dj][di][pi][pj][c] = [num_active, D, D, P, P, 2]
+        // Match Python's permute(0,1,3,2,4,5): correlation is stored as [e, corr_x, corr_y, pi, pj, c]
+        // where corr_x = dj (horizontal offset) and corr_y = di (vertical offset)
         // We need to extract center 7×7 region from 8×8 window
         for (int c = 0; c < 2; c++) {
-            for (int di = 0; di < D_target && (di + offset) < D; di++) {
-                for (int dj = 0; dj < D_target && (dj + offset) < D; dj++) {
+            for (int di = 0; di < D_target && (di + offset) < D; di++) {  // corr_y (vertical offset)
+                for (int dj = 0; dj < D_target && (dj + offset) < D; dj++) {  // corr_x (horizontal offset)
                     for (int pi = 0; pi < P; pi++) {
                         for (int pj = 0; pj < P; pj++) {
-                            // Source: corr[e][di+offset][dj+offset][pi][pj][c]
-                            // Layout: [num_active, D, D, P, P, 2]
+                            // Source: corr[e][dj+offset][di+offset][pi][pj][c] = [e, corr_x, corr_y, pi, pj, c]
+                            // Layout: [num_active, D, D, P, P, 2] where first D is corr_x, second D is corr_y
                             int src_idx = e * D * D * P * P * 2 +
-                                         (di + offset) * D * P * P * 2 +
-                                         (dj + offset) * P * P * 2 +
+                                         (dj + offset) * D * P * P * 2 +  // corr_x dimension (swapped)
+                                         (di + offset) * P * P * 2 +      // corr_y dimension (swapped)
                                          pi * P * 2 +
                                          pj * 2 +
                                          c;  // Channel last
