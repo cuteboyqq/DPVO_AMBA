@@ -222,7 +222,15 @@ def compute_python_8x8_correlation(gmap_py, fmap1_py, fmap2_py, coords_py,
     corr1_8x8_py = corr1_8x8_py[0].cpu().numpy()
     corr2_8x8_py = corr2_8x8_py[0].cpu().numpy()
     
-    print(f"Python 8x8 shape: {corr1_8x8_py.shape}")
+    # IMPORTANT: Python's 8x8 output (before permute) is [M, corr_y, corr_x, H, W]
+    # C++ stores 8x8 internal buffer as [e, corr_x, corr_y, i0, j0] (matching Python's final permuted format)
+    # So we need to swap dimensions 1 and 2 to match C++: [M, corr_x, corr_y, H, W]
+    # Using numpy transpose: (0, 2, 1, 3, 4) swaps dimensions 1 and 2
+    corr1_8x8_py = np.transpose(corr1_8x8_py, (0, 2, 1, 3, 4))  # Swap corr_y and corr_x dimensions
+    corr2_8x8_py = np.transpose(corr2_8x8_py, (0, 2, 1, 3, 4))  # Swap corr_y and corr_x dimensions
+    
+    print(f"Python 8x8 shape (after transpose): {corr1_8x8_py.shape}")
+    print(f"  Note: Swapped dimensions to match C++ format [edge, corr_x, corr_y, patch_y, patch_x]")
     
     return corr1_8x8_py, corr2_8x8_py
 

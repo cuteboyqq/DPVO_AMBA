@@ -528,12 +528,10 @@ def align_correlation_windows(corr_cpp_torch, corr1_py, corr2_py, D, D_py, R):
     corr_py_stacked = torch.stack([corr1_py, corr2_py], dim=-1)  # [1, num_active, D_py, D_py, P, P, 2]
     corr_py_final = corr_py_stacked.squeeze(0)  # [num_active, D_py, D_py, P, P, 2]
     
-    # IMPORTANT: Python's corr_torch_forward_fp16 returns out.permute(0, 1, 3, 2, 4, 5)
-    # This swaps correlation window dimensions: [B, M, corr_y, corr_x, H, W] -> [B, M, corr_x, corr_y, H, W]
-    # C++ stores correlation as [edge, corr_y, corr_x, patch_y, patch_x, level]
-    # So we need to swap Python's correlation window dimensions to match C++
-    # Swap dimensions 1 and 2: [num_active, D_py, D_py, P, P, 2] -> [num_active, D_py, D_py, P, P, 2]
-    corr_py_final = corr_py_final.transpose(1, 2)  # Swap correlation window dimensions to match C++
+    # C++ now matches Python's output format: [edge, corr_x, corr_y, patch_y, patch_x, level]
+    # Python's corr_torch_forward_fp16 returns out.permute(0, 1, 3, 2, 4, 5)
+    # which outputs [B, M, corr_x, corr_y, H, W] - C++ now matches this format
+    # No dimension swap needed anymore!
     
     corr_cpp_final = corr_cpp_torch.clone()
     
