@@ -284,22 +284,19 @@ def verify_slice_correspondence(kk_cpp, jj_cpp, num_active, M, num_gmap_frames, 
     ii1_in_bounds = max_ii1 < num_active
     jj1_in_bounds = max_jj1 < num_active
     
-    # Use actual C++ indices if they're within bounds, otherwise use sequential
-    if ii1_in_bounds and jj1_in_bounds:
-        # Use the actual C++ indices - this ensures Python selects the same slices as C++
-        ii1_py = torch.from_numpy(ii1_computed).long().to(device)
-        jj1_py = torch.from_numpy(jj1_computed).long().to(device)
-        print(f"✅ Using C++ indices directly (within bounds)")
-        print(f"   ii1_py will use C++ ii1_computed values")
-        print(f"   jj1_py will use C++ jj1_computed values")
-    else:
-        # Fallback to sequential if out of bounds
-        ii1_py = torch.arange(num_active, dtype=torch.long, device=device)
-        jj1_py = torch.arange(num_active, dtype=torch.long, device=device)
-        print(f"⚠️  WARNING: Some indices are out of bounds!")
-        print(f"   max_ii1: {max_ii1}, num_active: {num_active}, within bounds: {ii1_in_bounds}")
-        print(f"   max_jj1: {max_jj1}, num_active: {num_active}, within bounds: {jj1_in_bounds}")
-        print(f"   Falling back to sequential indices (may cause mismatches)")
+    # IMPORTANT: Since we're passing flattened arrays [1, num_active, ...] where
+    # each element corresponds to an edge, we should ALWAYS use sequential indices
+    # [0, 1, 2, ..., num_active-1] so Python selects the correct edge's data.
+    # If we use ring buffer indices (kk % (M*pmem)), Python would select the wrong edge!
+    # Example: If kk[23]=9, then ii1_py[23]=9, and Python selects fmap1[:, 9],
+    # but gmap_slices[9] contains patch from kk[9], not kk[23]!
+    # Always use sequential indices for flattened arrays (matching compare_correlation_8x8.py)
+    ii1_py = torch.arange(num_active, dtype=torch.long, device=device)
+    jj1_py = torch.arange(num_active, dtype=torch.long, device=device)
+    print(f"✅ Using sequential indices for flattened arrays")
+    print(f"   ii1_py = [0, 1, 2, ..., {num_active-1}]")
+    print(f"   jj1_py = [0, 1, 2, ..., {num_active-1}]")
+    print(f"   This ensures Python selects gmap_slices[e] and fmap_slices[e] for edge e")
     
     print(f"{'Edge':<10} {'C++ ii1':<15} {'C++ jj1':<15} {'Python ii1':<15} {'Python jj1':<15} {'Note':<30}")
     print("-"*70)
@@ -506,16 +503,19 @@ def _debug_correlation_output(corr_py, corr_cpp_torch, R, P, level):
     print(f"  Debug: corr{level+1}_py huge elements (>1e6): {corr_huge}/{corr_total} ({100*corr_huge/corr_total:.2f}%)")
     
     center_d = R
-    py_center_val = corr_py[0, 0, center_d, center_d, 1, 1].item()
+    # corr_py shape: [num_active, D, D, P, P] (5D tensor)
+    py_center_val = corr_py[0, center_d, center_d, 1, 1].item()
     cpp_center_val = corr_cpp_torch[0, R, R, 1, 1, level].item()
-    print(f"  Debug: corr{level+1}_py[0, 0, {center_d}, {center_d}, 1, 1] (center): {py_center_val:.6f}")
+    print(f"  Debug: corr{level+1}_py[0, {center_d}, {center_d}, 1, 1] (center): {py_center_val:.6f}")
     print(f"  Debug: C++ corr[0, {R}, {R}, 1, 1, {level}] (center): {cpp_center_val:.6f}")
     print(f"  Debug: Difference: {abs(py_center_val - cpp_center_val):.6f}")
     
     if corr_nan > 0 or corr_huge > 0:
         print(f"\n  ⚠️  WARNING: Found NaN or huge values in corr{level+1}_py!")
-        nan_edges = torch.isnan(corr_py).any(dim=2).any(dim=2).any(dim=2).any(dim=2)[0]
-        huge_edges = (torch.abs(corr_py) > 1e6).any(dim=2).any(dim=2).any(dim=2).any(dim=2)[0]
+        # corr_py shape: [num_active, D, D, P, P] (5D tensor)
+        # Reduce over all dimensions except the first (edge dimension)
+        nan_edges = torch.isnan(corr_py).any(dim=(1, 2, 3, 4))  # [num_active]
+        huge_edges = (torch.abs(corr_py) > 1e6).any(dim=(1, 2, 3, 4))  # [num_active]
         nan_edge_indices = torch.where(nan_edges)[0][:5].tolist()
         huge_edge_indices = torch.where(huge_edges)[0][:5].tolist()
         print(f"     Edges with NaN (first 5): {nan_edge_indices}")
@@ -527,6 +527,13 @@ def align_correlation_windows(corr_cpp_torch, corr1_py, corr2_py, D, D_py, R):
     # Stack Python results
     corr_py_stacked = torch.stack([corr1_py, corr2_py], dim=-1)  # [1, num_active, D_py, D_py, P, P, 2]
     corr_py_final = corr_py_stacked.squeeze(0)  # [num_active, D_py, D_py, P, P, 2]
+    
+    # IMPORTANT: Python's corr_torch_forward_fp16 returns out.permute(0, 1, 3, 2, 4, 5)
+    # This swaps correlation window dimensions: [B, M, corr_y, corr_x, H, W] -> [B, M, corr_x, corr_y, H, W]
+    # C++ stores correlation as [edge, corr_y, corr_x, patch_y, patch_x, level]
+    # So we need to swap Python's correlation window dimensions to match C++
+    # Swap dimensions 1 and 2: [num_active, D_py, D_py, P, P, 2] -> [num_active, D_py, D_py, P, P, 2]
+    corr_py_final = corr_py_final.transpose(1, 2)  # Swap correlation window dimensions to match C++
     
     corr_cpp_final = corr_cpp_torch.clone()
     
@@ -795,25 +802,26 @@ def print_detailed_analysis(results, corr1_cpp, corr2_cpp, corr_cpp_final, corr1
             print("="*100)
             print("Key Differences Between C++ and Python:")
             print("1. INTERPOLATION METHOD:")
-            print("   • C++: Uses nearest neighbor (floor() + integer indexing)")
+            print("   • C++: ✅ Uses bilinear interpolation (matching Python)")
             print("   • Python: Uses bilinear interpolation (grid_sample with 4-point weighted average)")
-            print("   → This causes differences especially for sub-pixel coordinates")
+            print("   → Both use bilinear interpolation, but implementation details may differ")
             print()
             print("2. COORDINATE HANDLING:")
-            print("   • C++: Uses raw pixel coordinates directly with floor()")
+            print("   • C++: ✅ Normalizes coordinates to [-1, 1] for bilinear sampling")
             print("   • Python: Normalizes coordinates to [-1, 1] for grid_sample")
-            print("   → Normalization: gx = 2 * (x / (W-1)) - 1, gy = 2 * (y / (H-1)) - 1")
+            print("   → Both normalize: gx = 2 * (x / (W-1)) - 1, gy = 2 * (y / (H-1)) - 1")
+            print("   → Both use align_corners=True normalization")
             print()
             print("3. BOUNDARY HANDLING:")
-            print("   • C++: Explicit bounds checking, sets correlation to 0.0 for out-of-bounds")
+            print("   • C++: ✅ Strict boundary check - returns 0 if ANY corner is out of bounds")
             print("   • Python: grid_sample returns 0 for out-of-bounds coordinates")
-            print("   → Both return 0, but may differ in edge cases")
+            print("   → Both use strict boundary checking (no tolerance-based clamping)")
             print()
-            print("RECOMMENDATION:")
-            print("To match Python exactly, C++ should:")
-            print("  • Use bilinear interpolation instead of nearest neighbor")
-            print("  • Normalize coordinates to [-1, 1] range")
-            print("  • Use the same 4-point weighted average as grid_sample")
+            print("4. POSSIBLE REMAINING ISSUES:")
+            print("   • Floating-point precision differences")
+            print("   • Potential dimension order mismatch in correlation window")
+            print("   • Different handling of exactly-on-boundary coordinates")
+            print("   • Code may not be recompiled after changes")
             print("="*100)
 
 
