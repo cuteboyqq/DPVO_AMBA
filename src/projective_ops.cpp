@@ -751,9 +751,28 @@ void transformWithJacobians(
         // ====================================================================
         // Ji[2, 6]: How do pixel coordinates change when we perturb pose i?
         // Since Gij = Tj * Ti^-1, changing Ti affects Gij through its inverse
-        // We use the adjoint transpose: Ji = -Gij.adjointT(Jj)
-        // The negative sign comes from the inverse in Gij = Tj * Ti^-1
-        Eigen::Matrix<float, 2, 6> Ji = -Gij.adjointT(Jj);
+        // Python uses: Ji = -Gij.adjT(Jj)
+        // Python's adjT computes: J * Ad (not J * Ad^T like C++ adjointT)
+        // C++ adjointT computes: J * Ad^T
+        // So Python's adjT is equivalent to: J * Ad = (J * Ad^T) * (Ad^T)^-1 * Ad
+        // But simpler: Python's adjT might compute Ad^T * J^T, then transpose
+        // Actually, let's try: Ji = -Gij.adjoint(Jj.transpose()).transpose()
+        // But adjoint takes a 6-vector, not a matrix. Let's compute manually:
+        // Python adjT: J * Ad (where Ad is adjoint matrix)
+        // C++ adjointT: J * Ad^T
+        // So we need: Ji = -Jj * Ad (not Jj * Ad^T)
+        // We can compute this by: Ji = -(Jj * Ad^T) * (Ad^T)^-1 * Ad
+        // Or simpler: compute Ad manually and do Jj * Ad
+        Eigen::Matrix3f R = Gij.R();
+        Eigen::Matrix3f t_hat = SE3::skew(Gij.t);
+        Eigen::Matrix3f Zero = Eigen::Matrix3f::Zero();
+        Eigen::Matrix<float, 6, 6> Ad;
+        Ad.block<3, 3>(0, 0) = R;
+        Ad.block<3, 3>(0, 3) = t_hat * R;
+        Ad.block<3, 3>(3, 0) = Zero;
+        Ad.block<3, 3>(3, 3) = R;
+        // Python's adjT computes: J * Ad (not J * Ad^T)
+        Eigen::Matrix<float, 2, 6> Ji = -Jj * Ad;
 
         // ====================================================================
         // STEP 11e: Jz = Jacobian w.r.t. inverse depth

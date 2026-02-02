@@ -1,5 +1,5 @@
 #pragma once
-#include "se3.h"
+#include "se.hpp"
 #include <vector>
 
 namespace pops {

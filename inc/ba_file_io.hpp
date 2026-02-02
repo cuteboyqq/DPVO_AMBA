@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 #include "eigen_common.h"  // Provides Eigen types (Vector3f, Quaternionf, etc.)
-#include "se3.h"
+#include "se.hpp"
 #include "logger.hpp"
 
 /**

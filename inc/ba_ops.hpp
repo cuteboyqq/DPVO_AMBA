@@ -1,6 +1,6 @@
 #pragma once
 #include "eigen_common.h"
-#include "se3.h"
+#include "se.hpp"
 #include <vector>
 
 namespace ba_ops {

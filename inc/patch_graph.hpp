@@ -1,5 +1,5 @@
 #pragma once
-#include "se3.h"
+#include "se.hpp"
 #include <cstdint>
 
 constexpr int BUFFER_SIZE = 36;

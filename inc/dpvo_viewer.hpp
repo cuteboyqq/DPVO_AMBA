@@ -13,7 +13,7 @@
 
 #pragma once
 
-#include "se3.h"
+#include "se.hpp"
 #include "patch_graph.hpp"
 #include <vector>
 #include <thread>
