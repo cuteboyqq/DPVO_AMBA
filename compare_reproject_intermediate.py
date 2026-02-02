@@ -15,6 +15,7 @@ import sys
 import os
 import argparse
 from pathlib import Path
+from typing import Union, Tuple, Optional, Dict, List, Any
 try:
     from scipy.spatial.transform import Rotation as R
 except ImportError:
@@ -41,7 +42,7 @@ except ImportError:
         print("Warning: Could not import lietorch.SE3. Will use torch tensors directly.")
 
 
-def load_binary_float(filename):
+def load_binary_float(filename: str) -> np.ndarray:
     """Load float32 array from binary file."""
     if not os.path.exists(filename):
         raise FileNotFoundError(f"File not found: {filename}")
@@ -49,7 +50,7 @@ def load_binary_float(filename):
     return data
 
 
-def load_binary_int32(filename):
+def load_binary_int32(filename: str) -> np.ndarray:
     """Load int32 array from binary file."""
     if not os.path.exists(filename):
         raise FileNotFoundError(f"File not found: {filename}")
@@ -57,7 +58,7 @@ def load_binary_int32(filename):
     return data
 
 
-def load_se3_object(filename):
+def load_se3_object(filename: str) -> np.ndarray:
     """Load SE3 object from binary file [7] format: [tx, ty, tz, qx, qy, qz, qw]."""
     data = load_binary_float(filename)
     if len(data) != 7:
@@ -65,7 +66,7 @@ def load_se3_object(filename):
     return data
 
 
-def load_matrix(filename, rows, cols):
+def load_matrix(filename: str, rows: int, cols: int) -> np.ndarray:
     """Load matrix from binary file (row-major format).
     
     Args:
@@ -84,28 +85,28 @@ def load_matrix(filename, rows, cols):
     return matrix
 
 
-def load_poses(filename, N):
-    """Load poses from binary file [N, 7] format: [tx, ty, tz, qx, qy, qz, qw]."""
+def load_poses(filename: str, N: int) -> np.ndarray:
+    """Load poses from binary file [N, 7] format: [tx, ty, tz, qw, qx, qy, qz] (Python lietorch format)."""
     data = load_binary_float(filename)
     poses = data.reshape(N, 7)
     return poses
 
 
-def load_patches(filename, N, M, P):
+def load_patches(filename: str, N: int, M: int, P: int) -> np.ndarray:
     """Load patches from binary file [N*M, 3, P, P]."""
     data = load_binary_float(filename)
     patches = data.reshape(N * M, 3, P, P)
     return patches
 
 
-def load_intrinsics(filename, N):
+def load_intrinsics(filename: str, N: int) -> np.ndarray:
     """Load intrinsics from binary file [N, 4] format: [fx, fy, cx, cy]."""
     data = load_binary_float(filename)
     intrinsics = data.reshape(N, 4)
     return intrinsics
 
 
-def load_edge_indices(ii_file, jj_file, kk_file, num_active):
+def load_edge_indices(ii_file: str, jj_file: str, kk_file: str, num_active: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load edge indices from binary files."""
     ii = load_binary_int32(ii_file)[:num_active]
     jj = load_binary_int32(jj_file)[:num_active]
@@ -113,7 +114,7 @@ def load_edge_indices(ii_file, jj_file, kk_file, num_active):
     return ii, jj, kk
 
 
-def convert_poses_to_se3(poses_np):
+def convert_poses_to_se3(poses_np: np.ndarray) -> torch.Tensor:
     """Convert numpy poses [N, 7] to Python SE3 objects.
     
     Args:
@@ -125,19 +126,19 @@ def convert_poses_to_se3(poses_np):
     return torch.from_numpy(poses_np).float()
 
 
-def convert_patches_to_torch(patches_np, N, M, P):
+def convert_patches_to_torch(patches_np: np.ndarray, N: int, M: int, P: int) -> torch.Tensor:
     """Convert numpy patches [N*M, 3, P, P] to torch [N, M, 3, P, P]."""
     patches_torch = torch.from_numpy(patches_np).float()
     patches_torch = patches_torch.reshape(N, M, 3, P, P)
     return patches_torch
 
 
-def convert_intrinsics_to_torch(intrinsics_np):
+def convert_intrinsics_to_torch(intrinsics_np: np.ndarray) -> torch.Tensor:
     """Convert numpy intrinsics [N, 4] to torch."""
     return torch.from_numpy(intrinsics_np).float()
 
 
-def se3_to_matrix(se3_data):
+def se3_to_matrix(se3_data: np.ndarray) -> np.ndarray:
     """Convert SE3 data [tx, ty, tz, qx, qy, qz, qw] to 4x4 transformation matrix.
     
     Args:
@@ -173,7 +174,12 @@ def se3_to_matrix(se3_data):
     return T
 
 
-def compare_se3(cpp_se3, py_se3, name="SE3", tolerance=1e-5):
+def compare_se3(
+    cpp_se3: np.ndarray,  # [7] format: [tx, ty, tz, qx, qy, qz, qw]
+    py_se3: Union[np.ndarray, torch.Tensor, Any],  # [7] format or SE3 object
+    name: str = "SE3",
+    tolerance: float = 1e-5
+) -> Dict[str, Any]:
     """Compare two SE3 objects.
     
     Args:
@@ -185,28 +191,40 @@ def compare_se3(cpp_se3, py_se3, name="SE3", tolerance=1e-5):
     Returns:
         dict: Comparison results
     """
-    # Convert Python SE3 to numpy if needed
-    if isinstance(py_se3, np.ndarray):
-        # Already a numpy array
-        py_se3_np = np.array(py_se3).flatten()  # Ensure it's 1D
-    elif isinstance(py_se3, torch.Tensor):
-        py_se3_np = py_se3.cpu().numpy().flatten()
-    elif hasattr(py_se3, 'data'):
-        # SE3 object or similar with .data attribute
-        try:
-            data = py_se3.data
-            if isinstance(data, torch.Tensor):
-                py_se3_np = data.cpu().numpy().flatten()
-            else:
-                py_se3_np = np.array(data).flatten()
-        except AttributeError:
-            py_se3_np = np.array(py_se3).flatten()
-    else:
-        py_se3_np = np.array(py_se3).flatten()
+    # Print log message FIRST, before any conversion
+    # print(f"--------------Start compare SE3 size ({name}):----------------------")
     
+    # Convert Python SE3 to numpy if needed
+    try:
+        if isinstance(py_se3, np.ndarray):
+            # Already a numpy array
+            py_se3_np = np.array(py_se3).flatten()  # Ensure it's 1D
+        elif isinstance(py_se3, torch.Tensor):
+            py_se3_np = py_se3.cpu().numpy().flatten()
+        elif hasattr(py_se3, 'data'):
+            # SE3 object or similar with .data attribute
+            try:
+                data = py_se3.data
+                if isinstance(data, torch.Tensor):
+                    py_se3_np = data.cpu().numpy().flatten()
+                else:
+                    py_se3_np = np.array(data).flatten()
+            except AttributeError:
+                py_se3_np = np.array(py_se3).flatten()
+                print(f"❌ py_se3_np = np.array(py_se3).flatten()")
+        else:
+            py_se3_np = np.array(py_se3).flatten()
+    except Exception as e:
+        print(f"❌ Error converting py_se3 to numpy: {e}")
+        print(f"   py_se3 type: {type(py_se3)}")
+        print(f"   py_se3 value: {py_se3}")
+        raise
     # Ensure both are [7] arrays
     if len(cpp_se3) != 7 or len(py_se3_np) != 7:
-        raise ValueError(f"SE3 must be [7], got C++: {len(cpp_se3)}, Python: {len(py_se3_np)}")
+        print(f"❌ SE3 must be [7], got C++: {len(cpp_se3)}, Python: {len(py_se3_np)}")
+        raise ValueError(f"❌ SE3 must be [7], got C++: {len(cpp_se3)}, Python: {len(py_se3_np)}")
+    # else:
+    #     print(f"✅ SE3 size matched [7], got C++: {len(cpp_se3)}, Python: {len(py_se3_np)}")
     
     # Compare translation
     t_cpp = cpp_se3[:3]
@@ -219,13 +237,10 @@ def compare_se3(cpp_se3, py_se3, name="SE3", tolerance=1e-5):
     q_cpp = cpp_se3[3:]
     q_py = py_se3_np[3:]
     
-    # Normalize quaternions
-    q_cpp_norm = q_cpp / np.linalg.norm(q_cpp)
-    q_py_norm = q_py / np.linalg.norm(q_py)
-    
     # Handle quaternion sign ambiguity (q and -q represent same rotation)
-    q_diff1 = np.abs(q_cpp_norm - q_py_norm)
-    q_diff2 = np.abs(q_cpp_norm + q_py_norm)
+    # Note: Quaternions should already be normalized in SE3 representations
+    q_diff1 = np.abs(q_cpp - q_py)
+    q_diff2 = np.abs(q_cpp + q_py)
     q_diff = np.minimum(q_diff1, q_diff2)
     q_max_diff = np.max(q_diff)
     q_mean_diff = np.mean(q_diff)
@@ -267,7 +282,12 @@ def compare_se3(cpp_se3, py_se3, name="SE3", tolerance=1e-5):
     }
 
 
-def compare_jacobians(cpp_jac, py_jac, name="Jacobian", tolerance=1e-4):
+def compare_jacobians(
+    cpp_jac: np.ndarray,  # [rows, cols]
+    py_jac: Union[np.ndarray, torch.Tensor],  # [rows, cols]
+    name: str = "Jacobian",
+    tolerance: float = 1e-4
+) -> Dict[str, Any]:
     """Compare two Jacobian matrices.
     
     Args:
@@ -317,7 +337,7 @@ def compare_jacobians(cpp_jac, py_jac, name="Jacobian", tolerance=1e-4):
     }
 
 
-def print_se3_comparison(result):
+def print_se3_comparison(result: Dict[str, Any]) -> None:
     """Print SE3 comparison results."""
     print(f"\n{'='*80}")
     print(f"SE3 COMPARISON: {result['name']}")
@@ -341,7 +361,7 @@ def print_se3_comparison(result):
     print(f"\nOverall: {'✅ MATCH' if result['overall_match'] else '❌ MISMATCH'}")
 
 
-def print_jacobian_comparison(result):
+def print_jacobian_comparison(result: Dict[str, Any]) -> None:
     """Print Jacobian comparison results."""
     print(f"\n{'='*80}")
     print(f"JACOBIAN COMPARISON: {result['name']}")
@@ -364,7 +384,12 @@ def print_jacobian_comparison(result):
     print(f"\n{'✅ MATCH' if result['match'] else '❌ MISMATCH'}")
 
 
-def compare_coordinates(cpp_coords, py_coords, name="Coordinates", tolerance=1e-4):
+def compare_coordinates(
+    cpp_coords: np.ndarray,  # [2, P, P] or [P, P, 2] or flattened
+    py_coords: np.ndarray,  # [2, P, P] or [P, P, 2] or similar
+    name: str = "Coordinates",
+    tolerance: float = 1e-4
+) -> Dict[str, Any]:
     """Compare reprojected coordinates.
     
     Args:
@@ -446,7 +471,7 @@ def compare_coordinates(cpp_coords, py_coords, name="Coordinates", tolerance=1e-
     }
 
 
-def print_coordinates_comparison(result, P, show_all=False):
+def print_coordinates_comparison(result: Dict[str, Any], P: int, show_all: bool = False) -> None:
     """Print coordinates comparison results.
     
     Args:
@@ -507,7 +532,11 @@ def print_coordinates_comparison(result, P, show_all=False):
     print(f"\n{'✅ MATCH' if result['match'] else '❌ MISMATCH'}")
 
 
-def load_cpp_intermediate_values(bin_dir, frame_num, edge_idx):
+def load_cpp_intermediate_values(
+    bin_dir: str,
+    frame_num: int,
+    edge_idx: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load C++ intermediate values (Ti, Tj, Gij, Ji, Jj, Jz) from binary files.
     
     Args:
@@ -516,7 +545,14 @@ def load_cpp_intermediate_values(bin_dir, frame_num, edge_idx):
         edge_idx: Edge index
     
     Returns:
-        tuple: (ti_cpp, tj_cpp, gij_cpp, ji_cpp, jj_cpp, jz_cpp)
+        tuple: (
+            ti_cpp: np.ndarray[7] - Ti pose in Python format [tx, ty, tz, qw, qx, qy, qz],
+            tj_cpp: np.ndarray[7] - Tj pose in Python format [tx, ty, tz, qw, qx, qy, qz],
+            gij_cpp: np.ndarray[7] - Gij transformation,
+            ji_cpp: np.ndarray[2, 6] - Jacobian w.r.t. pose i,
+            jj_cpp: np.ndarray[2, 6] - Jacobian w.r.t. pose j,
+            jz_cpp: np.ndarray[2, 1] - Jacobian w.r.t. inverse depth
+        )
     """
     print(f"\n{'='*80}")
     print("LOADING C++ INTERMEDIATE VALUES")
@@ -554,7 +590,11 @@ def load_cpp_intermediate_values(bin_dir, frame_num, edge_idx):
     return ti_cpp, tj_cpp, gij_cpp, ji_cpp, jj_cpp, jz_cpp
 
 
-def load_cpp_input_data(bin_dir, frame_num, edge_idx):
+def load_cpp_input_data(
+    bin_dir: str,
+    frame_num: int,
+    edge_idx: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], int, int, int, int, int, int, int]:
     """Load C++ input data (poses, patches, intrinsics, edge indices, coordinates).
     
     Args:
@@ -563,8 +603,22 @@ def load_cpp_input_data(bin_dir, frame_num, edge_idx):
         edge_idx: Edge index
     
     Returns:
-        tuple: (poses_cpp, patches_cpp, intrinsics_cpp, ii_cpp, jj_cpp_idx, kk_cpp, 
-                coords_cpp_full, N, M, P, num_active, i, j, k)
+        tuple: (
+            poses_cpp: np.ndarray[N, 7] - Poses,
+            patches_cpp: np.ndarray[N*M, 3, P, P] - Patches,
+            intrinsics_cpp: np.ndarray[N, 4] - Intrinsics,
+            ii_cpp: np.ndarray[num_active] - Source frame indices,
+            jj_cpp_idx: np.ndarray[num_active] - Target frame indices,
+            kk_cpp: np.ndarray[num_active] - Patch indices,
+            coords_cpp_full: Optional[np.ndarray] - Reprojected coordinates (may be None),
+            N: int - Number of frames,
+            M: int - Patches per frame,
+            P: int - Patch size,
+            num_active: int - Number of active edges,
+            i: int - Source frame index for this edge,
+            j: int - Target frame index for this edge,
+            k: int - Patch index for this edge
+        )
     """
     print(f"\n{'='*80}")
     print("LOADING C++ INPUT DATA")
@@ -644,7 +698,17 @@ def load_cpp_input_data(bin_dir, frame_num, edge_idx):
             coords_cpp_full, N, M, P, num_active, i, j, k)
 
 
-def prepare_python_inputs(poses_cpp, patches_cpp, intrinsics_cpp, i, j, k, N, M, P):
+def prepare_python_inputs(
+    poses_cpp: np.ndarray,  # [N, 7]
+    patches_cpp: np.ndarray,  # [N*M, 3, P, P]
+    intrinsics_cpp: np.ndarray,  # [N, 4]
+    i: int,
+    j: int,
+    k: int,
+    N: int,
+    M: int,
+    P: int
+) -> Tuple[Union[torch.Tensor, 'SE3_Python'], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prepare Python reproject inputs from C++ data.
     
     Args:
@@ -659,19 +723,22 @@ def prepare_python_inputs(poses_cpp, patches_cpp, intrinsics_cpp, i, j, k, N, M,
         P: Patch size
     
     Returns:
-        tuple: (poses_batch, patches_batch, intrinsics_batch, ii_single, jj_single, kk_single)
+        tuple: (
+            poses_batch: Union[torch.Tensor, SE3_Python] [1, N, 7] - Poses batch,
+            patches_batch: torch.Tensor [1, N*M, 3, P, P] - Patches batch,
+            intrinsics_batch: torch.Tensor [1, N, 4] - Intrinsics batch,
+            ii_single: torch.Tensor [1] - Source frame index tensor,
+            jj_single: torch.Tensor [1] - Target frame index tensor,
+            kk_single: torch.Tensor [1] - Patch index tensor
+        )
     """
     print(f"\n{'='*80}")
     print("PREPARING PYTHON INPUTS")
     print(f"{'='*80}")
     
-    # Convert poses to Python SE3 format if needed
-    # Python's lietorch.SE3 expects [N, 7] format: [tx, ty, tz, qw, qx, qy, qz]
-    # C++ uses [tx, ty, tz, qx, qy, qz, qw]
-    poses_py_format = np.zeros((N, 7))
-    poses_py_format[:, :3] = poses_cpp[:, :3]  # Translation
-    poses_py_format[:, 3] = poses_cpp[:, 6]     # qw
-    poses_py_format[:, 4:7] = poses_cpp[:, 3:6]  # qx, qy, qz
+    # C++ now saves poses in Python lietorch format: [tx, ty, tz, qw, qx, qy, qz]
+    # No conversion needed - use directly
+    poses_py_format = poses_cpp.copy()
     
     patches_torch = convert_patches_to_torch(patches_cpp, N, M, P)
     intrinsics_torch = convert_intrinsics_to_torch(intrinsics_cpp)
@@ -683,8 +750,10 @@ def prepare_python_inputs(poses_cpp, patches_cpp, intrinsics_cpp, i, j, k, N, M,
     
     if SE3_Python is not None:
         poses_batch = SE3_Python(poses_torch_batch)
+        print(f"-----------poses_batch = SE3_Python(poses_torch_batch)-------------")
     else:
         poses_batch = poses_torch_batch  # [1, N, 7]
+        print(f"-----------poses_batch = poses_torch_batch-------------")
     
     patches_batch = patches_torch.reshape(N * M, 3, P, P).unsqueeze(0)  # [1, N*M, 3, P, P]
     intrinsics_batch = intrinsics_torch.unsqueeze(0)  # [1, N, 4]
@@ -705,7 +774,12 @@ def prepare_python_inputs(poses_cpp, patches_cpp, intrinsics_cpp, i, j, k, N, M,
     return poses_batch, patches_batch, intrinsics_batch, ii_single, jj_single, kk_single
 
 
-def extract_python_jacobians(ji_py, jj_py, jz_py, P):
+def extract_python_jacobians(
+    ji_py: torch.Tensor,  # [1, 1, 2, 6] or similar
+    jj_py: torch.Tensor,  # [1, 1, 2, 6] or similar
+    jz_py: torch.Tensor,  # [1, 1, 2, 1] or similar
+    P: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract Python Jacobians at center pixel.
     
     Args:
@@ -715,7 +789,11 @@ def extract_python_jacobians(ji_py, jj_py, jz_py, P):
         P: Patch size
     
     Returns:
-        tuple: (ji_py_center, jj_py_center, jz_py_center) as numpy arrays
+        tuple: (
+            ji_py_center: np.ndarray[2, 6] - Jacobian w.r.t. pose i at center pixel,
+            jj_py_center: np.ndarray[2, 6] - Jacobian w.r.t. pose j at center pixel,
+            jz_py_center: np.ndarray[2, 1] - Jacobian w.r.t. inverse depth at center pixel
+        )
     """
     center_y = P // 2
     center_x = P // 2
@@ -760,7 +838,12 @@ def extract_python_jacobians(ji_py, jj_py, jz_py, P):
     return ji_py_center, jj_py_center, jz_py_center
 
 
-def compute_python_gij(poses_batch, i, j, poses_cpp):
+def compute_python_gij(
+    poses_batch: Union[torch.Tensor, 'SE3_Python'],  # [1, N, 7] SE3 object or tensor
+    i: int,  # Source frame index
+    j: int,  # Target frame index
+    poses_cpp: np.ndarray  # [N, 7] C++ format: [tx, ty, tz, qx, qy, qz, qw]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute Python Gij = Tj * Ti^-1.
     
     Args:
@@ -770,26 +853,48 @@ def compute_python_gij(poses_batch, i, j, poses_cpp):
         poses_cpp: C++ poses [N, 7] in C++ format - used for Ti/Tj extraction (same as C++ input)
     
     Returns:
-        tuple: (gij_py, ti_py, tj_py) in C++ format [7]
+        tuple: (
+            gij_py: np.ndarray[7] - Gij transformation in C++ format,
+            ti_py: np.ndarray[7] - Ti pose in C++ format,
+            tj_py: np.ndarray[7] - Tj pose in C++ format
+        )
     """
     # Ti and Tj should come from the same input poses that C++ used
-    # C++ saves Ti = poses_cpp[i] and Tj = poses_cpp[j]
-    ti_py = poses_cpp[i].copy()  # [tx, ty, tz, qx, qy, qz, qw] - same as C++
-    tj_py = poses_cpp[j].copy()  # [tx, ty, tz, qx, qy, qz, qw] - same as C++
+    # C++ now saves in Python format: [tx, ty, tz, qw, qx, qy, qz]
+    ti_py = poses_cpp[i].copy()  # [tx, ty, tz, qw, qx, qy, qz] - Python format
+    tj_py = poses_cpp[j].copy()  # [tx, ty, tz, qw, qx, qy, qz] - Python format
     
+
     # Compute Gij using Python SE3 operations for comparison
     if SE3_Python is not None:
         # poses_batch is SE3 object with shape [1, N, 7]
-        # Access individual poses - try both indexing methods
+        # CRITICAL: Python's transform function computes Gij as:
+        #   Gij = poses[:, jj] * poses[:, ii].inv()
+        # Try to use the exact same indexing as Python's transform function
         try:
-            ti_py_se3 = poses_batch[0, i]  # Try batch indexing first
-            tj_py_se3 = poses_batch[0, j]
-        except (IndexError, TypeError):
-            # Fallback: direct indexing
-            ti_py_se3 = poses_batch[i]
-            tj_py_se3 = poses_batch[j]
-        
-        gij_py_se3 = tj_py_se3 * ti_py_se3.inv()
+            # Create index tensors exactly as Python's transform function receives them
+            ii_tensor = torch.tensor([i], dtype=torch.long, device=poses_batch.device)
+            jj_tensor = torch.tensor([j], dtype=torch.long, device=poses_batch.device)
+            
+            # Debug: Check if i == j
+            if i == j:
+                print(f"   DEBUG: i == j == {i}, so Gij should be identity")
+                print(f"   DEBUG: Ti == Tj, so Tj * Ti.inv() = Tj * Tj.inv() = Identity")
+            
+            # Compute Gij exactly as Python's transform function does:
+            # Gij = poses[:, jj] * poses[:, ii].inv()
+            # This uses advanced indexing: poses[:, jj] selects columns jj from poses
+            gij_py_se3_batch = poses_batch[:, jj_tensor] * poses_batch[:, ii_tensor].inv()
+            
+            # Extract the single Gij from the batch (since we only have one edge)
+            gij_py_se3 = gij_py_se3_batch[0, 0]  # [batch=0, edge=0]
+        except (IndexError, TypeError, AttributeError) as e:
+            # Fallback: If advanced indexing doesn't work, use direct indexing
+            # This should still give the same result as Python's transform function
+            print(f"   ⚠️  Warning: Advanced indexing failed ({e}), using direct indexing")
+            if i == j:
+                print(f"   DEBUG: i == j == {i}, using direct indexing")
+            gij_py_se3 = poses_batch[0, j] * poses_batch[0, i].inv()
         
         # Extract data and ensure it's 1D [7]
         gij_py_data_raw = gij_py_se3.data.cpu().numpy()
@@ -798,11 +903,9 @@ def compute_python_gij(poses_batch, i, j, poses_cpp):
         if len(gij_py_data) != 7:
             raise ValueError(f"Expected gij_py_data to have length 7, got {len(gij_py_data)} with shape {gij_py_data_raw.shape}")
         
-        # Convert to C++ format: [tx, ty, tz, qx, qy, qz, qw]
-        gij_py = np.zeros(7)
-        gij_py[:3] = gij_py_data[:3]  # Translation
-        gij_py[3:6] = gij_py_data[4:7]  # qx, qy, qz
-        gij_py[6] = gij_py_data[3]  # qw
+        # Python's lietorch.SE3.data() returns [tx, ty, tz, qw, qx, qy, qz]
+        # C++ now saves in the same format, so no conversion needed
+        gij_py = gij_py_data.copy()
     # else:
     #     # Manual computation using scipy
     #     if R is None:
@@ -825,14 +928,14 @@ def compute_python_gij(poses_batch, i, j, poses_cpp):
     return gij_py, ti_py, tj_py
 
 
-def extract_python_coordinates(coords_py):
+def extract_python_coordinates(coords_py: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     """Extract Python coordinates and normalize to [2, P, P] format.
     
     Args:
         coords_py: Python coordinates (various formats)
     
     Returns:
-        numpy.ndarray: Coordinates in [2, P, P] format
+        numpy.ndarray[2, P, P]: Coordinates in [2, P, P] format
     """
     coords_py_edge = coords_py
     if isinstance(coords_py_edge, torch.Tensor):
@@ -914,24 +1017,42 @@ def extract_python_coordinates(coords_py):
     return coords_py_edge
 
 
-def call_python_reproject(poses_batch, patches_batch, intrinsics_batch, 
-                          ii_single, jj_single, kk_single, P, i, j, poses_cpp):
+def call_python_reproject(
+    poses_batch: Union[torch.Tensor, 'SE3_Python'],  # [1, N, 7] SE3 object or tensor
+    patches_batch: torch.Tensor,  # [1, N*M, 3, P, P]
+    intrinsics_batch: torch.Tensor,  # [1, N, 4]
+    ii_single: torch.Tensor,  # [1] long tensor, source frame index
+    jj_single: torch.Tensor,  # [1] long tensor, target frame index
+    kk_single: torch.Tensor,  # [1] long tensor, patch index
+    P: int,  # Patch size (e.g., 3)
+    i: int,  # Source frame index (for Gij computation)
+    j: int,  # Target frame index (for Gij computation)
+    poses_cpp: np.ndarray  # [N, 7] C++ format: [tx, ty, tz, qx, qy, qz, qw]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Call Python reproject function and extract all results.
     
     Args:
-        poses_batch: Python poses batch
-        patches_batch: Python patches batch
-        intrinsics_batch: Python intrinsics batch
-        ii_single: Source frame index tensor
-        jj_single: Target frame index tensor
-        kk_single: Patch index tensor
-        P: Patch size
+        poses_batch: Python poses batch - SE3 object or tensor with shape [1, N, 7]
+        patches_batch: Python patches batch with shape [1, N*M, 3, P, P]
+        intrinsics_batch: Python intrinsics batch with shape [1, N, 4]
+        ii_single: Source frame index tensor with shape [1] and dtype long
+        jj_single: Target frame index tensor with shape [1] and dtype long
+        kk_single: Patch index tensor with shape [1] and dtype long
+        P: Patch size (e.g., 3 for 3x3 patches)
         i: Source frame index (for Gij computation)
         j: Target frame index (for Gij computation)
-        poses_cpp: C++ poses [N, 7] in C++ format (same input as C++ used)
+        poses_cpp: C++ poses array with shape [N, 7] in C++ format [tx, ty, tz, qx, qy, qz, qw]
     
     Returns:
-        tuple: (gij_py, ti_py, tj_py, ji_py_center, jj_py_center, jz_py_center, coords_py_edge)
+        tuple: (
+            gij_py: np.ndarray[7] - Gij transformation in C++ format [tx, ty, tz, qx, qy, qz, qw],
+            ti_py: np.ndarray[7] - Ti pose in C++ format [tx, ty, tz, qx, qy, qz, qw],
+            tj_py: np.ndarray[7] - Tj pose in C++ format [tx, ty, tz, qx, qy, qz, qw],
+            ji_py_center: np.ndarray[2, 6] - Jacobian w.r.t. pose i at center pixel,
+            jj_py_center: np.ndarray[2, 6] - Jacobian w.r.t. pose j at center pixel,
+            jz_py_center: np.ndarray[2, 1] - Jacobian w.r.t. inverse depth at center pixel,
+            coords_py_edge: np.ndarray[2, P, P] - Reprojected coordinates [u, v] for the patch
+        )
     """
     print(f"\n{'='*80}")
     print("CALLING PYTHON REPROJECT WITH JACOBIAN")
@@ -994,18 +1115,34 @@ def call_python_reproject(poses_batch, patches_batch, intrinsics_batch,
         raise
 
 
-def compare_all_results(ti_cpp, tj_cpp, gij_cpp, ji_cpp, jj_cpp, jz_cpp,
-                       ti_py, tj_py, gij_py, ji_py_center, jj_py_center, jz_py_center,
-                       coords_cpp_full, coords_py_edge, edge_idx, P, tolerance):
+def compare_all_results(
+    ti_cpp: np.ndarray,  # [7]
+    tj_cpp: np.ndarray,  # [7]
+    gij_cpp: np.ndarray,  # [7]
+    ji_cpp: np.ndarray,  # [2, 6]
+    jj_cpp: np.ndarray,  # [2, 6]
+    jz_cpp: np.ndarray,  # [2, 1]
+    ti_py: np.ndarray,  # [7]
+    tj_py: np.ndarray,  # [7]
+    gij_py: np.ndarray,  # [7]
+    ji_py_center: np.ndarray,  # [2, 6]
+    jj_py_center: np.ndarray,  # [2, 6]
+    jz_py_center: np.ndarray,  # [2, 1]
+    coords_cpp_full: Optional[np.ndarray],  # Flattened coordinates or None
+    coords_py_edge: np.ndarray,  # [2, P, P]
+    edge_idx: int,
+    P: int,
+    tolerance: float
+) -> Dict[str, Any]:
     """Compare all intermediate values between C++ and Python.
     
     Args:
-        ti_cpp, tj_cpp, gij_cpp: C++ SE3 objects
+        ti_cpp, tj_cpp, gij_cpp: C++ SE3 objects [7]
         ji_cpp, jj_cpp, jz_cpp: C++ Jacobians
-        ti_py, tj_py, gij_py: Python SE3 objects
+        ti_py, tj_py, gij_py: Python SE3 objects [7]
         ji_py_center, jj_py_center, jz_py_center: Python Jacobians
         coords_cpp_full: C++ coordinates array (or None)
-        coords_py_edge: Python coordinates array (or None)
+        coords_py_edge: Python coordinates array [2, P, P]
         edge_idx: Edge index
         P: Patch size
         tolerance: Comparison tolerance
@@ -1023,6 +1160,14 @@ def compare_all_results(ti_cpp, tj_cpp, gij_cpp, ji_cpp, jj_cpp, jz_cpp,
     
     tj_result = compare_se3(tj_cpp, tj_py, "Tj", tolerance)
     print_se3_comparison(tj_result)
+    
+    # Debug: Print Gij values before comparison
+    # print("-"*70)
+    # print(f"\n   DEBUG: Before Gij comparison:")
+    # print(f"   DEBUG: gij_cpp = {gij_cpp}")
+    # print(f"   DEBUG: gij_py = {gij_py}")
+    # print(f"   DEBUG: gij_cpp shape = {gij_cpp.shape if hasattr(gij_cpp, 'shape') else 'no shape'}")
+    # print(f"   DEBUG: gij_py shape = {gij_py.shape if hasattr(gij_py, 'shape') else 'no shape'}")
     
     gij_result = compare_se3(gij_cpp, gij_py, "Gij", tolerance)
     print_se3_comparison(gij_result)
@@ -1090,7 +1235,7 @@ def compare_all_results(ti_cpp, tj_cpp, gij_cpp, ji_cpp, jj_cpp, jz_cpp,
     }
 
 
-def print_summary(results):
+def print_summary(results: Dict[str, Any]) -> None:
     """Print comparison summary.
     
     Args:
@@ -1113,7 +1258,7 @@ def print_summary(results):
     print(f"\nOverall: {'✅ ALL MATCH' if results['all_match'] else '❌ SOME MISMATCHES'}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Compare C++ and Python reproject intermediate values")
     parser.add_argument("--frame", type=int, required=True, help="Frame number to compare")
     parser.add_argument("--edge", type=int, default=0, help="Edge index to compare (default: 0)")
