@@ -1161,13 +1161,141 @@ def compare_all_results(
     tj_result = compare_se3(tj_cpp, tj_py, "Tj", tolerance)
     print_se3_comparison(tj_result)
     
-    # Debug: Print Gij values before comparison
-    # print("-"*70)
-    # print(f"\n   DEBUG: Before Gij comparison:")
-    # print(f"   DEBUG: gij_cpp = {gij_cpp}")
-    # print(f"   DEBUG: gij_py = {gij_py}")
-    # print(f"   DEBUG: gij_cpp shape = {gij_cpp.shape if hasattr(gij_cpp, 'shape') else 'no shape'}")
-    # print(f"   DEBUG: gij_py shape = {gij_py.shape if hasattr(gij_py, 'shape') else 'no shape'}")
+    # Debug: Compare Ti.inverse() and intermediate steps
+    print(f"\n{'='*80}")
+    print("DEBUGGING Gij COMPUTATION")
+    print(f"{'='*80}")
+    
+    # Compute Ti.inverse() in Python to compare with C++
+    if SE3_Python is not None:
+        ti_py_tensor = torch.from_numpy(ti_py).float().unsqueeze(0).unsqueeze(0)  # [1, 1, 7]
+        ti_py_se3 = SE3_Python(ti_py_tensor)
+        ti_inv_py_se3 = ti_py_se3.inv()
+        ti_inv_py_data = ti_inv_py_se3.data[0, 0].cpu().numpy().flatten()
+        print(f"\nTi.inverse() comparison:")
+        print(f"  Python Ti.inverse(): {ti_inv_py_data}")
+        
+        # Compute Tj * Ti.inverse() step by step
+        tj_py_tensor = torch.from_numpy(tj_py).float().unsqueeze(0).unsqueeze(0)  # [1, 1, 7]
+        tj_py_se3 = SE3_Python(tj_py_tensor)
+        gij_py_step = tj_py_se3 * ti_inv_py_se3
+        gij_py_step_data = gij_py_step.data[0, 0].cpu().numpy().flatten()
+        print(f"  Python Tj * Ti.inverse(): {gij_py_step_data}")
+        print(f"  Python Gij (from compute_python_gij): {gij_py}")
+        print(f"  C++ Gij: {gij_cpp}")
+        
+        # Check if they match
+        if np.allclose(gij_py_step_data, gij_py, atol=1e-5):
+            print(f"  ✅ Python Gij matches (step-by-step vs function)")
+        else:
+            print(f"  ❌ Python Gij mismatch (step-by-step vs function)")
+            print(f"     Max diff: {np.max(np.abs(gij_py_step_data - gij_py))}")
+        
+        # Compare Ti.inverse() rotation matrices directly
+        print(f"\n{'='*80}")
+        print("COMPARING Ti.inverse() ROTATION MATRICES")
+        print(f"{'='*80}")
+        
+        from scipy.spatial.transform import Rotation as Rot
+        
+        # Python Ti.inverse() rotation matrix
+        ti_inv_py_q = ti_inv_py_data[3:]  # [qw, qx, qy, qz]
+        rot_ti_inv_py = Rot.from_quat([ti_inv_py_q[1], ti_inv_py_q[2], ti_inv_py_q[3], ti_inv_py_q[0]])  # scipy uses [x,y,z,w]
+        R_ti_inv_py = rot_ti_inv_py.as_matrix()
+        
+        # Expected Ti.inverse() rotation matrix (from Ti using standard math)
+        ti_cpp_q = ti_cpp[3:]  # [qw, qx, qy, qz] from C++ (now in Python format)
+        rot_ti_cpp = Rot.from_quat([ti_cpp_q[1], ti_cpp_q[2], ti_cpp_q[3], ti_cpp_q[0]])  # scipy uses [x,y,z,w]
+        R_ti_cpp = rot_ti_cpp.as_matrix()
+        R_ti_inv_expected = R_ti_cpp.T  # Inverse rotation = transpose
+        
+        print(f"  Python Ti.inverse() R:\n{R_ti_inv_py}")
+        print(f"  Expected Ti.inverse() R (from Ti.T):\n{R_ti_inv_expected}")
+        print(f"  R diff:\n{R_ti_inv_py - R_ti_inv_expected}")
+        print(f"  Max R diff: {np.max(np.abs(R_ti_inv_py - R_ti_inv_expected))}")
+        
+        # Check if Python's quaternion conjugate produces different rotation matrix
+        # Python's Ti.inverse() quaternion: [-0.91661954, 0.388893, 0.0145935, -0.09142205] (qw, qx, qy, qz)
+        # Original Ti quaternion: [0.91661954, -0.388893, -0.0145935, -0.09142205] (qw, qx, qy, qz)
+        # Conjugate should be: [0.91661954, 0.388893, 0.0145935, 0.09142205] (negate x,y,z, keep w)
+        # But Python has: [-0.91661954, 0.388893, 0.0145935, -0.09142205] (negated w and z!)
+        print(f"\n  Quaternion analysis:")
+        print(f"  Original Ti q: {ti_cpp_q}")
+        print(f"  Python Ti.inverse() q: {ti_inv_py_q}")
+        print(f"  Expected conjugate q: [{ti_cpp_q[0]}, {-ti_cpp_q[1]}, {-ti_cpp_q[2]}, {-ti_cpp_q[3]}]")
+        print(f"  Python's conjugate seems to negate w and z instead of x,y,z!")
+        
+        # Check if Python uses a different quaternion convention
+        # Try: negate w and z instead of x,y,z
+        q_conj_python_style = np.array([-ti_cpp_q[0], ti_cpp_q[1], ti_cpp_q[2], -ti_cpp_q[3]])  # Negate w and z
+        rot_conj_python_style = Rot.from_quat([q_conj_python_style[1], q_conj_python_style[2], q_conj_python_style[3], q_conj_python_style[0]])
+        R_conj_python_style = rot_conj_python_style.as_matrix()
+        print(f"\n  If Python negates w and z (instead of x,y,z):")
+        print(f"  R diff with Python: {np.max(np.abs(R_ti_inv_py - R_conj_python_style))}")
+        
+        # Check if Python negates specific rows/columns of the rotation matrix
+        # Try negating column 2 and row 2
+        R_test1 = R_ti_inv_expected.copy()
+        R_test1[:, 2] = -R_test1[:, 2]  # Negate column 2
+        R_test1[2, :] = -R_test1[2, :]  # Negate row 2
+        print(f"\n  If Python negates column 2 and row 2 of R^T:")
+        print(f"  R diff with Python: {np.max(np.abs(R_ti_inv_py - R_test1))}")
+        
+        # Try negating just column 2
+        R_test2 = R_ti_inv_expected.copy()
+        R_test2[:, 2] = -R_test2[:, 2]  # Negate column 2
+        print(f"  If Python negates column 2 of R^T:")
+        print(f"  R diff with Python: {np.max(np.abs(R_ti_inv_py - R_test2))}")
+        
+        # Try negating just row 2
+        R_test3 = R_ti_inv_expected.copy()
+        R_test3[2, :] = -R_test3[2, :]  # Negate row 2
+        print(f"  If Python negates row 2 of R^T:")
+        print(f"  R diff with Python: {np.max(np.abs(R_ti_inv_py - R_test3))}")
+        
+        if np.max(np.abs(R_ti_inv_py - R_ti_inv_expected)) < 1e-5:
+            print(f"  ✅ Ti.inverse() rotation matrices match!")
+        else:
+            print(f"  ❌ Ti.inverse() rotation matrices DON'T match!")
+            print(f"  ⚠️  Python's lietorch uses a different inverse convention!")
+        
+        # Compare translations
+        t_ti_cpp = ti_cpp[:3]
+        t_ti_inv_py = ti_inv_py_data[:3]
+        t_ti_inv_expected = -R_ti_inv_expected @ t_ti_cpp
+        print(f"\n  Python Ti.inverse() t: {t_ti_inv_py}")
+        print(f"  Expected Ti.inverse() t: {t_ti_inv_expected}")
+        print(f"  t diff: {np.abs(t_ti_inv_py - t_ti_inv_expected)}, max={np.max(np.abs(t_ti_inv_py - t_ti_inv_expected))}")
+        
+        # Compare rotation matrices directly
+        # Python Gij rotation matrix
+        gij_py_q = gij_py[3:]  # [qw, qx, qy, qz]
+        rot_py = Rot.from_quat([gij_py_q[1], gij_py_q[2], gij_py_q[3], gij_py_q[0]])  # scipy uses [x,y,z,w]
+        R_py = rot_py.as_matrix()
+        
+        # C++ Gij rotation matrix
+        gij_cpp_q = gij_cpp[3:]  # [qw, qx, qy, qz]
+        rot_cpp = Rot.from_quat([gij_cpp_q[1], gij_cpp_q[2], gij_cpp_q[3], gij_cpp_q[0]])  # scipy uses [x,y,z,w]
+        R_cpp = rot_cpp.as_matrix()
+        
+        print(f"\nRotation Matrix Comparison:")
+        print(f"  Python R:\n{R_py}")
+        print(f"  C++ R:\n{R_cpp}")
+        print(f"  R diff:\n{R_py - R_cpp}")
+        print(f"  Max R diff: {np.max(np.abs(R_py - R_cpp))}")
+        
+        # Check if quaternions represent the same rotation (q and -q represent same rotation)
+        q_py_norm = gij_py_q / np.linalg.norm(gij_py_q)
+        q_cpp_norm = gij_cpp_q / np.linalg.norm(gij_cpp_q)
+        q_diff1 = np.abs(q_py_norm - q_cpp_norm)
+        q_diff2 = np.abs(q_py_norm + q_cpp_norm)  # Check negative quaternion
+        print(f"\nQuaternion comparison (normalized):")
+        print(f"  Python q (norm): {q_py_norm}")
+        print(f"  C++ q (norm): {q_cpp_norm}")
+        print(f"  q diff (direct): {q_diff1}, max={np.max(q_diff1)}")
+        print(f"  q diff (negated): {q_diff2}, max={np.max(q_diff2)}")
+        if np.max(q_diff2) < np.max(q_diff1):
+            print(f"  ⚠️  C++ quaternion might be negated version of Python quaternion")
     
     gij_result = compare_se3(gij_cpp, gij_py, "Gij", tolerance)
     print_se3_comparison(gij_result)
