@@ -5,6 +5,8 @@
 #include <cmath>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <sys/stat.h>  // For mkdir
+#include <sys/types.h>
 #ifdef SPDLOG_USE_SYSLOG
 #include <spdlog/sinks/syslog_sink.h>
 #endif
@@ -12,6 +14,24 @@
 namespace pops {
 
 static constexpr float MIN_DEPTH = 0.2f;
+
+// Helper function to get bin_file directory path and ensure it exists
+static std::string get_bin_file_path(const std::string& filename) {
+    const std::string bin_dir = "bin_file";
+    
+    // Create directory if it doesn't exist
+    struct stat info;
+    if (stat(bin_dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        #ifdef _WIN32
+        mkdir(bin_dir.c_str());
+        #else
+        mkdir(bin_dir.c_str(), 0755);
+        #endif
+    }
+    
+    return bin_dir + "/" + filename;
+}
 
 // ------------------------------------------------------------
 // iproj(): inverse projection
@@ -288,9 +308,9 @@ void transformWithJacobians(
             }
             std::string frame_suffix = std::to_string(frame_num);
             std::string edge_suffix = std::to_string(e);
-            ba_file_io::save_se3_object("reproject_Ti_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Ti, logger);
-            ba_file_io::save_se3_object("reproject_Tj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Tj, logger);
-            ba_file_io::save_se3_object("reproject_Gij_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Gij, logger);
+            ba_file_io::save_se3_object(get_bin_file_path("reproject_Ti_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Ti, logger);
+            ba_file_io::save_se3_object(get_bin_file_path("reproject_Tj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Tj, logger);
+            ba_file_io::save_se3_object(get_bin_file_path("reproject_Gij_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Gij, logger);
         }
 
         // ====================================================================
@@ -761,9 +781,9 @@ void transformWithJacobians(
             }
             std::string frame_suffix = std::to_string(frame_num);
             std::string edge_suffix = std::to_string(e);
-            ba_file_io::save_eigen_matrix("reproject_Ji_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Ji, logger);
-            ba_file_io::save_eigen_matrix("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Jj, logger);
-            ba_file_io::save_eigen_matrix("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin", Jz, logger);
+            ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Ji_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Ji, logger);
+            ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jj, logger);
+            ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jz, logger);
         }
 
         // ====================================================================
@@ -815,6 +835,23 @@ void transformWithJacobians(
                 }
             }
         }
+    }
+    
+    // Save reprojected coordinates if requested
+    if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
+        auto logger = spdlog::get("dpvo");
+        if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+            logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+            logger = spdlog::stdout_color_mt("dpvo");
+            logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+        }
+        std::string frame_suffix = std::to_string(frame_num);
+        // Save all coordinates: [num_edges, 2, P, P] flattened
+        size_t total_size = static_cast<size_t>(num_edges) * 2 * P * P;
+        ba_file_io::save_float_array(get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin"), coords_out, total_size, logger);
     }
 }
 
