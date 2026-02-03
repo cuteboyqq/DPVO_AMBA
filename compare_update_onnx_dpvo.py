@@ -343,6 +343,13 @@ def main() -> int:
     # Print comparison table
     print_comparison_table(results)
     
+    # Print parseable format for run_all_comparisons.py
+    # Calculate overall max_diff and mean_diff across all outputs
+    overall_max_diff = max(r.max_diff for r in results)
+    overall_mean_diff = sum(r.mean_diff for r in results) / len(results)
+    print(f"\n   UPDATE_MODEL_MAX_DIFF={overall_max_diff:.10e}")
+    print(f"   UPDATE_MODEL_MEAN_DIFF={overall_mean_diff:.10e}")
+    
     # Print sample values for all outputs in table format
     print("\n" + "="*100)
     print("DETAILED SAMPLE VALUES COMPARISON")

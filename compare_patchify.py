@@ -267,15 +267,23 @@ def print_sample_values_table(arr1, arr2, name, max_samples=20):
     print("="*100)
 
 def compare_arrays(arr1, arr2, name, tolerance=1e-5, show_samples=True):
-    """Compare two arrays and print statistics in table format"""
+    """Compare two arrays and print statistics in table format
+    
+    Returns:
+        tuple: (matches: bool, max_diff: float, mean_diff: float)
+    """
     arr1 = np.asarray(arr1)
     arr2 = np.asarray(arr2)
     
     if arr1.shape != arr2.shape:
         print(f"\n❌ {name}: Shape mismatch - {arr1.shape} vs {arr2.shape}")
-        return False
+        return False, float('inf'), float('inf')
     
     diff = np.abs(arr1 - arr2)
+    
+    # Calculate statistics
+    max_diff = np.max(diff)
+    mean_diff = np.mean(diff)
     
     # Print comparison table
     print_comparison_table(name, arr1, arr2, diff, tolerance)
@@ -285,17 +293,17 @@ def compare_arrays(arr1, arr2, name, tolerance=1e-5, show_samples=True):
         print_sample_values_table(arr1, arr2, name, max_samples=20)
     
     # Determine if they match
-    max_diff = np.max(diff)
     num_diff = np.sum(diff > tolerance)
     total = arr1.size
     pct_diff = 100.0 * num_diff / total
     
+    matches = False
     if max_diff < tolerance:
-        return True
+        matches = True
     elif pct_diff < 1.0:
-        return True
-    else:
-        return False
+        matches = True
+    
+    return matches, max_diff, mean_diff
 
 def load_inputs(frame_idx):
     """Load fnet and inet input files"""
@@ -477,9 +485,9 @@ def run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patche
     print_first_patch_details(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patches)
     
     # Run comparisons with table output
-    gmap_match = compare_arrays(cpp_gmap, py_gmap, "gmap (patches from fmap)", tolerance=1e-4, show_samples=True)
-    imap_match = compare_arrays(cpp_imap, py_imap, "imap (patches from inet)", tolerance=1e-4, show_samples=True)
-    patches_match = compare_arrays(cpp_patches, py_patches, "patches (coordinate patches)", tolerance=1e-4, show_samples=True)
+    gmap_match, gmap_max_diff, gmap_mean_diff = compare_arrays(cpp_gmap, py_gmap, "gmap (patches from fmap)", tolerance=1e-4, show_samples=True)
+    imap_match, imap_max_diff, imap_mean_diff = compare_arrays(cpp_imap, py_imap, "imap (patches from inet)", tolerance=1e-4, show_samples=True)
+    patches_match, patches_max_diff, patches_mean_diff = compare_arrays(cpp_patches, py_patches, "patches (coordinate patches)", tolerance=1e-4, show_samples=True)
     
     # Summary table
     print(f"\n{'='*100}")
@@ -491,6 +499,28 @@ def run_comparisons(cpp_gmap, py_gmap, cpp_imap, py_imap, cpp_patches, py_patche
     print(f"{'imap':<30} {'✅ MATCH' if imap_match else '❌ MISMATCH':<20}")
     print(f"{'patches':<30} {'✅ MATCH' if patches_match else '❌ MISMATCH':<20}")
     print("="*100)
+    
+    # Calculate overall max_diff and mean_diff across all outputs
+    max_diffs = [gmap_max_diff, imap_max_diff, patches_max_diff]
+    mean_diffs = [gmap_mean_diff, imap_mean_diff, patches_mean_diff]
+    
+    # Filter out inf values (from shape mismatches)
+    max_diffs_valid = [d for d in max_diffs if d != float('inf')]
+    mean_diffs_valid = [d for d in mean_diffs if d != float('inf')]
+    
+    if max_diffs_valid:
+        overall_max_diff = max(max_diffs_valid)
+    else:
+        overall_max_diff = float('inf')
+    
+    if mean_diffs_valid:
+        overall_mean_diff = sum(mean_diffs_valid) / len(mean_diffs_valid)
+    else:
+        overall_mean_diff = float('inf')
+    
+    # Print parseable format for run_all_comparisons.py
+    print(f"\n   PATCHIFY_MAX_DIFF={overall_max_diff:.10e}")
+    print(f"   PATCHIFY_MEAN_DIFF={overall_mean_diff:.10e}")
     
     return gmap_match and imap_match and patches_match
 

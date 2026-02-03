@@ -68,21 +68,53 @@ def parse_correlation_output(output: str) -> ComparisonResult:
         elif "❌ MISMATCH" in output or "Mismatches detected" in output:
             match_status = "MISMATCH"
     
-    # Extract max diff from comparison table
-    max_diff_match = re.search(r'Max Diff.*?([\d.e+-]+)', output)
-    if max_diff_match:
-        try:
-            max_diff = float(max_diff_match.group(1))
-        except ValueError:
-            pass
+    # Extract max diff and mean diff from comparison table
+    # Look for the detailed comparison section
+    # Pattern: "Max Diff" followed by a number
+    max_diff_patterns = [
+        r'Max Diff.*?([\d.e+-]+)',
+        r'max_diff.*?([\d.e+-]+)',
+        r'Max.*?Diff.*?([\d.e+-]+)'
+    ]
+    
+    for pattern in max_diff_patterns:
+        max_diff_match = re.search(pattern, output, re.IGNORECASE)
+        if max_diff_match:
+            try:
+                max_diff = float(max_diff_match.group(1))
+                break
+            except ValueError:
+                continue
     
     # Extract mean diff
-    mean_diff_match = re.search(r'Mean Diff.*?([\d.e+-]+)', output)
-    if mean_diff_match:
-        try:
-            mean_diff = float(mean_diff_match.group(1))
-        except ValueError:
-            pass
+    mean_diff_patterns = [
+        r'Mean Diff.*?([\d.e+-]+)',
+        r'mean_diff.*?([\d.e+-]+)',
+        r'Mean.*?Diff.*?([\d.e+-]+)'
+    ]
+    
+    for pattern in mean_diff_patterns:
+        mean_diff_match = re.search(pattern, output, re.IGNORECASE)
+        if mean_diff_match:
+            try:
+                mean_diff = float(mean_diff_match.group(1))
+                break
+            except ValueError:
+                continue
+    
+    # If not found in summary, look in detailed analysis
+    if max_diff is None or mean_diff is None:
+        # Look for "DETAILED COMPARISON ANALYSIS" section
+        detailed_section = re.search(r'DETAILED COMPARISON ANALYSIS.*?Max Diff.*?([\d.e+-]+).*?Mean Diff.*?([\d.e+-]+)', 
+                                     output, re.IGNORECASE | re.DOTALL)
+        if detailed_section:
+            try:
+                if max_diff is None:
+                    max_diff = float(detailed_section.group(1))
+                if mean_diff is None:
+                    mean_diff = float(detailed_section.group(2))
+            except (ValueError, IndexError):
+                pass
     
     if match_status == "ERROR":
         if "File not found" in output or "FileNotFoundError" in output:
@@ -109,6 +141,8 @@ def parse_reproject_output(output: str, edge: int = None) -> ComparisonResult:
     """Parse reproject intermediate comparison output."""
     match_status = "ERROR"
     details = ""
+    max_diff = None
+    mean_diff = None
     
     # Look for summary
     if "SUMMARY" in output:
@@ -116,6 +150,23 @@ def parse_reproject_output(output: str, edge: int = None) -> ComparisonResult:
             match_status = "MATCH"
         elif "❌ SOME MISMATCHES" in output:
             match_status = "MISMATCH"
+    
+    # Extract max diff and mean diff from Gij comparison (most important)
+    # Look for "Max Diff:" and "Mean Diff:" in the Gij comparison section
+    gij_max_diff_match = re.search(r'Gij.*?Max Diff:\s*([\d.e+-]+)', output, re.IGNORECASE | re.DOTALL)
+    gij_mean_diff_match = re.search(r'Gij.*?Mean Diff:\s*([\d.e+-]+)', output, re.IGNORECASE | re.DOTALL)
+    
+    if gij_max_diff_match:
+        try:
+            max_diff = float(gij_max_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    if gij_mean_diff_match:
+        try:
+            mean_diff = float(gij_mean_diff_match.group(1))
+        except ValueError:
+            pass
     
     # Check individual component matches
     if match_status == "ERROR":
@@ -188,6 +239,8 @@ def parse_reproject_output(output: str, edge: int = None) -> ComparisonResult:
         success=(match_status != "ERROR"),
         match_status=match_status,
         details=details,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
         output=output
     )
 
@@ -199,6 +252,8 @@ def parse_ba_output(output: str) -> ComparisonResult:
     """
     match_status = "ERROR"
     details = ""
+    max_diff = None
+    mean_diff = None
     
     # Look specifically for "Final Poses" comparison result
     # The BA script outputs "Final Poses (STEP 17)" in the summary table
@@ -260,6 +315,98 @@ def parse_ba_output(output: str) -> ComparisonResult:
                 match_status = "MISMATCH"
                 details = "Some final poses mismatched"
     
+    # Extract max diff and mean diff from final poses comparison
+    # Method 1: Extract from parseable format lines added by BA script
+    # Format: "BA_FINAL_POSES_MAX_DIFF=1.234567e-03"
+    #         "BA_FINAL_POSES_MEAN_DIFF=5.678901e-04"
+    if "Final Poses" in output or "COMPARING FINAL OUTPUTS" in output:
+        ba_max_diff_match = re.search(r'BA_FINAL_POSES_MAX_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+        ba_mean_diff_match = re.search(r'BA_FINAL_POSES_MEAN_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+        
+        if ba_max_diff_match:
+            try:
+                max_diff = float(ba_max_diff_match.group(1))
+            except ValueError:
+                pass
+        
+        if ba_mean_diff_match:
+            try:
+                mean_diff = float(ba_mean_diff_match.group(1))
+            except ValueError:
+                pass
+        
+        # Method 2: Extract from summary table row "Final Poses (STEP 17)"
+        # Format: "STEP 17    Final Poses (STEP 17)    ✅ MATCH    0.001234    0.000567"
+        if max_diff is None or mean_diff is None:
+            # Look for the summary table row with "Final Poses (STEP 17)"
+            # The table format has: Step, Component Name, Status, Max Diff, Mean Diff
+            # Pattern: "Final Poses (STEP 17)" followed by status, then max_diff, then mean_diff
+            summary_row_pattern = r'Final Poses\s*\(STEP\s*17\)[^\n]*?(?:✅|❌)[^\n]*?([\d.e+-]+)\s+([\d.e+-]+)'
+            summary_match = re.search(summary_row_pattern, output, re.IGNORECASE | re.DOTALL)
+            
+            if summary_match:
+                try:
+                    if max_diff is None:
+                        max_diff = float(summary_match.group(1))
+                    if mean_diff is None:
+                        mean_diff = float(summary_match.group(2))
+                except (ValueError, IndexError):
+                    pass
+        
+        # Method 3: Extract from "Overall translation diff: max=..., mean=..." line
+        # Format: "Overall translation diff: max=0.001234, mean=0.000567"
+        if max_diff is None or mean_diff is None:
+            patterns = [
+                r'Overall translation diff:\s*max=([\d.e+-]+),\s*mean=([\d.e+-]+)',
+                r'Overall translation diff:\s*max\s*=\s*([\d.e+-]+),\s*mean\s*=\s*([\d.e+-]+)',
+                r'overall.*?translation.*?diff.*?max\s*=\s*([\d.e+-]+).*?mean\s*=\s*([\d.e+-]+)',
+                r'overall.*?translation.*?diff.*?max=([\d.e+-]+).*?mean=([\d.e+-]+)',
+            ]
+            
+            for pattern in patterns:
+                translation_diff_match = re.search(pattern, output, re.IGNORECASE | re.DOTALL)
+                if translation_diff_match:
+                    try:
+                        if max_diff is None:
+                            max_diff = float(translation_diff_match.group(1))
+                        if mean_diff is None:
+                            mean_diff = float(translation_diff_match.group(2))
+                        if max_diff is not None and mean_diff is not None:
+                            break  # Found both, stop trying other patterns
+                    except (ValueError, IndexError):
+                        continue
+        
+        # Method 4: Extract max and mean separately if still not found
+        if max_diff is None:
+            max_patterns = [
+                r'Overall translation diff:\s*max=([\d.e+-]+)',
+                r'overall.*?translation.*?diff.*?max\s*=\s*([\d.e+-]+)',
+                r'overall.*?t_max.*?=\s*([\d.e+-]+)',
+            ]
+            for pattern in max_patterns:
+                match = re.search(pattern, output, re.IGNORECASE)
+                if match:
+                    try:
+                        max_diff = float(match.group(1))
+                        break
+                    except (ValueError, IndexError):
+                        continue
+        
+        if mean_diff is None:
+            mean_patterns = [
+                r'Overall translation diff:.*?mean=([\d.e+-]+)',
+                r'overall.*?translation.*?diff.*?mean\s*=\s*([\d.e+-]+)',
+                r'overall.*?t_mean.*?=\s*([\d.e+-]+)',
+            ]
+            for pattern in mean_patterns:
+                match = re.search(pattern, output, re.IGNORECASE)
+                if match:
+                    try:
+                        mean_diff = float(match.group(1))
+                        break
+                    except (ValueError, IndexError):
+                        continue
+    
     # If we couldn't find final poses specifically, fall back to checking STEP 17
     if match_status == "ERROR" and "STEP 17" in output:
         # Look for STEP 17 status anywhere in output
@@ -297,6 +444,8 @@ def parse_ba_output(output: str) -> ComparisonResult:
         success=(match_status != "ERROR"),
         match_status=match_status,
         details=details,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
         output=output
     )
 
@@ -305,6 +454,8 @@ def parse_update_output(output: str) -> ComparisonResult:
     """Parse update model comparison output."""
     match_status = "ERROR"
     details = ""
+    max_diff = None
+    mean_diff = None
     
     # Look for comparison table
     if "UPDATE MODEL OUTPUT COMPARISON" in output:
@@ -345,6 +496,102 @@ def parse_update_output(output: str) -> ComparisonResult:
             match_status = "MISMATCH"
             details = "Some outputs mismatched"
     
+    # Extract max diff and mean diff from comparison table
+    if "UPDATE MODEL OUTPUT COMPARISON" in output:
+        # The table format is:
+        # Output              Status        Max Diff        Mean Diff       Mismatches      Shape
+        # net_out             ✅ MATCH      0.000000        0.000000        0/12345         ...
+        # d_out               ✅ MATCH      0.000000        0.000000        0/12345         ...
+        # w_out               ✅ MATCH      0.000000        0.000000        0/12345         ...
+        
+        # Method 1: Extract from parseable format lines added by Update Model script
+        # Format: "UPDATE_MODEL_MAX_DIFF=1.234567e-03"
+        #         "UPDATE_MODEL_MEAN_DIFF=5.678901e-04"
+        update_max_diff_match = re.search(r'UPDATE_MODEL_MAX_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+        update_mean_diff_match = re.search(r'UPDATE_MODEL_MEAN_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+        
+        if update_max_diff_match:
+            try:
+                max_diff = float(update_max_diff_match.group(1))
+            except ValueError:
+                pass
+        
+        if update_mean_diff_match:
+            try:
+                mean_diff = float(update_mean_diff_match.group(1))
+            except ValueError:
+                pass
+        
+        # Method 2: Parse table rows if parseable format not found
+        if max_diff is None or mean_diff is None:
+            # Extract all max_diff and mean_diff values from table rows
+            max_diffs = []
+            mean_diffs = []
+            
+            # Parse each line in the table section to extract max_diff and mean_diff
+            # The table uses fixed-width columns, so we parse line by line
+            lines = output.split('\n')
+            in_table = False
+            header_found = False
+            
+            for line in lines:
+                if "UPDATE MODEL OUTPUT COMPARISON" in line:
+                    in_table = True
+                    continue
+                if in_table and "="*100 in line and header_found:
+                    break  # End of table
+                if in_table and "Max Diff" in line and "Mean Diff" in line:
+                    header_found = True
+                    continue
+                if in_table and header_found:
+                    # Check if this line contains an output name
+                    if any(output_name in line.lower() for output_name in ['net_out', 'd_out', 'w_out']):
+                        # Extract numbers from this line
+                        # Format: "net_out             ✅ MATCH      0.000000        0.000000        0/12345         ..."
+                        # Numbers appear after the status (✅ MATCH or ❌ MISMATCH)
+                        # We want the first two numbers after the status
+                        numbers = re.findall(r'([\d.e+-]+)', line)
+                        if len(numbers) >= 2:
+                            try:
+                                # Usually the first two numbers after status are max_diff and mean_diff
+                                max_diffs.append(float(numbers[0]))
+                                mean_diffs.append(float(numbers[1]))
+                            except (ValueError, IndexError):
+                                continue
+            
+            # If found multiple outputs, use the maximum max_diff and average mean_diff
+            if max_diffs and max_diff is None:
+                max_diff = max(max_diffs)
+            if mean_diffs and mean_diff is None:
+                mean_diff = sum(mean_diffs) / len(mean_diffs)  # Average across all outputs
+        
+        # Fallback: Try regex pattern matching if line-by-line parsing failed
+        if max_diff is None or mean_diff is None:
+            # Pattern to match table rows: output_name, status, max_diff, mean_diff
+            # Example: "net_out             ✅ MATCH      0.000000        0.000000"
+            table_row_patterns = [
+                r'(?:net_out|d_out|w_out)\s+(?:✅|❌)\s+MATCH\s+([\d.e+-]+)\s+([\d.e+-]+)',
+                r'(?:net_out|d_out|w_out)[^\d]*?([\d.e+-]+)\s+([\d.e+-]+)',
+            ]
+            
+            for pattern in table_row_patterns:
+                matches = re.findall(pattern, output, re.IGNORECASE | re.MULTILINE)
+                if matches:
+                    temp_max_diffs = []
+                    temp_mean_diffs = []
+                    for match in matches:
+                        try:
+                            temp_max_diffs.append(float(match[0]))
+                            temp_mean_diffs.append(float(match[1]))
+                        except (ValueError, IndexError):
+                            continue
+                    
+                    if temp_max_diffs and max_diff is None:
+                        max_diff = max(temp_max_diffs)
+                    if temp_mean_diffs and mean_diff is None:
+                        mean_diff = sum(temp_mean_diffs) / len(temp_mean_diffs)
+                    break  # Found values, stop trying other patterns
+    
     if match_status == "ERROR":
         if "File not found" in output or "FileNotFoundError" in output:
             match_status = "SKIPPED"
@@ -360,6 +607,8 @@ def parse_update_output(output: str) -> ComparisonResult:
         success=(match_status != "ERROR"),
         match_status=match_status,
         details=details,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
         output=output
     )
 
@@ -368,6 +617,8 @@ def parse_patchify_output(output: str) -> ComparisonResult:
     """Parse patchify comparison output."""
     match_status = "ERROR"
     details = ""
+    max_diff = None
+    mean_diff = None
     
     # Look for match indicators
     if "✅" in output and "MATCH" in output:
@@ -396,6 +647,42 @@ def parse_patchify_output(output: str) -> ComparisonResult:
     if components:
         details = ", ".join(components)
     
+    # Extract max diff and mean diff from parseable format lines
+    # Method 1: Extract from parseable format lines added by Patchify script
+    # Format: "PATCHIFY_MAX_DIFF=1.234567e-03"
+    #         "PATCHIFY_MEAN_DIFF=5.678901e-04"
+    patchify_max_diff_match = re.search(r'PATCHIFY_MAX_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+    patchify_mean_diff_match = re.search(r'PATCHIFY_MEAN_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+    
+    if patchify_max_diff_match:
+        try:
+            max_diff = float(patchify_max_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    if patchify_mean_diff_match:
+        try:
+            mean_diff = float(patchify_mean_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    # Method 2: Fallback - extract from comparison tables if parseable format not found
+    if max_diff is None or mean_diff is None:
+        max_diff_match = re.search(r'Max.*?Diff.*?([\d.e+-]+)', output, re.IGNORECASE)
+        mean_diff_match = re.search(r'Mean.*?Diff.*?([\d.e+-]+)', output, re.IGNORECASE)
+        
+        if max_diff_match and max_diff is None:
+            try:
+                max_diff = float(max_diff_match.group(1))
+            except ValueError:
+                pass
+        
+        if mean_diff_match and mean_diff is None:
+            try:
+                mean_diff = float(mean_diff_match.group(1))
+            except ValueError:
+                pass
+    
     if match_status == "ERROR":
         if "File not found" in output or "FileNotFoundError" in output:
             match_status = "SKIPPED"
@@ -411,6 +698,8 @@ def parse_patchify_output(output: str) -> ComparisonResult:
         success=(match_status != "ERROR"),
         match_status=match_status,
         details=details,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
         output=output
     )
 
@@ -419,6 +708,8 @@ def parse_onnx_output(output: str) -> ComparisonResult:
     """Parse ONNX model comparison output."""
     match_status = "ERROR"
     details = ""
+    max_diff = None
+    mean_diff = None
     
     # Look for match indicators
     if "✅ All outputs match" in output or "All matches: True" in output:
@@ -426,21 +717,118 @@ def parse_onnx_output(output: str) -> ComparisonResult:
     elif "❌" in output and "Mismatch" in output:
         match_status = "MISMATCH"
     
-    # Check FNet and INet separately
-    fnet_match = "FNet" in output and ("✅" in output or "MATCH" in output)
-    inet_match = "INet" in output and ("✅" in output or "MATCH" in output)
+    # Check FNet and INet separately by looking at their actual status rows
+    # The output format is: "FNet" followed by status like "✅ MATCH" or "❌ DIFFER"
+    # We need to check the status on the same line or nearby lines
+    fnet_match = None  # None = not found, True = match, False = mismatch
+    inet_match = None
     
-    if fnet_match and inet_match:
+    # Method 1: Look for table rows with FNet/INet and their status
+    # Pattern: "FNet" followed by status indicators on the same line
+    fnet_patterns = [
+        r'FNet\s+✅\s+MATCH',
+        r'FNet[^\n]*✅\s+MATCH',
+        r'FNet[^\n]*❌\s+DIFFER',
+    ]
+    inet_patterns = [
+        r'INet\s+✅\s+MATCH',
+        r'INet[^\n]*✅\s+MATCH',
+        r'INet[^\n]*❌\s+DIFFER',
+    ]
+    
+    for pattern in fnet_patterns:
+        match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
+        if match:
+            if "✅ MATCH" in match.group(0):
+                fnet_match = True
+            elif "❌ DIFFER" in match.group(0):
+                fnet_match = False
+            break
+    
+    for pattern in inet_patterns:
+        match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
+        if match:
+            if "✅ MATCH" in match.group(0):
+                inet_match = True
+            elif "❌ DIFFER" in match.group(0):
+                inet_match = False
+            break
+    
+    # Method 2: Fallback - check line by line for FNet/INet rows
+    if fnet_match is None and "FNet" in output:
+        lines = output.split('\n')
+        for i, line in enumerate(lines):
+            if "FNet" in line:
+                if "✅ MATCH" in line:
+                    fnet_match = True
+                    break
+                elif "❌ DIFFER" in line:
+                    fnet_match = False
+                    break
+    
+    if inet_match is None and "INet" in output:
+        lines = output.split('\n')
+        for i, line in enumerate(lines):
+            if "INet" in line:
+                if "✅ MATCH" in line:
+                    inet_match = True
+                    break
+                elif "❌ DIFFER" in line:
+                    inet_match = False
+                    break
+    
+    # Determine overall match status
+    if fnet_match is True and inet_match is True:
         match_status = "MATCH"
         details = "FNet✅, INet✅"
-    elif not fnet_match or not inet_match:
+    elif fnet_match is False or inet_match is False:
         match_status = "MISMATCH"
         mismatches = []
-        if not fnet_match:
+        if fnet_match is False:
             mismatches.append("FNet❌")
-        if not inet_match:
+        elif fnet_match is None:
+            mismatches.append("FNet?")
+        if inet_match is False:
             mismatches.append("INet❌")
+        elif inet_match is None:
+            mismatches.append("INet?")
         details = ", ".join(mismatches)
+    
+    # Extract max diff and mean diff from parseable format lines
+    # Method 1: Extract from parseable format lines added by ONNX script
+    # Format: "ONNX_MODELS_MAX_DIFF=1.234567e-03"
+    #         "ONNX_MODELS_MEAN_DIFF=5.678901e-04"
+    onnx_max_diff_match = re.search(r'ONNX_MODELS_MAX_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+    onnx_mean_diff_match = re.search(r'ONNX_MODELS_MEAN_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+    
+    if onnx_max_diff_match:
+        try:
+            max_diff = float(onnx_max_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    if onnx_mean_diff_match:
+        try:
+            mean_diff = float(onnx_mean_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    # Method 2: Fallback - extract from comparison tables if parseable format not found
+    if max_diff is None or mean_diff is None:
+        max_diff_match = re.search(r'Max.*?Diff.*?([\d.e+-]+)', output, re.IGNORECASE)
+        mean_diff_match = re.search(r'Mean.*?Diff.*?([\d.e+-]+)', output, re.IGNORECASE)
+        
+        if max_diff_match and max_diff is None:
+            try:
+                max_diff = float(max_diff_match.group(1))
+            except ValueError:
+                pass
+        
+        if mean_diff_match and mean_diff is None:
+            try:
+                mean_diff = float(mean_diff_match.group(1))
+            except ValueError:
+                pass
     
     if match_status == "ERROR":
         if "File not found" in output or "FileNotFoundError" in output:
@@ -457,6 +845,8 @@ def parse_onnx_output(output: str) -> ComparisonResult:
         success=(match_status != "ERROR"),
         match_status=match_status,
         details=details,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
         output=output
     )
 
@@ -546,13 +936,29 @@ def run_onnx_comparison(image_path: str, fnet_model: str, inet_model: str,
     return result
 
 
+def format_diff_value(val: Optional[float]) -> str:
+    """Format a difference value for display."""
+    if val is None:
+        return "N/A"
+    if val == 0.0:
+        return "0.0"
+    elif abs(val) < 1e-6:
+        return f"{val:.2e}"
+    elif abs(val) < 1.0:
+        return f"{val:.6f}"
+    elif abs(val) < 1000.0:
+        return f"{val:.4f}"
+    else:
+        return f"{val:.2e}"
+
+
 def print_summary_table(results: List[ComparisonResult]):
     """Print a summary table of all comparison results."""
-    print("\n" + "="*100)
+    print("\n" + "="*120)
     print("COMPARISON SUMMARY TABLE")
-    print("="*100)
-    print(f"{'Component':<30} {'Status':<15} {'Exit Code':<12} {'Details':<43}")
-    print("-"*100)
+    print("="*120)
+    print(f"{'Component':<30} {'Status':<15} {'Exit Code':<12} {'Max Diff':<15} {'Mean Diff':<15} {'Details':<33}")
+    print("-"*120)
     
     for result in results:
         # Format status with emoji
@@ -566,12 +972,16 @@ def print_summary_table(results: List[ComparisonResult]):
         # Format exit code
         exit_str = str(result.exit_code) if result.exit_code >= 0 else "N/A"
         
-        # Truncate details if too long
-        details = result.details[:40] + "..." if len(result.details) > 43 else result.details
+        # Format max diff and mean diff
+        max_diff_str = format_diff_value(result.max_diff)
+        mean_diff_str = format_diff_value(result.mean_diff)
         
-        print(f"{result.name:<30} {status_emoji:<15} {exit_str:<12} {details:<43}")
+        # Truncate details if too long
+        details = result.details[:30] + "..." if len(result.details) > 33 else result.details
+        
+        print(f"{result.name:<30} {status_emoji:<15} {exit_str:<12} {max_diff_str:<15} {mean_diff_str:<15} {details:<33}")
     
-    print("="*100)
+    print("="*120)
     
     # Summary statistics
     total = len(results)

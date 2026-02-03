@@ -433,8 +433,8 @@ def print_header(image_path: str, fnet_model_path: str, inet_model_path: str, fn
     print(f"📂 C++ INet output: {inet_cpp_bin}")
     print()
 
-def load_and_preprocess_images(image_path: str, is_video: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load and preprocess images with different methods.
+def load_and_preprocess_images(image_path: str, is_video: bool = False) -> np.ndarray:
+    """Load and preprocess images using Python DPVO preprocessing.
     
     Args:
         image_path: Path to image file
@@ -459,18 +459,11 @@ def load_and_preprocess_images(image_path: str, is_video: bool = False) -> Tuple
     print("  🔧 Applying undistortion with k1=0.07, k2=-0.08, p1=0, p2=0")
     input_data_python_dpvo, orig_H, orig_W = load_image(image_path, use_bgr=False, match_python_dpvo=True, apply_undistort=False, is_video=is_video)
     
-    # Also try C++ preprocessing for comparison (with undistortion to match C++ code)
-    print("  🔄 Also testing C++ preprocessing (undistort + nearest neighbor + crop to divisible by 16, BGR format) for comparison")
-    input_data_cpp_bgr, _, _ = load_image(image_path, use_bgr=True, match_python_dpvo=False, apply_undistort=True, is_video=False)
-    input_data_cpp_rgb, _, _ = load_image(image_path, use_bgr=False, match_python_dpvo=False, apply_undistort=True, is_video=False)
-    
     print(f"  📐 Original image size: {orig_W}x{orig_H}")
     print(f"  🐍 Python DPVO input shape: {input_data_python_dpvo.shape} (NCHW)")
-    print(f"  ⚙️  C++ preprocessing (BGR): {input_data_cpp_bgr.shape} (NCHW)")
-    print(f"  ⚙️  C++ preprocessing (RGB): {input_data_cpp_rgb.shape} (NCHW)")
     print()
     
-    return input_data_python_dpvo, input_data_cpp_bgr, input_data_cpp_rgb
+    return input_data_python_dpvo
 
 def load_onnx_models(fnet_model_path: str, inet_model_path: str) -> Tuple[ort.InferenceSession, ort.InferenceSession]:
     """Load ONNX models and print model information."""
@@ -493,9 +486,8 @@ def load_onnx_models(fnet_model_path: str, inet_model_path: str) -> Tuple[ort.In
     return fnet_session, inet_session
 
 def run_all_inferences(fnet_session: ort.InferenceSession, inet_session: ort.InferenceSession,
-                       input_data_python_dpvo: np.ndarray, input_data_cpp_bgr: np.ndarray,
-                       input_data_cpp_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Run all inference variations and return all outputs."""
+                       input_data_python_dpvo: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Run inference using Python DPVO preprocessing and return outputs."""
     print("🚀 Running inference...")
     
     # FNet inference
@@ -503,40 +495,22 @@ def run_all_inferences(fnet_session: ort.InferenceSession, inet_session: ort.Inf
     fnet_py_dpvo = run_fnet_inference(fnet_session, input_data_python_dpvo)
     print(f"    ✅ Output shape: {fnet_py_dpvo.shape} (NCHW)")
     
-    print("  ⚙️  FNet inference (C++ preprocessing, BGR)...")
-    fnet_py_cpp_bgr = run_fnet_inference(fnet_session, input_data_cpp_bgr)
-    print(f"    ✅ Output shape: {fnet_py_cpp_bgr.shape} (NCHW)")
-    
-    print("  ⚙️  FNet inference (C++ preprocessing, RGB)...")
-    fnet_py_cpp_rgb = run_fnet_inference(fnet_session, input_data_cpp_rgb)
-    print(f"    ✅ Output shape: {fnet_py_cpp_rgb.shape} (NCHW)")
-    print()
-    
     # INet inference
     print("  🐍 INet inference (Python DPVO preprocessing)...")
     inet_py_dpvo = run_inet_inference(inet_session, input_data_python_dpvo)
     print(f"    ✅ Output shape: {inet_py_dpvo.shape} (NCHW)")
-    
-    print("  ⚙️  INet inference (C++ preprocessing, BGR)...")
-    inet_py_cpp_bgr = run_inet_inference(inet_session, input_data_cpp_bgr)
-    print(f"    ✅ Output shape: {inet_py_cpp_bgr.shape} (NCHW)")
-    
-    print("  ⚙️  INet inference (C++ preprocessing, RGB)...")
-    inet_py_cpp_rgb = run_inet_inference(inet_session, input_data_cpp_rgb)
-    print(f"    ✅ Output shape: {inet_py_cpp_rgb.shape} (NCHW)")
     print()
     
-    return fnet_py_dpvo, fnet_py_cpp_bgr, fnet_py_cpp_rgb, inet_py_dpvo, inet_py_cpp_bgr, inet_py_cpp_rgb
+    return fnet_py_dpvo, inet_py_dpvo
 
-def save_python_outputs(fnet_py_dpvo: np.ndarray, fnet_py_cpp_bgr: np.ndarray, fnet_py_cpp_rgb: np.ndarray,
-                        inet_py_dpvo: np.ndarray, inet_py_cpp_bgr: np.ndarray, inet_py_cpp_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Save all Python outputs to binary files."""
+def save_python_outputs(fnet_py_dpvo: np.ndarray, inet_py_dpvo: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Save Python DPVO outputs to binary files."""
     print("💾 Saving Python outputs to binary files...")
     
     bin_dir = "bin_file"
     os.makedirs(bin_dir, exist_ok=True)
     
-    # Save Python DPVO outputs (primary - matches Python DPVO repository)
+    # Save Python DPVO outputs (matches Python DPVO repository)
     fnet_py_dpvo_chw = fnet_py_dpvo[0]  # Remove batch dimension: [C, H, W]
     fnet_py_dpvo_path = os.path.join(bin_dir, 'fnet_py_dpvo_frame0.bin')
     fnet_py_dpvo_chw.tofile(fnet_py_dpvo_path)
@@ -546,27 +520,6 @@ def save_python_outputs(fnet_py_dpvo: np.ndarray, fnet_py_cpp_bgr: np.ndarray, f
     inet_py_dpvo_path = os.path.join(bin_dir, 'inet_py_dpvo_frame0.bin')
     inet_py_dpvo_chw.tofile(inet_py_dpvo_path)
     print(f"  ✅ Saved {inet_py_dpvo_path}: shape={inet_py_dpvo_chw.shape} (CHW), size={inet_py_dpvo_chw.nbytes} bytes")
-    
-    # Also save C++ preprocessing outputs for comparison
-    fnet_py_cpp_bgr_chw = fnet_py_cpp_bgr[0]
-    fnet_py_cpp_bgr_path = os.path.join(bin_dir, 'fnet_py_cpp_bgr_frame0.bin')
-    fnet_py_cpp_bgr_chw.tofile(fnet_py_cpp_bgr_path)
-    print(f"  ✅ Saved {fnet_py_cpp_bgr_path}: shape={fnet_py_cpp_bgr_chw.shape} (CHW), size={fnet_py_cpp_bgr_chw.nbytes} bytes")
-    
-    fnet_py_cpp_rgb_chw = fnet_py_cpp_rgb[0]
-    fnet_py_cpp_rgb_path = os.path.join(bin_dir, 'fnet_py_cpp_rgb_frame0.bin')
-    fnet_py_cpp_rgb_chw.tofile(fnet_py_cpp_rgb_path)
-    print(f"  ✅ Saved {fnet_py_cpp_rgb_path}: shape={fnet_py_cpp_rgb_chw.shape} (CHW), size={fnet_py_cpp_rgb_chw.nbytes} bytes")
-    
-    inet_py_cpp_bgr_chw = inet_py_cpp_bgr[0]
-    inet_py_cpp_bgr_path = os.path.join(bin_dir, 'inet_py_cpp_bgr_frame0.bin')
-    inet_py_cpp_bgr_chw.tofile(inet_py_cpp_bgr_path)
-    print(f"  ✅ Saved {inet_py_cpp_bgr_path}: shape={inet_py_cpp_bgr_chw.shape} (CHW), size={inet_py_cpp_bgr_chw.nbytes} bytes")
-    
-    inet_py_cpp_rgb_chw = inet_py_cpp_rgb[0]
-    inet_py_cpp_rgb_path = os.path.join(bin_dir, 'inet_py_cpp_rgb_frame0.bin')
-    inet_py_cpp_rgb_chw.tofile(inet_py_cpp_rgb_path)
-    print(f"  ✅ Saved {inet_py_cpp_rgb_path}: shape={inet_py_cpp_rgb_chw.shape} (CHW), size={inet_py_cpp_rgb_chw.nbytes} bytes")
     print()
     
     return fnet_py_dpvo_chw, inet_py_dpvo_chw
@@ -714,17 +667,15 @@ def print_category_table(title: str, results: List[ComparisonResult], descriptio
                         break
 
 def run_comparisons(fnet_cpp: np.ndarray, inet_cpp: np.ndarray, fnet_py_dpvo: np.ndarray,
-                    fnet_py_cpp_bgr: np.ndarray, fnet_py_cpp_rgb: np.ndarray,
-                    inet_py_dpvo: np.ndarray, inet_py_cpp_bgr: np.ndarray, inet_py_cpp_rgb: np.ndarray,
-                    is_video: bool = False) -> Tuple[bool, bool, bool, bool, bool, bool]:
-    """Run all comparisons and return match results."""
+                    inet_py_dpvo: np.ndarray, is_video: bool = False) -> Tuple[bool, bool]:
+    """Run comparisons between Python DPVO preprocessing and C++ outputs."""
     print("=" * 120)
     print("🔍 Running Comparisons")
     print("=" * 120)
-    print("  📝 Comparing all preprocessing methods with C++ outputs...")
+    print("  📝 Comparing Python DPVO preprocessing with C++ outputs...")
     print()
     
-    # Define preprocessing settings for each comparison
+    # Define preprocessing settings
     dpvo_settings = PreprocessingSettings(
         use_bgr=False,
         match_python_dpvo=True,
@@ -732,54 +683,16 @@ def run_comparisons(fnet_cpp: np.ndarray, inet_cpp: np.ndarray, fnet_py_dpvo: np
         is_video=is_video
     )
     
-    cpp_bgr_settings = PreprocessingSettings(
-        use_bgr=True,
-        match_python_dpvo=False,
-        apply_undistort=True,
-        is_video=False
-    )
-    
-    cpp_rgb_settings = PreprocessingSettings(
-        use_bgr=False,
-        match_python_dpvo=False,
-        apply_undistort=True,
-        is_video=False
-    )
-    
-    # Run all comparisons
-    all_results = []
-    
-    # Python DPVO comparisons
+    # Run Python DPVO comparisons
     fnet_dpvo_result = compare_outputs(fnet_cpp, fnet_py_dpvo, "FNet", tolerance=1e-5, preprocessing=dpvo_settings)
     inet_dpvo_result = compare_outputs(inet_cpp, inet_py_dpvo, "INet", tolerance=1e-5, preprocessing=dpvo_settings)
     dpvo_results = [fnet_dpvo_result, inet_dpvo_result]
-    
-    # C++ BGR comparisons
-    fnet_cpp_bgr_result = compare_outputs(fnet_cpp, fnet_py_cpp_bgr, "FNet", tolerance=1e-5, preprocessing=cpp_bgr_settings)
-    inet_cpp_bgr_result = compare_outputs(inet_cpp, inet_py_cpp_bgr, "INet", tolerance=1e-5, preprocessing=cpp_bgr_settings)
-    cpp_bgr_results = [fnet_cpp_bgr_result, inet_cpp_bgr_result]
-    
-    # C++ RGB comparisons
-    fnet_cpp_rgb_result = compare_outputs(fnet_cpp, fnet_py_cpp_rgb, "FNet", tolerance=1e-5, preprocessing=cpp_rgb_settings)
-    inet_cpp_rgb_result = compare_outputs(inet_cpp, inet_py_cpp_rgb, "INet", tolerance=1e-5, preprocessing=cpp_rgb_settings)
-    cpp_rgb_results = [fnet_cpp_rgb_result, inet_cpp_rgb_result]
-    
-    # Collect all results
-    all_results.extend(dpvo_results)
-    all_results.extend(cpp_bgr_results)
-    all_results.extend(cpp_rgb_results)
     
     # Prepare data dictionaries for sample value tables
     dpvo_cpp_dict = {"fnet": fnet_cpp, "inet": inet_cpp}
     dpvo_py_dict = {"fnet": fnet_py_dpvo, "inet": inet_py_dpvo}
     
-    cpp_bgr_cpp_dict = {"fnet": fnet_cpp, "inet": inet_cpp}
-    cpp_bgr_py_dict = {"fnet": fnet_py_cpp_bgr, "inet": inet_py_cpp_bgr}
-    
-    cpp_rgb_cpp_dict = {"fnet": fnet_cpp, "inet": inet_cpp}
-    cpp_rgb_py_dict = {"fnet": fnet_py_cpp_rgb, "inet": inet_py_cpp_rgb}
-    
-    # Print category-specific tables with sample values
+    # Print comparison table with sample values
     print_category_table(
         "Python DPVO Preprocessing vs C++ Outputs",
         dpvo_results,
@@ -789,53 +702,47 @@ def run_comparisons(fnet_cpp: np.ndarray, inet_cpp: np.ndarray, fnet_py_dpvo: np
         show_samples=True
     )
     
-    print_category_table(
-        "C++ Preprocessing (BGR) vs C++ Outputs",
-        cpp_bgr_results,
-        "This shows if C++ preprocessing (BGR format) matches C++ ONNX inference",
-        cpp_data_dict=cpp_bgr_cpp_dict,
-        py_data_dict=cpp_bgr_py_dict,
-        show_samples=False  # Only show samples for Python DPVO to avoid clutter
-    )
-    
-    print_category_table(
-        "C++ Preprocessing (RGB) vs C++ Outputs",
-        cpp_rgb_results,
-        "This shows if C++ preprocessing (RGB format) matches C++ ONNX inference",
-        cpp_data_dict=cpp_rgb_cpp_dict,
-        py_data_dict=cpp_rgb_py_dict,
-        show_samples=False  # Only show samples for Python DPVO to avoid clutter
-    )
-    
     # Print overall comparison table
     print("\n" + "=" * 120)
-    print("📊 Overall Comparison Summary")
+    print("📊 Comparison Summary")
     print("=" * 120)
-    print_comparison_table(all_results)
+    print_comparison_table(dpvo_results)
+    
+    # Calculate overall max_diff and mean_diff for parseable format
+    dpvo_max_diffs = [r.max_diff for r in dpvo_results if r.max_diff != float('inf')]
+    dpvo_mean_diffs = [r.mean_diff for r in dpvo_results if r.mean_diff != float('inf')]
+    
+    if dpvo_max_diffs:
+        overall_max_diff = max(dpvo_max_diffs)
+    else:
+        overall_max_diff = float('inf')
+    
+    if dpvo_mean_diffs:
+        overall_mean_diff = sum(dpvo_mean_diffs) / len(dpvo_mean_diffs)
+    else:
+        overall_mean_diff = float('inf')
+    
+    # Print parseable format for run_all_comparisons.py
+    print(f"\n   ONNX_MODELS_MAX_DIFF={overall_max_diff:.10e}")
+    print(f"   ONNX_MODELS_MEAN_DIFF={overall_mean_diff:.10e}")
     
     # Extract boolean results
     fnet_match_dpvo = dpvo_results[0].matches
     inet_match_dpvo = dpvo_results[1].matches
-    fnet_match_cpp_bgr = cpp_bgr_results[0].matches
-    inet_match_cpp_bgr = cpp_bgr_results[1].matches
-    fnet_match_cpp_rgb = cpp_rgb_results[0].matches
-    inet_match_cpp_rgb = cpp_rgb_results[1].matches
     
-    return fnet_match_dpvo, inet_match_dpvo, fnet_match_cpp_bgr, inet_match_cpp_bgr, fnet_match_cpp_rgb, inet_match_cpp_rgb
+    return fnet_match_dpvo, inet_match_dpvo
 
-def print_summary(fnet_match_dpvo: bool, inet_match_dpvo: bool, fnet_match_cpp_bgr: bool,
-                  inet_match_cpp_bgr: bool, fnet_match_cpp_rgb: bool, inet_match_cpp_rgb: bool) -> int:
+def print_summary(fnet_match_dpvo: bool, inet_match_dpvo: bool) -> int:
     """Print final summary in table format and return exit code."""
     print("\n" + "=" * 120)
     print("📊 Final Summary")
     print("=" * 120)
     
     # Summary table
-    print(f"\n{'Category':<40} {'FNet':<20} {'INet':<20}")
+    print(f"\n{'Model':<40} {'Status':<20}")
     print("-" * 120)
-    print(f"{'Python DPVO preprocessing':<40} {'✅ MATCH' if fnet_match_dpvo else '❌ DIFFER':<20} {'✅ MATCH' if inet_match_dpvo else '❌ DIFFER':<20}")
-    print(f"{'C++ preprocessing (BGR)':<40} {'✅ MATCH' if fnet_match_cpp_bgr else '❌ DIFFER':<20} {'✅ MATCH' if inet_match_cpp_bgr else '❌ DIFFER':<20}")
-    print(f"{'C++ preprocessing (RGB)':<40} {'✅ MATCH' if fnet_match_cpp_rgb else '❌ DIFFER':<20} {'✅ MATCH' if inet_match_cpp_rgb else '❌ DIFFER':<20}")
+    print(f"{'FNet (Python DPVO preprocessing)':<40} {'✅ MATCH' if fnet_match_dpvo else '❌ DIFFER':<20}")
+    print(f"{'INet (Python DPVO preprocessing)':<40} {'✅ MATCH' if inet_match_dpvo else '❌ DIFFER':<20}")
     print("=" * 120)
     print()
     
@@ -843,17 +750,9 @@ def print_summary(fnet_match_dpvo: bool, inet_match_dpvo: bool, fnet_match_cpp_b
         print("✅ SUCCESS: Python DPVO preprocessing matches C++ outputs!")
         print("  💡 This means C++ ONNX inference uses the same preprocessing as Python DPVO.")
         return 0
-    elif fnet_match_cpp_bgr and inet_match_cpp_bgr:
-        print("✅ SUCCESS: C++ preprocessing (BGR) matches C++ outputs!")
-        print("  💡 C++ ONNX uses BGR format with nearest neighbor resize.")
-        return 0
-    elif fnet_match_cpp_rgb and inet_match_cpp_rgb:
-        print("✅ SUCCESS: C++ preprocessing (RGB) matches C++ outputs!")
-        print("  💡 C++ ONNX uses RGB format with nearest neighbor resize.")
-        return 0
     else:
-        print("❌ WARNING: No preprocessing method matches perfectly.")
-        print("  🔍 Check the differences above. There may be other preprocessing differences.")
+        print("❌ WARNING: Python DPVO preprocessing does not match C++ outputs perfectly.")
+        print("  🔍 Check the differences above. There may be preprocessing differences.")
         print()
         print("📝 NOTE: Python DPVO outputs are saved to:")
         print("  📄 bin_file/fnet_py_dpvo_frame0.bin")
@@ -872,32 +771,27 @@ def main() -> int:
     print_header(image_path, fnet_model_path, inet_model_path, fnet_cpp_bin, inet_cpp_bin)
     
     # Step 4: Load and preprocess images
-    input_data_python_dpvo, input_data_cpp_bgr, input_data_cpp_rgb = load_and_preprocess_images(image_path, is_video=is_video)
+    input_data_python_dpvo = load_and_preprocess_images(image_path, is_video=is_video)
     
     # Step 5: Load ONNX models
     fnet_session, inet_session = load_onnx_models(fnet_model_path, inet_model_path)
     
-    # Step 6: Run all inferences
-    fnet_py_dpvo, fnet_py_cpp_bgr, fnet_py_cpp_rgb, inet_py_dpvo, inet_py_cpp_bgr, inet_py_cpp_rgb = \
-        run_all_inferences(fnet_session, inet_session, input_data_python_dpvo, input_data_cpp_bgr, input_data_cpp_rgb)
+    # Step 6: Run inference
+    fnet_py_dpvo, inet_py_dpvo = run_all_inferences(fnet_session, inet_session, input_data_python_dpvo)
     
     # Step 7: Save Python outputs
-    fnet_py_dpvo_chw, inet_py_dpvo_chw = save_python_outputs(
-        fnet_py_dpvo, fnet_py_cpp_bgr, fnet_py_cpp_rgb,
-        inet_py_dpvo, inet_py_cpp_bgr, inet_py_cpp_rgb
-    )
+    fnet_py_dpvo_chw, inet_py_dpvo_chw = save_python_outputs(fnet_py_dpvo, inet_py_dpvo)
     
     # Step 8: Load C++ outputs
     fnet_cpp, inet_cpp = load_cpp_outputs(fnet_cpp_bin, inet_cpp_bin, fnet_py_dpvo_chw, inet_py_dpvo_chw)
     
     # Step 9: Run comparisons
-    fnet_match_dpvo, inet_match_dpvo, fnet_match_cpp_bgr, inet_match_cpp_bgr, fnet_match_cpp_rgb, inet_match_cpp_rgb = \
-        run_comparisons(fnet_cpp, inet_cpp, fnet_py_dpvo, fnet_py_cpp_bgr, fnet_py_cpp_rgb,
-                       inet_py_dpvo, inet_py_cpp_bgr, inet_py_cpp_rgb, is_video=is_video)
+    fnet_match_dpvo, inet_match_dpvo = run_comparisons(
+        fnet_cpp, inet_cpp, fnet_py_dpvo, inet_py_dpvo, is_video=is_video
+    )
     
     # Step 10: Print summary and return
-    return print_summary(fnet_match_dpvo, inet_match_dpvo, fnet_match_cpp_bgr, inet_match_cpp_bgr,
-                        fnet_match_cpp_rgb, inet_match_cpp_rgb)
+    return print_summary(fnet_match_dpvo, inet_match_dpvo)
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -1832,6 +1832,9 @@ def compare_final_outputs(poses_py_updated, N):
     print(f"   ❌ Mismatched: {mismatch_count} ({100.0 * mismatch_count / N:.1f}%)")
     print(f"   Overall translation diff: max={t_max_diffs.max().item():.6f}, mean={t_mean_diffs.mean().item():.6f}")
     print(f"   Overall quaternion diff: max={q_max_diffs.max().item():.6f}, mean={q_mean_diffs.mean().item():.6f}")
+    # Print in parseable format for run_all_comparisons.py
+    print(f"   BA_FINAL_POSES_MAX_DIFF={t_max_diffs.max().item():.10e}")
+    print(f"   BA_FINAL_POSES_MEAN_DIFF={t_mean_diffs.mean().item():.10e}")
     
     # Add final pose comparison to summary results
     overall_t_max = t_max_diffs.max().item()
