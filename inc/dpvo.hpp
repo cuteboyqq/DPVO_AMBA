@@ -122,6 +122,9 @@ private:
     float motionMagnitude(int i, int j);
     float motionProbe();  // Motion probe for initialization check (matches Python motion_probe)
     
+    // Helper function to save reproject inputs for debugging/comparison
+    void save_reproject_inputs(int num_active);
+    
     // Bundle Adjustment
     void bundleAdjustment(
         float lmbda = 1e-4f,

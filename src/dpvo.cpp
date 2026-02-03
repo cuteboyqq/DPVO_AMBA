@@ -473,11 +473,11 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
         }
         
         // Compute fac = (c-b) / (b-a)
-        int64_t dt1 = b - a;  // Time between frame n-2 and n-1
-        int64_t dt2 = c - b;  // Time between frame n-1 and n
-        
-        if (dt1 > 0) {
-            fac = static_cast<float>(dt2) / static_cast<float>(dt1);
+            int64_t dt1 = b - a;  // Time between frame n-2 and n-1
+            int64_t dt2 = c - b;  // Time between frame n-1 and n
+            
+            if (dt1 > 0) {
+                fac = static_cast<float>(dt2) / static_cast<float>(dt1);
         }
         
         // Compute relative motion: (P1 * P2.inv()).log()
@@ -875,8 +875,30 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
         n = m_pg.m_n;
     }
     
-    if (n + 1 >= PatchGraph::N)
+    // SAFETY CHECK: If buffer is getting full, proactively call keyframe() to remove frames
+    // This prevents buffer overflow when motion is consistently high
+    const int PROACTIVE_THRESHOLD = PatchGraph::N - 3;  // Start removing when n >= 33 (buffer size 36)
+    if (n >= PROACTIVE_THRESHOLD && m_is_initialized) {
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->warn("DPVO::run: Buffer nearly full (n={} >= {}), proactively calling keyframe() to remove frames", 
+                         n, PROACTIVE_THRESHOLD);
+        }
+        // Call keyframe() to remove frames before adding a new one
+        keyframe();
+        // Update n after keyframe removal
+        n = m_pg.m_n;
+    }
+    
+    if (n + 1 >= PatchGraph::N) {
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->error("DPVO::run: PatchGraph buffer overflow - n={}, buffer_size={}. "
+                          "This should not happen if keyframe() is working correctly.", 
+                          n, PatchGraph::N);
+        }
         throw std::runtime_error("PatchGraph buffer overflow");
+    }
     
     const int pm = n % m_pmem;  // Ring buffer index for imap/gmap (pmem = 36)
     const int mm = n % m_mem;   // Ring buffer index for fmap1/fmap2 (mem = 36)
@@ -995,23 +1017,7 @@ void DPVO::update()
     
     // Save poses, intrinsics, and edge indices right before reproject() to verify what C++ actually uses
     if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
-        const int N = m_pg.m_n;
-        const int M = m_cfg.PATCHES_PER_FRAME;
-        std::string frame_suffix = std::to_string(TARGET_FRAME);
-        std::string reproject_poses_filename = get_bin_file_path("reproject_poses_frame" + frame_suffix + ".bin");
-        std::string reproject_intrinsics_filename = get_bin_file_path("reproject_intrinsics_frame" + frame_suffix + ".bin");
-        std::string reproject_ii_filename = get_bin_file_path("reproject_ii_frame" + frame_suffix + ".bin");
-        std::string reproject_jj_filename = get_bin_file_path("reproject_jj_frame" + frame_suffix + ".bin");
-        std::string reproject_kk_filename = get_bin_file_path("reproject_kk_frame" + frame_suffix + ".bin");
-        ba_file_io::save_poses(reproject_poses_filename, m_pg.m_poses, N, logger);
-        ba_file_io::save_intrinsics(reproject_intrinsics_filename, m_pg.m_intrinsics, N, logger);
-        ba_file_io::save_edge_indices(reproject_ii_filename, reproject_jj_filename, reproject_kk_filename,
-                                      m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
-        if (logger) {
-            logger->info("[DPVO::update] Saved poses, intrinsics, and edge indices for reproject comparison (frame {}): {}, {}, {}, {}, {}", 
-                        TARGET_FRAME, reproject_poses_filename, reproject_intrinsics_filename,
-                        reproject_ii_filename, reproject_jj_filename, reproject_kk_filename);
-        }
+        save_reproject_inputs(num_active);
     }
     
     std::vector<float> coords(num_active * 2 * P * P); // [num_active, 2, P, P]
@@ -1810,7 +1816,10 @@ void DPVO::update()
         // Sync optimized poses from sliding window (m_pg.m_poses) back to historical buffer (m_allPoses)
         // Use timestamps to map sliding window indices to global frame indices
         // This ensures the viewer shows the optimized poses, not just the initial estimates
+        // CRITICAL: Sync BEFORE keyframe() removes frames, otherwise timestamps will shift and matching will fail
         if (!m_allTimestamps.empty() && m_pg.m_n > 0) {
+            int synced_count = 0;
+            int failed_count = 0;
             for (int sw_idx = 0; sw_idx < m_pg.m_n; sw_idx++) {
                 int64_t sw_timestamp = m_pg.m_tstamps[sw_idx];
                 
@@ -1826,6 +1835,64 @@ void DPVO::update()
                 // Update the corresponding global pose if we found a match
                 if (global_idx >= 0 && global_idx < static_cast<int>(m_allPoses.size())) {
                     m_allPoses[global_idx] = m_pg.m_poses[sw_idx];
+                    synced_count++;
+                } else {
+                    failed_count++;
+                    if (logger && failed_count <= 3) {
+                        logger->warn("DPVO::update: Failed to sync pose for sw_idx={}, timestamp={}, "
+                                    "m_allTimestamps.size()={}, m_allPoses.size()={}",
+                                    sw_idx, sw_timestamp, m_allTimestamps.size(), m_allPoses.size());
+                    }
+                }
+            }
+            if (logger && (synced_count > 0 || failed_count > 0)) {
+                logger->info("DPVO::update: Synced {}/{} poses from sliding window to historical buffer (failed: {})",
+                            synced_count, m_pg.m_n, failed_count);
+                // Log which global frame indices were synced (for debugging pose jumping)
+                if (synced_count > 0) {
+                    std::string synced_mappings;
+                    bool mappings_consecutive = true;
+                    int prev_global_idx = -1;
+                    for (int sw_idx = 0; sw_idx < m_pg.m_n; sw_idx++) {
+                        int64_t sw_timestamp = m_pg.m_tstamps[sw_idx];
+                        int global_idx = -1;
+                        for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
+                            if (m_allTimestamps[g_idx] == sw_timestamp) {
+                                global_idx = g_idx;
+                                break;
+                            }
+                        }
+                        if (global_idx >= 0) {
+                            if (!synced_mappings.empty()) synced_mappings += ", ";
+                            synced_mappings += std::to_string(sw_idx) + "->" + std::to_string(global_idx);
+                            
+                            // Check if mappings are consecutive
+                            if (prev_global_idx >= 0 && global_idx != prev_global_idx + 1) {
+                                mappings_consecutive = false;
+                            }
+                            prev_global_idx = global_idx;
+                        }
+                    }
+                    logger->info("DPVO::update: Sync mappings (sw_idx->global_idx): [{}]", synced_mappings);
+                    if (!mappings_consecutive && synced_count > 1) {
+                        // This is EXPECTED behavior: sliding window only keeps recent frames
+                        // Frames removed by keyframe() are no longer in sliding window, so their poses
+                        // in m_allPoses won't be updated. This is correct for optimization but may cause
+                        // visualization jumps. The viewer should handle non-consecutive frames gracefully.
+                        logger->info("DPVO::update: NOTE - Sync mappings are not consecutive (expected: sliding window only keeps recent frames). "
+                                    "Frames between gaps have been removed from sliding window and won't be updated.");
+                    }
+                }
+            }
+            
+            // Save poses after syncing for comparison with Python (at target frame)
+            if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME && synced_count > 0) {
+                // Save all historical poses (m_allPoses) for comparison
+                int num_historical = static_cast<int>(m_allPoses.size());
+                ba_file_io::save_poses(get_bin_file_path("poses_after_sync_frame" + std::to_string(TARGET_FRAME) + ".bin"), 
+                                      m_allPoses.data(), num_historical, logger);
+                if (logger) {
+                    logger->info("DPVO::update: Saved {} historical poses after sync for frame {}", num_historical, TARGET_FRAME);
                 }
             }
         }
@@ -1877,26 +1944,83 @@ void DPVO::keyframe() {
 
     int n = m_pg.m_n;
 
-    int i = n - m_cfg.KEYFRAME_INDEX - 1;
-    int j = n - m_cfg.KEYFRAME_INDEX + 1;
-    if (i < 0 || j < 0) return;
-
-    float m = motionMagnitude(i, j) + motionMagnitude(j, i);
-    
-    auto logger = spdlog::get("dpvo");
-    if (logger) {
-        logger->info("DPVO::keyframe: n={}, i={}, j={}, motion={}, threshold={}, will_remove={}", 
-                     n, i, j, 0.5f * m, m_cfg.KEYFRAME_THRESH, (0.5f * m < m_cfg.KEYFRAME_THRESH));
-    }
-
     // =============================================================
     // Phase A: Keyframe removal decision
     // =============================================================
-    if (0.5f * m < m_cfg.KEYFRAME_THRESH) {
-        int k = n - m_cfg.KEYFRAME_INDEX;
+    // SAFETY CHECK: Force frame removal if buffer is getting full
+    // This prevents buffer overflow when motion is consistently high
+    // Python raises an exception, but we can be more graceful and force removal
+    const int SAFETY_THRESHOLD = PatchGraph::N - 2;  // Force removal when n >= 34 (buffer size 36)
+    bool force_removal = (n >= SAFETY_THRESHOLD);
+    
+    int i = n - m_cfg.KEYFRAME_INDEX - 1;
+    int j = n - m_cfg.KEYFRAME_INDEX + 1;
+    
+    float m = 0.0f;
+    bool should_remove = false;
+    
+    if (force_removal) {
+        // Buffer is getting full - force removal regardless of motion
+        should_remove = true;
+        auto logger = spdlog::get("dpvo");
         if (logger) {
-            logger->info("DPVO::keyframe: Removing keyframe k={}, m_pg.m_n will decrease from {} to {}", 
-                         k, n, n - 1);
+            logger->warn("DPVO::keyframe: Buffer nearly full (n={} >= {}), forcing frame removal regardless of motion", 
+                         n, SAFETY_THRESHOLD);
+        }
+    } else if (i >= 0 && j >= 0) {
+        // Normal keyframe removal based on motion
+        m = motionMagnitude(i, j) + motionMagnitude(j, i);
+        should_remove = (0.5f * m < m_cfg.KEYFRAME_THRESH);
+        
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->info("DPVO::keyframe: n={}, i={}, j={}, motion={}, threshold={}, will_remove={}", 
+                         n, i, j, 0.5f * m, m_cfg.KEYFRAME_THRESH, should_remove);
+        }
+    } else {
+        // Not enough frames to check motion
+        return;
+    }
+
+    if (should_remove) {
+        // Determine which frame to remove
+        // Always use KEYFRAME_INDEX position for consistency with shifting logic
+        // Force removal just bypasses motion check, but still removes the same frame position
+        int k = n - m_cfg.KEYFRAME_INDEX;
+        
+        // Safety: if k is invalid (shouldn't happen), remove oldest frame
+        if (k < 0 || k >= n) {
+            k = 0;
+        }
+        
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->info("DPVO::keyframe: Removing keyframe k={}, m_pg.m_n will decrease from {} to {} (force_removal={})", 
+                         k, n, n - 1, force_removal);
+        }
+
+        // CRITICAL: Sync pose of frame k to m_allPoses BEFORE removing it from sliding window
+        // This ensures the removed frame has its latest optimized pose for visualization
+        if (k >= 0 && k < n && !m_allTimestamps.empty()) {
+            int64_t k_timestamp = m_pg.m_tstamps[k];
+            int global_idx = -1;
+            for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
+                if (m_allTimestamps[g_idx] == k_timestamp) {
+                    global_idx = g_idx;
+                    break;
+                }
+            }
+            if (global_idx >= 0 && global_idx < static_cast<int>(m_allPoses.size())) {
+                m_allPoses[global_idx] = m_pg.m_poses[k];
+                if (logger) {
+                    Eigen::Vector3f t = m_pg.m_poses[k].t;
+                    logger->info("DPVO::keyframe: Synced pose of frame k={} (global_idx={}) to m_allPoses before removal, t=({:.3f}, {:.3f}, {:.3f})",
+                                k, global_idx, t.x(), t.y(), t.z());
+                }
+            } else if (logger) {
+                logger->warn("DPVO::keyframe: Failed to sync pose of frame k={} (timestamp={}) before removal, global_idx={}, m_allTimestamps.size()={}, m_allPoses.size()={}",
+                            k, k_timestamp, global_idx, m_allTimestamps.size(), m_allPoses.size());
+            }
         }
 
         // ---------------------------------------------------------
@@ -1954,6 +2078,7 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // Phase B3: shift per-frame data
         // ---------------------------------------------------------
+        // M is already declared above (line 1986)
         for (int f = k; f < n - 1; f++) {
 
 			m_pg.m_tstamps[f] = m_pg.m_tstamps[f + 1];
@@ -1983,6 +2108,24 @@ void DPVO::keyframe() {
 				m_pg.m_intrinsics[f + 1],
 				sizeof(m_pg.m_intrinsics[0])
 			);
+
+			// CRITICAL: Update m_index for shifted frame
+			// m_index[frame][patch] stores patch index mapping
+			for (int patch = 0; patch < M; patch++) {
+				m_pg.m_index[f][patch] = m_pg.m_index[f + 1][patch];
+			}
+			m_pg.m_index_map[f] = m_pg.m_index_map[f + 1];
+
+			// CRITICAL: Update m_ix for all patches in shifted frame
+			// m_ix[kk] stores frame index for patch kk
+			// When frame f+1 shifts to f, patches move from kk=(f+1)*M+patch to kk=f*M+patch
+			// Frame index stored in m_ix should be decremented by 1
+			for (int patch = 0; patch < M; patch++) {
+				int kk_old = (f + 1) * M + patch;
+				int kk_new = f * M + patch;
+				// Decrement frame index: frame f+1 becomes frame f
+				m_pg.m_ix[kk_new] = m_pg.m_ix[kk_old] - 1;
+			}
 
 			// ---- ring buffers / lightweight objects ----
 			m_imap[f % m_pmem] = m_imap[(f + 1) % m_pmem];
@@ -2151,18 +2294,34 @@ void DPVO::removeFactors(const bool* mask, bool store) {
 // Motion magnitude (based on Python motionmag)
 // -------------------------------------------------------------
 float DPVO::motionMagnitude(int i, int j) {
-    // Find active edges where ii == i and jj == j
+    // Python: active_ii = self.pg.ii[:num_active] (source frame indices)
+    //         active_jj = self.pg.jj[:num_active] (target frame indices)
+    //         k = (active_ii == i) & (active_jj == j)
+    //         ii = active_ii[k], jj = active_jj[k], kk = self.pg.kk[:num_active][k]
+    //
+    // CRITICAL: In C++, m_ii[e] is NOT the source frame index!
+    //           It's a patch index mapping (m_pg.m_index[frame][patch]).
+    //           We must extract the source frame from kk: i_source = kk[e] / M
     const int num_active = m_pg.m_num_edges;
     if (num_active == 0) {
         return 0.0f;
     }
     
-    // Collect edges matching (i, j)
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    
+    // Collect edges matching (i, j) where:
+    //   i_source = kk[e] / M (source frame extracted from kk)
+    //   j_target = jj[e] (target frame)
     std::vector<int> matching_ii, matching_jj, matching_kk;
     for (int e = 0; e < num_active; e++) {
-        if (m_pg.m_ii[e] == i && m_pg.m_jj[e] == j) {
-            matching_ii.push_back(m_pg.m_ii[e]);
-            matching_jj.push_back(m_pg.m_jj[e]);
+        // Extract source frame from kk (matching Python's active_ii semantics)
+        int i_source = m_pg.m_kk[e] / M;  // Source frame index
+        int j_target = m_pg.m_jj[e];      // Target frame index
+        
+        if (i_source == i && j_target == j) {
+            // Store the source frame index (for flow_mag which expects frame indices)
+            matching_ii.push_back(i_source);
+            matching_jj.push_back(j_target);
             matching_kk.push_back(m_pg.m_kk[e]);
         }
     }
@@ -2180,6 +2339,7 @@ float DPVO::motionMagnitude(int i, int j) {
     std::vector<float> flow_out(matching_ii.size());
     
     // Call flow_mag with matching edges
+    // Note: flow_mag expects ii to be source frame indices (which we now have)
     pops::flow_mag(
         m_pg.m_poses,
         patches_flat,
@@ -2188,14 +2348,14 @@ float DPVO::motionMagnitude(int i, int j) {
         matching_jj.data(),
         matching_kk.data(),
         static_cast<int>(matching_ii.size()),
-        m_cfg.PATCHES_PER_FRAME,
+        M,
         m_P,
         0.5f,  // beta = 0.5 (from Python default)
         flow_out.data(),
         nullptr  // valid_out not needed
     );
     
-    // Return mean flow
+    // Return mean flow (matching Python: flow.mean().item())
     float sum = 0.0f;
     for (float f : flow_out) {
         sum += f;
@@ -2276,6 +2436,41 @@ float DPVO::motionProbe() {
     return median;
 }
 
+// -------------------------------------------------------------
+// Save reproject inputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_reproject_inputs(int num_active)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    const int N = m_pg.m_n;
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    std::string reproject_poses_filename = get_bin_file_path("reproject_poses_frame" + frame_suffix + ".bin");
+    std::string reproject_intrinsics_filename = get_bin_file_path("reproject_intrinsics_frame" + frame_suffix + ".bin");
+    std::string reproject_ii_filename = get_bin_file_path("reproject_ii_frame" + frame_suffix + ".bin");
+    std::string reproject_jj_filename = get_bin_file_path("reproject_jj_frame" + frame_suffix + ".bin");
+    std::string reproject_kk_filename = get_bin_file_path("reproject_kk_frame" + frame_suffix + ".bin");
+    
+    ba_file_io::save_poses(reproject_poses_filename, m_pg.m_poses, N, logger);
+    ba_file_io::save_intrinsics(reproject_intrinsics_filename, m_pg.m_intrinsics, N, logger);
+    ba_file_io::save_edge_indices(reproject_ii_filename, reproject_jj_filename, reproject_kk_filename,
+                                  m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
+    
+    if (logger) {
+        logger->info("[DPVO::save_reproject_inputs] Saved poses, intrinsics, and edge indices for reproject comparison (frame {}): {}, {}, {}, {}, {}", 
+                    TARGET_FRAME, reproject_poses_filename, reproject_intrinsics_filename,
+                    reproject_ii_filename, reproject_jj_filename, reproject_kk_filename);
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Reproject patches from source frame i to target frame j using SE3 poses
@@ -3399,6 +3594,10 @@ void DPVO::updateViewer()
                 }
             }
             
+            // CRITICAL: Pass all historical poses to viewer, even though some may have stale poses
+            // Frames that have been removed from the sliding window by keyframe() will have poses
+            // from when they were last optimized. This is correct for optimization but may cause
+            // visualization jumps. The viewer should handle this gracefully.
             m_viewer->updatePoses(m_allPoses.data(), num_historical_frames);
             if (logger && m_pg.m_n > 0) {
                 // Log first and last pose to track movement

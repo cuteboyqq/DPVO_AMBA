@@ -461,7 +461,7 @@ void computeCorrelationSingle(
                 // Match Python's corr_torch_forward_fp16: compute 8x8 correlation at integer offsets first
                 float x0 = std::floor(x_half);
                 float y0 = std::floor(y_half);
-                
+                        
                 // Step 1: Compute 8x8 correlation at integer offsets (matching Python's internal computation)
                 // Python uses offsets: torch.arange(-radius, radius + 2) = [-3, -2, -1, 0, 1, 2, 3, 4]
                 for (int corr_ii = 0; corr_ii < D_internal; corr_ii++) {
@@ -489,24 +489,24 @@ void computeCorrelationSingle(
                         float sum = 0.0f;
                         
                         // Extract patch feature from gmap (unchanged)
-                        int gmap_i = i0 + gmap_center_offset;
-                        int gmap_j = j0 + gmap_center_offset;
-                        
-                        // Dot product over feature channels
-                        int features_processed = 0;
-                        for (int f = 0; f < feature_dim; f++) {
-                            // fmap1: patch feature from gmap (unchanged - still uses integer indexing)
-                            size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
-                                               static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
-                                               static_cast<size_t>(f) * D_gmap * D_gmap +
-                                               static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
+                            int gmap_i = i0 + gmap_center_offset;
+                            int gmap_j = j0 + gmap_center_offset;
                             
+                            // Dot product over feature channels
+                            int features_processed = 0;
+                            for (int f = 0; f < feature_dim; f++) {
+                            // fmap1: patch feature from gmap (unchanged - still uses integer indexing)
+                                size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
+                                                   static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
+                                                   static_cast<size_t>(f) * D_gmap * D_gmap +
+                                                   static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
+                                
                             // Bounds check for gmap access
                             if (fmap1_idx >= gmap_total_size) {
                                 continue;
                             }
                             
-                            float f1 = gmap[fmap1_idx];
+                                    float f1 = gmap[fmap1_idx];
                             
                             // fmap2: frame feature from pyramid using bilinear interpolation
                             // Use normalized coordinates directly (already computed above)
@@ -519,8 +519,8 @@ void computeCorrelationSingle(
                                 frame_offset
                             );
                             
-                            sum += f1 * f2;
-                            features_processed++;
+                                    sum += f1 * f2;
+                                    features_processed++;
                         }
                         
                         // Note: Out-of-bounds sampling returns 0.0 from bilinear_sample_grid_sample
@@ -534,8 +534,8 @@ void computeCorrelationSingle(
                         size_t internal_idx = static_cast<size_t>(e) * D_internal * D_internal * P * P +
                                               static_cast<size_t>(corr_jj) * D_internal * P * P +
                                               static_cast<size_t>(corr_ii) * P * P +
-                                              static_cast<size_t>(i0) * P +
-                                              static_cast<size_t>(j0);
+                                         static_cast<size_t>(i0) * P +
+                                         static_cast<size_t>(j0);
                         
                         if (internal_idx < corr_internal_size) {
                             corr_internal[internal_idx] = sum;

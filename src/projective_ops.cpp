@@ -33,6 +33,29 @@ static std::string get_bin_file_path(const std::string& filename) {
     return bin_dir + "/" + filename;
 }
 
+// Helper function to save Jacobians for debugging/comparison
+static void save_jacobians(int frame_num, int edge_idx, 
+                           const Eigen::Matrix<float, 2, 6>& Ji,
+                           const Eigen::Matrix<float, 2, 6>& Jj,
+                           const Eigen::Matrix<float, 2, 1>& Jz)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    std::string frame_suffix = std::to_string(frame_num);
+    std::string edge_suffix = std::to_string(edge_idx);
+    ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Ji_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Ji, logger);
+    ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jj, logger);
+    ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jz, logger);
+}
+
 // ------------------------------------------------------------
 // iproj(): inverse projection
 // ------------------------------------------------------------
@@ -789,20 +812,7 @@ void transformWithJacobians(
 
         // Save intermediate Jacobians if requested
         if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
-            auto logger = spdlog::get("dpvo");
-            if (!logger) {
-#ifdef SPDLOG_USE_SYSLOG
-                logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
-#else
-                logger = spdlog::stdout_color_mt("dpvo");
-                logger->set_pattern("[%n] [%^%l%$] %v");
-#endif
-            }
-            std::string frame_suffix = std::to_string(frame_num);
-            std::string edge_suffix = std::to_string(e);
-            ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Ji_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Ji, logger);
-            ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jj, logger);
-            ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jz, logger);
+            save_jacobians(frame_num, e, Ji, Jj, Jz);
         }
 
         // ====================================================================
