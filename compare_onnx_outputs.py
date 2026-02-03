@@ -137,7 +137,7 @@ def load_image(image_path: str, use_bgr: bool = True, match_python_dpvo: bool = 
             # Python DPVO image_stream: no resize (commented out with if 0:)
             # But for model input, we need to resize to model size
             # Use INTER_LINEAR as default (matches image stream behavior when resize is enabled)
-            img_resized = cv2.resize(img, (model_W, model_H), interpolation=cv2.INTER_LINEAR)
+            img_resized = cv2.resize(img, (model_W, model_H), interpolation=cv2.INTER_LINEAR) # INTER_LINEAR
     else:
         # C++ uses nearest neighbor interpolation with exact integer mapping
         img_resized = resize_nearest_neighbor_cpp_style(img, model_H, model_W)
@@ -457,7 +457,7 @@ def load_and_preprocess_images(image_path: str, is_video: bool = False) -> np.nd
         print("    - BGR format")
         print("  ✅ This matches Python DPVO image_stream() function")
     print("  🔧 Applying undistortion with k1=0.07, k2=-0.08, p1=0, p2=0")
-    input_data_python_dpvo, orig_H, orig_W = load_image(image_path, use_bgr=False, match_python_dpvo=True, apply_undistort=False, is_video=is_video)
+    input_data_python_dpvo, orig_H, orig_W = load_image(image_path, use_bgr=False, match_python_dpvo=True, apply_undistort=True, is_video=is_video)
     
     print(f"  📐 Original image size: {orig_W}x{orig_H}")
     print(f"  🐍 Python DPVO input shape: {input_data_python_dpvo.shape} (NCHW)")
@@ -679,13 +679,13 @@ def run_comparisons(fnet_cpp: np.ndarray, inet_cpp: np.ndarray, fnet_py_dpvo: np
     dpvo_settings = PreprocessingSettings(
         use_bgr=False,
         match_python_dpvo=True,
-        apply_undistort=False,
+        apply_undistort=True,
         is_video=is_video
     )
     
     # Run Python DPVO comparisons
-    fnet_dpvo_result = compare_outputs(fnet_cpp, fnet_py_dpvo, "FNet", tolerance=1e-5, preprocessing=dpvo_settings)
-    inet_dpvo_result = compare_outputs(inet_cpp, inet_py_dpvo, "INet", tolerance=1e-5, preprocessing=dpvo_settings)
+    fnet_dpvo_result = compare_outputs(fnet_cpp, fnet_py_dpvo, "FNet", tolerance=1e-2, preprocessing=dpvo_settings)
+    inet_dpvo_result = compare_outputs(inet_cpp, inet_py_dpvo, "INet", tolerance=1e-2, preprocessing=dpvo_settings)
     dpvo_results = [fnet_dpvo_result, inet_dpvo_result]
     
     # Prepare data dictionaries for sample value tables

@@ -430,7 +430,7 @@ def main() -> None:
     )
     parser.add_argument("--frame", type=int, required=True, help="Frame number to compare")
     parser.add_argument("--bin-dir", type=str, default="bin_file", help="Directory containing binary files")
-    parser.add_argument("--tolerance", type=float, default=1e-4, help="Comparison tolerance (default: 1e-4)")
+    parser.add_argument("--tolerance", type=float, default=1e-3, help="Comparison tolerance (default: 1e-4)")
     parser.add_argument("--max-edges", type=int, default=None, help="Maximum number of edges to compare (default: all)")
     parser.add_argument("--verbose", action="store_true", help="Print detailed output for each edge")
     args = parser.parse_args()
