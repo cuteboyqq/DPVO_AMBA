@@ -2028,8 +2028,9 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // CRITICAL FIX: m_ii[e] is NOT a frame index! It's a patch index mapping.
         // We need to extract the source frame from kk: i_source = kk[e] / M
-        // Python: to_remove = (active_ii > k) | (active_jj == k)
+        // Python: to_remove = (active_ii == k) | (active_jj == k)
         //   where active_ii is the source frame index extracted from kk
+        //   This removes edges that touch frame k (either source or target)
         bool remove[MAX_EDGES] = {false};
 
         int num_active = m_pg.m_num_edges;
@@ -2039,9 +2040,9 @@ void DPVO::keyframe() {
             int i_source = m_pg.m_kk[e] / M;  // Source frame index
             int j_target = m_pg.m_jj[e];       // Target frame index
             
-            // Remove edges where source frame > k OR target frame == k
-            // Python: to_remove = (active_ii > k) | (active_jj == k)
-            if (i_source > k || j_target == k) {
+            // Remove edges where source frame == k OR target frame == k
+            // Python: to_remove = (active_ii == k) | (active_jj == k)
+            if (i_source == k || j_target == k) {
                 remove[e] = true;
             }
         }
@@ -2051,25 +2052,27 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // Phase B2: reindex remaining edges
         // ---------------------------------------------------------
-        // CRITICAL FIX: Extract frame from kk, don't use m_ii
+        // CRITICAL FIX: Match Python's reindexing logic exactly
         // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1; active_jj[mask_jj] -= 1
+        // Python extracts source frame from active_ii (which is self.pg.ii, storing source frame index)
+        // C++ extracts source frame from kk: i_source = kk[e] / M
         num_active = m_pg.m_num_edges;
         for (int e = 0; e < num_active; e++) {
-            // Extract source frame from kk
+            // Extract source frame from kk (before decrementing)
             int i_source = m_pg.m_kk[e] / M;
             
-            // If source frame > k, decrement both kk and update m_ii
-            // Note: m_ii needs to be updated based on the new frame index
+            // If source frame > k, decrement kk and m_ii
+            // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1
             if (i_source > k) {
                 m_pg.m_kk[e] -= M;  // Decrement kk by M (one frame worth of patches)
-                // m_ii[e] stores m_index[frame][patch], so we need to update it
-                // But m_index might have changed, so we need to recompute it
-                int patch_idx = m_pg.m_kk[e] % M;
-                int new_frame = i_source - 1;
-                m_pg.m_ii[e] = m_pg.m_index[new_frame][patch_idx];
+                // CRITICAL: m_ii[e] stores m_index[frame][patch], which is the source frame index
+                // Python directly decrements: active_ii[mask_ii] -= 1
+                // Since m_index[frame][patch] stores the source frame index, we can directly decrement m_ii
+                m_pg.m_ii[e] -= 1;  // Decrement source frame index by 1 (matching Python)
             }
 
             // If target frame > k, decrement jj
+            // Python: active_jj[mask_jj] -= 1
             if (m_pg.m_jj[e] > k) {
                 m_pg.m_jj[e] -= 1;
             }

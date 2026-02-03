@@ -57,6 +57,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
     // bundleAdjustment() is a member function, so we can access m_counter directly
     bool save_intermediates = (m_counter == TARGET_FRAME);
+    
+    if (logger) {
+        logger->info("BA: m_counter={}, TARGET_FRAME={}, save_intermediates={}", 
+                     m_counter, TARGET_FRAME, save_intermediates);
+    }
 
     const int M = m_cfg.PATCHES_PER_FRAME;
     const int P = m_P;
@@ -291,7 +296,21 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             r_file.close();
             v_file.close();
             coords_center_file.close();
-            if (logger) logger->info("BA: Saved STEP 1 - residuals, validity mask, and coords at center");
+            if (logger) {
+                logger->info("BA: ✅ Successfully saved STEP 1 - residuals, validity mask, and coords at center");
+                logger->info("BA: File sizes - residuals: {} bytes, validity: {} bytes, coords_center: {} bytes",
+                             num_active * 2 * sizeof(float), num_active * sizeof(float), num_active * 2 * sizeof(float));
+            }
+        } else {
+            if (logger) {
+                logger->error("BA: ❌ Failed to open files for STEP 1 saving!");
+                logger->error("BA: r_file.is_open()={}, v_file.is_open()={}, coords_center_file.is_open()={}",
+                             r_file.is_open(), v_file.is_open(), coords_center_file.is_open());
+            }
+        }
+    } else {
+        if (logger && m_counter % 10 == 0) {  // Log every 10 frames to avoid spam
+            logger->debug("BA: Skipping STEP 1 save (m_counter={} != TARGET_FRAME={})", m_counter, TARGET_FRAME);
         }
     }
     
@@ -1067,7 +1086,17 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                     dZ_file.write(reinterpret_cast<const char*>(dZ.data()), sizeof(float) * dZ.size());
                     dX_file.close();
                     dZ_file.close();
-                    if (logger) logger->info("BA: Saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", dX.size(), dZ.size());
+                    if (logger) {
+                        logger->info("BA: ✅ Successfully saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", dX.size(), dZ.size());
+                        logger->info("BA: File sizes - dX: {} bytes, dZ: {} bytes", 
+                                     dX.size() * sizeof(float), dZ.size() * sizeof(float));
+                    }
+                } else {
+                    if (logger) {
+                        logger->error("BA: ❌ Failed to open files for STEP 15-16 saving!");
+                        logger->error("BA: dX_file.is_open()={}, dZ_file.is_open()={}", 
+                                     dX_file.is_open(), dZ_file.is_open());
+                    }
                 }
             }
         }
@@ -1131,6 +1160,21 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (logger) {
             logger->warn("BA: Skipping pose updates - structure_only={}, n_adjusted={}", 
                          structure_only, n_adjusted);
+        }
+    }
+    
+    // Summary log for BA saving
+    if (logger) {
+        if (save_intermediates) {
+            logger->info("BA: ========================================");
+            logger->info("BA: ✅ BA intermediate files saved for frame {} (TARGET_FRAME={})", m_counter, TARGET_FRAME);
+            logger->info("BA: Check bin_file/ directory for ba_step*.bin files");
+            logger->info("BA: ========================================");
+        } else {
+            if (m_counter % 50 == 0) {  // Log every 50 frames to avoid spam
+                logger->debug("BA: Skipping BA intermediate file saving (m_counter={} != TARGET_FRAME={})", 
+                             m_counter, TARGET_FRAME);
+            }
         }
     }
     
