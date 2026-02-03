@@ -214,7 +214,7 @@ def compare_single_edge(
                     coords_cpp_edge_flat = coords_cpp_full[edge_base:edge_base + 2 * P * P]
                     coords_cpp_edge = coords_cpp_edge_flat.reshape(2, P, P)
                     coords_result = compare_coordinates(coords_cpp_edge, coords_py_edge, "Coords", tolerance)
-                    coords_match = coords_result['match']
+                    coords_match = bool(coords_result['match'])  # Convert numpy bool to Python bool
                 else:
                     coords_error = f"Edge {edge_idx} out of bounds (file size: {len(coords_cpp_full)}, expected: {edge_base + 2 * P * P})"
             except Exception as e:
