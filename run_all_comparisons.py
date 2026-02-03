@@ -460,38 +460,47 @@ def parse_update_output(output: str) -> ComparisonResult:
     # Look for comparison table
     if "UPDATE MODEL OUTPUT COMPARISON" in output:
         # Parse the table to find mismatches
-        mismatches = []
-        matches = []
+        # Track status for each output type
+        output_status = {}  # {output_name: True/False for match/mismatch}
         
         # Check each output type from the table
         lines = output.split('\n')
         for line in lines:
             if "net_out" in line.lower() or "netOut" in line.lower():
                 if "❌ MISMATCH" in line:
-                    mismatches.append("net_out")
+                    output_status["net_out"] = False
                 elif "✅ MATCH" in line:
-                    matches.append("net_out")
+                    output_status["net_out"] = True
             if "d_out" in line.lower() or "dOut" in line.lower():
                 if "❌ MISMATCH" in line:
-                    mismatches.append("d_out")
+                    output_status["d_out"] = False
                 elif "✅ MATCH" in line:
-                    matches.append("d_out")
+                    output_status["d_out"] = True
             if "w_out" in line.lower() or "wOut" in line.lower():
                 if "❌ MISMATCH" in line:
-                    mismatches.append("w_out")
+                    output_status["w_out"] = False
                 elif "✅ MATCH" in line:
-                    matches.append("w_out")
+                    output_status["w_out"] = True
         
-        if mismatches:
-            match_status = "MISMATCH"
-            details = f"Mismatched: {', '.join(mismatches)}"
-        elif matches:
-            match_status = "MATCH"
-            details = f"All matched: {', '.join(matches)}"
+        # Build details string with checkmarks/crosses
+        detail_parts = []
+        for output_name in ["net_out", "d_out", "w_out"]:
+            if output_name in output_status:
+                status_symbol = "✅" if output_status[output_name] else "❌"
+                detail_parts.append(f"{output_name}{status_symbol}")
+        
+        if detail_parts:
+            details = " ".join(detail_parts)
+            # Determine overall match status
+            if all(output_status.values()):
+                match_status = "MATCH"
+            else:
+                match_status = "MISMATCH"
     else:
         # Fallback: look for match indicators
         if "✅ All outputs match" in output or "All matches: True" in output:
             match_status = "MATCH"
+            details = "net_out✅ d_out✅ w_out✅"
         elif "❌" in output and "MISMATCH" in output:
             match_status = "MISMATCH"
             details = "Some outputs mismatched"
