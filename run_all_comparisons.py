@@ -735,6 +735,27 @@ def parse_onnx_output(output: str) -> ComparisonResult:
     elif "❌" in output and "Mismatch" in output:
         match_status = "MISMATCH"
     
+    # First, check the "Final Summary" section which is more reliable
+    # Format: "FNet (Python DPVO preprocessing)         ❌ DIFFER" or "✅ MATCH"
+    # The summary section ends with a line of "=" characters
+    summary_section = re.search(r'📊 Final Summary.*?(?=\n.*?❌ WARNING|\Z)', output, re.DOTALL)
+    if summary_section:
+        summary_text = summary_section.group(0)
+        # Check for FNet status in summary - look for the line with FNet and status
+        fnet_summary_line = re.search(r'FNet \(Python DPVO preprocessing\)[^\n]*(?:✅ MATCH|❌ DIFFER)', summary_text)
+        if fnet_summary_line:
+            if "✅ MATCH" in fnet_summary_line.group(0):
+                fnet_match = True
+            elif "❌ DIFFER" in fnet_summary_line.group(0):
+                fnet_match = False
+        # Check for INet status in summary - look for the line with INet and status
+        inet_summary_line = re.search(r'INet \(Python DPVO preprocessing\)[^\n]*(?:✅ MATCH|❌ DIFFER)', summary_text)
+        if inet_summary_line:
+            if "✅ MATCH" in inet_summary_line.group(0):
+                inet_match = True
+            elif "❌ DIFFER" in inet_summary_line.group(0):
+                inet_match = False
+    
     # Check FNet and INet separately by looking at their actual status rows
     # The output format is: "FNet" followed by status like "✅ MATCH" or "❌ DIFFER"
     # We need to check the status on the same line or nearby lines
@@ -743,32 +764,39 @@ def parse_onnx_output(output: str) -> ComparisonResult:
     
     # Method 1: Look for table rows with FNet/INet and their status
     # Pattern: "FNet" followed by status indicators on the same line
+    # The actual format is: "FNet                      ❌ DIFFER" or "FNet                      ✅ MATCH"
     fnet_patterns = [
-        r'FNet\s+✅\s+MATCH',
-        r'FNet[^\n]*✅\s+MATCH',
-        r'FNet[^\n]*❌\s+DIFFER',
+        r'FNet\s+✅\s+MATCH',  # FNet followed by ✅ MATCH
+        r'FNet[^\n]*✅\s+MATCH',  # FNet followed by any chars then ✅ MATCH
+        r'FNet[^\n]*❌\s+DIFFER',  # FNet followed by any chars then ❌ DIFFER
+        r'^FNet\s+\S+\s+✅\s+MATCH',  # FNet at start of line, then status
+        r'^FNet\s+\S+\s+❌\s+DIFFER',  # FNet at start of line, then status
     ]
     inet_patterns = [
-        r'INet\s+✅\s+MATCH',
-        r'INet[^\n]*✅\s+MATCH',
-        r'INet[^\n]*❌\s+DIFFER',
+        r'INet\s+✅\s+MATCH',  # INet followed by ✅ MATCH
+        r'INet[^\n]*✅\s+MATCH',  # INet followed by any chars then ✅ MATCH
+        r'INet[^\n]*❌\s+DIFFER',  # INet followed by any chars then ❌ DIFFER
+        r'^INet\s+\S+\s+✅\s+MATCH',  # INet at start of line, then status
+        r'^INet\s+\S+\s+❌\s+DIFFER',  # INet at start of line, then status
     ]
     
     for pattern in fnet_patterns:
         match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
         if match:
-            if "✅ MATCH" in match.group(0):
+            matched_text = match.group(0)
+            if "✅ MATCH" in matched_text:
                 fnet_match = True
-            elif "❌ DIFFER" in match.group(0):
+            elif "❌ DIFFER" in matched_text:
                 fnet_match = False
             break
     
     for pattern in inet_patterns:
         match = re.search(pattern, output, re.IGNORECASE | re.MULTILINE)
         if match:
-            if "✅ MATCH" in match.group(0):
+            matched_text = match.group(0)
+            if "✅ MATCH" in matched_text:
                 inet_match = True
-            elif "❌ DIFFER" in match.group(0):
+            elif "❌ DIFFER" in matched_text:
                 inet_match = False
             break
     
@@ -972,6 +1000,17 @@ def format_diff_value(val: Optional[float]) -> str:
         return f"{val:.2e}"
 
 
+def format_status_with_emoji(status: str) -> str:
+    """Format match status with emoji indicator."""
+    status_emoji_map = {
+        "MATCH": "✅ MATCH",
+        "MISMATCH": "❌ MISMATCH",
+        "SKIPPED": "⚠️  SKIPPED",
+        "ERROR": "❌ ERROR"
+    }
+    return status_emoji_map.get(status, status)
+
+
 def print_summary_table(results: List[ComparisonResult]):
     """Print a summary table of all comparison results."""
     print("\n" + "="*120)
@@ -1121,7 +1160,7 @@ Examples:
         print("\n[1/6] Running correlation comparison...")
         result = run_correlation_comparison(args.frame)
         results.append(result)
-        print(f"    Status: {result.match_status}")
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
         print("\n[1/6] Skipping correlation comparison")
     
@@ -1130,7 +1169,7 @@ Examples:
         print("\n[2/6] Running reproject intermediate comparison...")
         result = run_reproject_comparison(args.frame, args.edge)
         results.append(result)
-        print(f"    Status: {result.match_status}")
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
         print("\n[2/6] Skipping reproject intermediate comparison")
     
@@ -1139,7 +1178,7 @@ Examples:
         print("\n[3/6] Running BA step-by-step comparison...")
         result = run_ba_comparison()
         results.append(result)
-        print(f"    Status: {result.match_status}")
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
         print("\n[3/6] Skipping BA step-by-step comparison")
     
@@ -1149,7 +1188,7 @@ Examples:
             print("\n[4/6] Running update model comparison...")
             result = run_update_comparison(args.update_model, args.frame)
             results.append(result)
-            print(f"    Status: {result.match_status}")
+            print(f"    Status: {format_status_with_emoji(result.match_status)}")
         else:
             print("\n[4/6] Skipping update model comparison (--update-model not provided)")
     else:
@@ -1160,7 +1199,7 @@ Examples:
         print("\n[5/6] Running patchify comparison...")
         result = run_patchify_comparison(args.frame)
         results.append(result)
-        print(f"    Status: {result.match_status}")
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
         print("\n[5/6] Skipping patchify comparison")
     
@@ -1173,7 +1212,7 @@ Examples:
                 args.fnet_bin, args.inet_bin
             )
             results.append(result)
-            print(f"    Status: {result.match_status}")
+            print(f"    Status: {format_status_with_emoji(result.match_status)}")
         else:
             print("\n[6/6] Skipping ONNX model comparison (--image, --fnet-model, --inet-model not all provided)")
     else:
