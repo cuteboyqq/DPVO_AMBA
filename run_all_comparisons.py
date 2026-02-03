@@ -138,102 +138,111 @@ def parse_correlation_output(output: str) -> ComparisonResult:
 
 
 def parse_reproject_output(output: str, edge: int = None) -> ComparisonResult:
-    """Parse reproject intermediate comparison output."""
+    """Parse reproject all edges comparison output."""
     match_status = "ERROR"
     details = ""
     max_diff = None
     mean_diff = None
     
-    # Look for summary
-    if "SUMMARY" in output:
-        if "✅ ALL MATCH" in output:
-            match_status = "MATCH"
-        elif "❌ SOME MISMATCHES" in output:
-            match_status = "MISMATCH"
+    # Look for statistics table section
+    # The output format from compare_reproject_all_edges.py includes:
+    # - "COMPARISON STATISTICS" section with a table
+    # - Summary section with "Total edges compared", "Fully matched edges", etc.
     
-    # Extract max diff and mean diff from Gij comparison (most important)
-    # Look for "Max Diff:" and "Mean Diff:" in the Gij comparison section
-    gij_max_diff_match = re.search(r'Gij.*?Max Diff:\s*([\d.e+-]+)', output, re.IGNORECASE | re.DOTALL)
-    gij_mean_diff_match = re.search(r'Gij.*?Mean Diff:\s*([\d.e+-]+)', output, re.IGNORECASE | re.DOTALL)
+    # Extract edge match statistics from summary
+    # Pattern: "Total edges compared: 50"
+    total_edges_match = re.search(r'Total edges compared:\s*(\d+)', output)
+    matched_edges_match = re.search(r'✅ Fully matched edges:\s*(\d+)', output)
+    mismatched_edges_match = re.search(r'❌ Mismatched edges:\s*(\d+)', output)
     
-    if gij_max_diff_match:
+    total_edges = None
+    matched_edges = None
+    mismatched_edges = None
+    
+    if total_edges_match:
         try:
-            max_diff = float(gij_max_diff_match.group(1))
+            total_edges = int(total_edges_match.group(1))
         except ValueError:
             pass
     
-    if gij_mean_diff_match:
+    if matched_edges_match:
         try:
-            mean_diff = float(gij_mean_diff_match.group(1))
+            matched_edges = int(matched_edges_match.group(1))
         except ValueError:
             pass
     
-    # Check individual component matches
-    if match_status == "ERROR":
-        matches = []
-        mismatches = []
-        if "Ti Match: ✅" in output:
-            matches.append("Ti")
-        elif "Ti Match: ❌" in output:
-            mismatches.append("Ti")
-        if "Tj Match: ✅" in output:
-            matches.append("Tj")
-        elif "Tj Match: ❌" in output:
-            mismatches.append("Tj")
-        if "Gij Match: ✅" in output:
-            matches.append("Gij")
-        elif "Gij Match: ❌" in output:
-            mismatches.append("Gij")
-        if "Ji Match: ✅" in output:
-            matches.append("Ji")
-        elif "Ji Match: ❌" in output:
-            mismatches.append("Ji")
-        if "Jj Match: ✅" in output:
-            matches.append("Jj")
-        elif "Jj Match: ❌" in output:
-            mismatches.append("Jj")
-        if "Jz Match: ✅" in output:
-            matches.append("Jz")
-        elif "Jz Match: ❌" in output:
-            mismatches.append("Jz")
-        if "Coords Match: ✅" in output:
-            matches.append("Coords")
-        elif "Coords Match: ❌" in output:
-            mismatches.append("Coords")
-        
-        if mismatches:
-            match_status = "MISMATCH"
-            details = f"Mismatched: {', '.join(mismatches)}"
-        elif matches:
-            match_status = "MATCH"
-            details = f"All matched: {', '.join(matches)}"
+    if mismatched_edges_match:
+        try:
+            mismatched_edges = int(mismatched_edges_match.group(1))
+        except ValueError:
+            pass
     
-    # Add edge information to details
-    if edge is not None:
-        if details:
-            details = f"Edge {edge}: {details}"
+    # Determine match status based on edge statistics
+    if total_edges is not None and matched_edges is not None:
+        if matched_edges == total_edges:
+            match_status = "MATCH"
+            details = f"{matched_edges}/{total_edges} edges matched"
+        elif matched_edges > 0:
+            match_status = "MISMATCH"
+            details = f"{matched_edges}/{total_edges} edges matched"
         else:
-            details = f"Edge {edge}"
-    else:
-        # Try to extract edge from output if not provided
-        edge_match = re.search(r'Edge:\s*(\d+)', output)
-        if edge_match:
-            edge_num = edge_match.group(1)
-            if details:
-                details = f"Edge {edge_num}: {details}"
+            match_status = "MISMATCH"
+            details = f"0/{total_edges} edges matched"
+    
+    # Extract max diff and mean diff from parseable format lines
+    # Format: "REPROJECT_MAX_DIFF=1.234567e-03"
+    #         "REPROJECT_MEAN_DIFF=5.678901e-04"
+    reproject_max_diff_match = re.search(r'REPROJECT_MAX_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+    reproject_mean_diff_match = re.search(r'REPROJECT_MEAN_DIFF=([\d.e+-]+)', output, re.IGNORECASE)
+    
+    if reproject_max_diff_match:
+        try:
+            max_diff = float(reproject_max_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    if reproject_mean_diff_match:
+        try:
+            mean_diff = float(reproject_mean_diff_match.group(1))
+        except ValueError:
+            pass
+    
+    # Fallback: Check for overall success message
+    if match_status == "ERROR":
+        if "🎉 SUCCESS: All edges matched!" in output:
+            match_status = "MATCH"
+            if total_edges:
+                details = f"{total_edges}/{total_edges} edges matched"
             else:
-                details = f"Edge {edge_num}"
+                details = "All edges matched"
+        elif "⚠️  WARNING:" in output and "edges have mismatches" in output:
+            match_status = "MISMATCH"
+            # Extract number from warning message
+            warning_match = re.search(r'(\d+)\s+edges have mismatches', output)
+            if warning_match:
+                mismatched_count = int(warning_match.group(1))
+                if total_edges:
+                    matched_count = total_edges - mismatched_count
+                    details = f"{matched_count}/{total_edges} edges matched"
+                else:
+                    details = f"{mismatched_count} edges mismatched"
+        elif "❌ ERROR: No edges matched!" in output:
+            match_status = "MISMATCH"
+            if total_edges:
+                details = f"0/{total_edges} edges matched"
+            else:
+                details = "No edges matched"
     
     if match_status == "ERROR":
         if "File not found" in output or "FileNotFoundError" in output:
             match_status = "SKIPPED"
-            details = f"Edge {edge if edge is not None else '?'}: Required files not found"
+            details = "Required files not found"
         else:
-            details = f"Edge {edge if edge is not None else '?'}: Could not parse output"
+            details = "Could not parse output"
     
     return ComparisonResult(
         name="Reproject Intermediate",
-        script="compare_reproject_intermediate.py",
+        script="compare_reproject_all_edges.py",
         command=[],
         exit_code=0,
         success=(match_status != "ERROR"),
@@ -872,9 +881,11 @@ def run_correlation_comparison(frame: int) -> ComparisonResult:
 
 
 def run_reproject_comparison(frame: int, edge: int = 0) -> ComparisonResult:
-    """Run reproject intermediate comparison."""
-    cmd = [sys.executable, "compare_reproject_intermediate.py", 
-           "--frame", str(frame), "--edge", str(edge)]
+    """Run reproject all edges comparison."""
+    # Use compare_reproject_all_edges.py instead of compare_reproject_intermediate.py
+    # The edge parameter is ignored since we compare all edges
+    cmd = [sys.executable, "compare_reproject_all_edges.py", 
+           "--frame", str(frame), "--tolerance", str(1e-3)]
     exit_code, output = run_command(cmd)
     result = parse_reproject_output(output, edge=edge)
     result.command = cmd

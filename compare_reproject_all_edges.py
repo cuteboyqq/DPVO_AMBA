@@ -75,6 +75,8 @@ class EdgeComparisonResult:
     jz_match: bool
     coords_match: Optional[bool]
     all_match: bool
+    gij_max_diff: Optional[float] = None  # Max diff from Gij comparison
+    gij_mean_diff: Optional[float] = None  # Mean diff from Gij comparison
     coords_error: Optional[str] = None  # Reason why coords weren't compared
     error: Optional[str] = None
 
@@ -249,6 +251,8 @@ def compare_single_edge(
             coords_match=coords_match,
             coords_error=coords_error,
             all_match=all_match,
+            gij_max_diff=gij_result.get('R_max_diff'),  # Use rotation matrix max diff as overall Gij diff
+            gij_mean_diff=gij_result.get('R_mean_diff'),  # Use rotation matrix mean diff as overall Gij diff
             error=None
         )
         
@@ -267,6 +271,8 @@ def compare_single_edge(
             coords_match=None,
             coords_error=None,
             all_match=False,
+            gij_max_diff=None,
+            gij_mean_diff=None,
             error=str(e)
         )
 
@@ -396,6 +402,19 @@ def print_statistics_table(results: List[EdgeComparisonResult], bin_dir: str = N
     print(f"  ✅ Fully matched edges: {all_matched} ({all_matched/total*100:.2f}%)")
     print(f"  ❌ Mismatched edges: {total - all_matched} ({(total-all_matched)/total*100:.2f}%)")
     print(f"  ⚠️  Errors: {errors} ({errors/total*100:.2f}%)")
+    
+    # Calculate overall max diff and mean diff from Gij comparisons
+    gij_max_diffs = [r.gij_max_diff for r in results if r.gij_max_diff is not None]
+    gij_mean_diffs = [r.gij_mean_diff for r in results if r.gij_mean_diff is not None]
+    
+    overall_max_diff = max(gij_max_diffs) if gij_max_diffs else None
+    overall_mean_diff = sum(gij_mean_diffs) / len(gij_mean_diffs) if gij_mean_diffs else None
+    
+    # Output parseable format for run_all_comparisons.py
+    if overall_max_diff is not None:
+        print(f"\nREPROJECT_MAX_DIFF={overall_max_diff:.10e}")
+    if overall_mean_diff is not None:
+        print(f"REPROJECT_MEAN_DIFF={overall_mean_diff:.10e}")
     
     if all_matched == total:
         print(f"\n🎉 SUCCESS: All edges matched!")
