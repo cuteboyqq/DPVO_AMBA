@@ -75,8 +75,21 @@ class EdgeComparisonResult:
     jz_match: bool
     coords_match: Optional[bool]
     all_match: bool
-    gij_max_diff: Optional[float] = None  # Max diff from Gij comparison
-    gij_mean_diff: Optional[float] = None  # Mean diff from Gij comparison
+    # Max/mean diff values for each component
+    ti_max_diff: Optional[float] = None
+    ti_mean_diff: Optional[float] = None
+    tj_max_diff: Optional[float] = None
+    tj_mean_diff: Optional[float] = None
+    gij_max_diff: Optional[float] = None  # Max diff from Gij comparison (R_max_diff)
+    gij_mean_diff: Optional[float] = None  # Mean diff from Gij comparison (R_mean_diff)
+    ji_max_diff: Optional[float] = None
+    ji_mean_diff: Optional[float] = None
+    jj_max_diff: Optional[float] = None
+    jj_mean_diff: Optional[float] = None
+    jz_max_diff: Optional[float] = None
+    jz_mean_diff: Optional[float] = None
+    coords_max_diff: Optional[float] = None
+    coords_mean_diff: Optional[float] = None
     coords_error: Optional[str] = None  # Reason why coords weren't compared
     error: Optional[str] = None
 
@@ -149,6 +162,20 @@ def compare_single_edge(
                 coords_match=None,
                 coords_error=None,
                 all_match=False,
+                ti_max_diff=None,
+                ti_mean_diff=None,
+                tj_max_diff=None,
+                tj_mean_diff=None,
+                gij_max_diff=None,
+                gij_mean_diff=None,
+                ji_max_diff=None,
+                ji_mean_diff=None,
+                jj_max_diff=None,
+                jj_mean_diff=None,
+                jz_max_diff=None,
+                jz_mean_diff=None,
+                coords_max_diff=None,
+                coords_mean_diff=None,
                 error=f"Missing files: {missing_files}"
             )
         
@@ -204,6 +231,8 @@ def compare_single_edge(
         # Compare coordinates if available
         coords_match = None
         coords_error = None
+        coords_max_diff = None
+        coords_mean_diff = None
         
         if coords_cpp_full is None:
             coords_error = "C++ coords file missing"
@@ -217,6 +246,8 @@ def compare_single_edge(
                     coords_cpp_edge = coords_cpp_edge_flat.reshape(2, P, P)
                     coords_result = compare_coordinates(coords_cpp_edge, coords_py_edge, "Coords", tolerance)
                     coords_match = bool(coords_result['match'])  # Convert numpy bool to Python bool
+                    coords_max_diff = coords_result.get('max_diff')
+                    coords_mean_diff = coords_result.get('mean_diff')
                 else:
                     coords_error = f"Edge {edge_idx} out of bounds (file size: {len(coords_cpp_full)}, expected: {edge_base + 2 * P * P})"
             except Exception as e:
@@ -251,8 +282,20 @@ def compare_single_edge(
             coords_match=coords_match,
             coords_error=coords_error,
             all_match=all_match,
+            ti_max_diff=ti_result.get('R_max_diff'),  # Use rotation matrix max diff
+            ti_mean_diff=ti_result.get('R_mean_diff'),  # Use rotation matrix mean diff
+            tj_max_diff=tj_result.get('R_max_diff'),
+            tj_mean_diff=tj_result.get('R_mean_diff'),
             gij_max_diff=gij_result.get('R_max_diff'),  # Use rotation matrix max diff as overall Gij diff
             gij_mean_diff=gij_result.get('R_mean_diff'),  # Use rotation matrix mean diff as overall Gij diff
+            ji_max_diff=ji_result.get('max_diff'),
+            ji_mean_diff=ji_result.get('mean_diff'),
+            jj_max_diff=jj_result.get('max_diff'),
+            jj_mean_diff=jj_result.get('mean_diff'),
+            jz_max_diff=jz_result.get('max_diff'),
+            jz_mean_diff=jz_result.get('mean_diff'),
+            coords_max_diff=coords_max_diff,
+            coords_mean_diff=coords_mean_diff,
             error=None
         )
         
@@ -271,20 +314,42 @@ def compare_single_edge(
             coords_match=None,
             coords_error=None,
             all_match=False,
+            ti_max_diff=None,
+            ti_mean_diff=None,
+            tj_max_diff=None,
+            tj_mean_diff=None,
             gij_max_diff=None,
             gij_mean_diff=None,
+            ji_max_diff=None,
+            ji_mean_diff=None,
+            jj_max_diff=None,
+            jj_mean_diff=None,
+            jz_max_diff=None,
+            jz_mean_diff=None,
+            coords_max_diff=None,
+            coords_mean_diff=None,
             error=str(e)
         )
 
 
+def format_diff_value(max_diff: Optional[float], mean_diff: Optional[float] = None) -> str:
+    """Format max diff value for display."""
+    if max_diff is None:
+        return "N/A"
+    # Always use fixed-point notation with enough decimal places to show small values
+    # Use 8 decimal places to show values like 1.53e-05 as 0.00001530
+    return f"{max_diff:.8f}"
+
+
 def print_edge_results_table(results: List[EdgeComparisonResult]) -> None:
-    """Print a table showing comparison results for all edges."""
+    """Print tables showing comparison results for all edges."""
+    # Table 1: Match Status
     print(f"\n{'='*120}")
-    print("EDGE COMPARISON RESULTS")
+    print("EDGE COMPARISON RESULTS - MATCH STATUS")
     print(f"{'='*120}")
     
     # Table header
-    header = f"{'Edge':<8} {'i':<6} {'j':<6} {'k':<8} {'Ti':<6} {'Tj':<6} {'Gij':<6} {'Ji':<6} {'Jj':<6} {'Jz':<6} {'Coords':<8} {'Overall':<10} {'Error':<30}"
+    header = f"{'Edge':<8} {'i':<6} {'j':<6} {'k':<8} {'Ti':<6} {'Tj':<6} {'Gij':<6} {'Ji':<6} {'Jj':<6} {'Jz':<6} {'Coords':<8} {'Overall':<10}"
     print(header)
     print("-" * 120)
     
@@ -309,12 +374,39 @@ def print_edge_results_table(results: List[EdgeComparisonResult]) -> None:
         
         overall_str = "✅ MATCH" if result.all_match else "❌ MISMATCH"
         
-        error_str = result.error[:28] + "..." if result.error and len(result.error) > 30 else (result.error or "")
-        
-        row = f"{edge_str:<8} {i_str:<6} {j_str:<6} {k_str:<8} {ti_str:<6} {tj_str:<6} {gij_str:<6} {ji_str:<6} {jj_str:<6} {jz_str:<6} {coords_str:<8} {overall_str:<10} {error_str:<30}"
+        row = f"{edge_str:<8} {i_str:<6} {j_str:<6} {k_str:<8} {ti_str:<6} {tj_str:<6} {gij_str:<6} {ji_str:<6} {jj_str:<6} {jz_str:<6} {coords_str:<8} {overall_str:<10}"
         print(row)
     
     print("=" * 120)
+    
+    # Table 2: Difference Values
+    print(f"\n{'='*150}")
+    print("EDGE COMPARISON RESULTS - MAX DIFFERENCE VALUES")
+    print(f"{'='*150}")
+    
+    # Table header for diff values
+    diff_header = (f"{'Edge':<8} {'Ti Max Diff':<15} {'Tj Max Diff':<15} {'Gij Max Diff':<15} "
+                   f"{'Ji Max Diff':<15} {'Jj Max Diff':<15} {'Jz Max Diff':<15} {'Coords Max Diff':<15}")
+    print(diff_header)
+    print("-" * 150)
+    
+    # Table rows for diff values
+    for result in results:
+        edge_str = str(result.edge_idx)
+        
+        ti_diff_str = format_diff_value(result.ti_max_diff)
+        tj_diff_str = format_diff_value(result.tj_max_diff)
+        gij_diff_str = format_diff_value(result.gij_max_diff)
+        ji_diff_str = format_diff_value(result.ji_max_diff)
+        jj_diff_str = format_diff_value(result.jj_max_diff)
+        jz_diff_str = format_diff_value(result.jz_max_diff)
+        coords_diff_str = format_diff_value(result.coords_max_diff)
+        
+        diff_row = (f"{edge_str:<8} {ti_diff_str:<15} {tj_diff_str:<15} {gij_diff_str:<15} "
+                    f"{ji_diff_str:<15} {jj_diff_str:<15} {jz_diff_str:<15} {coords_diff_str:<15}")
+        print(diff_row)
+    
+    print("=" * 150)
 
 
 def print_statistics_table(results: List[EdgeComparisonResult], bin_dir: str = None, frame_num: int = None) -> None:
