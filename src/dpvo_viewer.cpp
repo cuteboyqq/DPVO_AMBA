@@ -547,10 +547,10 @@ void DPVOViewer::drawPoses()
             glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
         }
         
-        // Camera position (tip of pyramid)
+        // Camera position (pyramid tip at back)
         Eigen::Vector3f tip(cam_x, cam_y, cam_z);
         
-        // Base center is in front of camera (forward direction)
+        // Square face is in front of camera (forward direction)
         Eigen::Vector3f base_center = tip + forward * pyramid_height;
         
         // Base square corners
@@ -985,8 +985,8 @@ void DPVOViewer::drawPoses_fake()
         }
         
         // Draw camera as a square pyramid (frustum) to show position and orientation
-        // Pyramid: tip at camera position, base square in front of camera
-        // Camera looks in -Z direction in camera frame, so base is at -Z in camera frame
+        // Pyramid: square face in front (forward direction), tip at camera position (behind)
+        // Camera looks in forward direction, so square face is offset forward
         
         // Normalize direction vectors (only if not using fake values, fake values are already normalized)
         if (!use_fake) {
@@ -999,10 +999,10 @@ void DPVOViewer::drawPoses_fake()
         const float pyramid_base_size = 0.01f;  // Size of pyramid base (reduced for better visibility)
         const float pyramid_height = 0.02f;      // Distance from tip to base (reduced for better visibility)
         
-        // Camera position (tip of pyramid)
+        // Camera position (pyramid tip at back)
         Eigen::Vector3f tip(cam_x, cam_y, cam_z);
         
-        // Base center is in front of camera (forward direction)
+        // Square face is in front of camera (forward direction)
         Eigen::Vector3f base_center = tip + forward * pyramid_height;
         
         // Base square corners

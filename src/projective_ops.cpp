@@ -1,6 +1,7 @@
 #include "projective_ops.hpp"
 #include "ba_file_io.hpp"
 #include "target_frame.hpp"
+#include "patch_graph.hpp"  // For PatchGraph::N
 #include <algorithm>
 #include <cmath>
 #include <spdlog/spdlog.h>
@@ -370,8 +371,9 @@ void transformWithJacobians(
         int center_idx = (P / 2) * P + (P / 2);  // Center pixel index in P×P patch
         int patch_base_idx = ((i * M + patch_idx) * 3 + 0) * P * P + center_idx;
         
-        // Validate patch index bounds (safety check - reasonable bounds)
-        if (i < 0 || i >= 100 || patch_idx < 0 || patch_idx >= M) {
+        // Validate patch index bounds (safety check - use PatchGraph::N instead of hardcoded 100)
+        // PatchGraph::N is now 4096, so we need to check against the actual buffer size
+        if (i < 0 || i >= PatchGraph::N || patch_idx < 0 || patch_idx >= M) {
             // Invalid frame or patch index - set coordinates to NaN to mark as invalid
             for (int y = 0; y < P; y++) {
                 for (int x = 0; x < P; x++) {

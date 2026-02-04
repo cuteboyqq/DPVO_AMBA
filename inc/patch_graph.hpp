@@ -2,7 +2,7 @@
 #include "se.hpp"
 #include <cstdint>
 
-constexpr int BUFFER_SIZE = 36;
+constexpr int BUFFER_SIZE = 4096;
 constexpr int PATCHES_PER_FRAME = 4;
 constexpr int PATCH_SIZE = 3;
 constexpr int MAX_EDGES = 360;

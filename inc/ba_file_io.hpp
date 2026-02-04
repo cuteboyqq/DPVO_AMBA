@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 #include "eigen_common.h"  // Provides Eigen types (Vector3f, Quaternionf, etc.)
-#include "se.hpp"
+#include "se.hpp"  // Changed from se3.h to se.hpp to match codebase
 #include "logger.hpp"
 
 /**
@@ -462,6 +462,158 @@ inline bool save_eigen_matrix(const std::string& filename, const MatrixType& mat
     }
     file.close();
     if (logger) logger->info("Saved Eigen matrix ({}x{}) to {}", matrix.rows(), matrix.cols(), filename);
+    return true;
+}
+
+/**
+ * Save timestamps to binary file [N] (int64_t)
+ * @param filename Output filename
+ * @param tstamps Array of timestamps
+ * @param N Number of frames
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_timestamps(const std::string& filename, const int64_t* tstamps, int N,
+                           std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    file.write(reinterpret_cast<const char*>(tstamps), sizeof(int64_t) * N);
+    file.close();
+    if (logger) logger->info("Saved {} timestamps to {}", N, filename);
+    return true;
+}
+
+/**
+ * Save colors to binary file [N, M, 3] (uint8_t)
+ * @param filename Output filename
+ * @param colors 3D array colors[frame][patch][channel]
+ * @param N Number of frames
+ * @param M Number of patches per frame
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename ColorArray>
+inline bool save_colors(const std::string& filename, const ColorArray& colors, int N, int M,
+                       std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < M; j++) {
+            for (int c = 0; c < 3; c++) {
+                uint8_t val = colors[i][j][c];
+                file.write(reinterpret_cast<const char*>(&val), sizeof(uint8_t));
+            }
+        }
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved colors [{}*{}, 3] to {}", N, M, filename);
+    return true;
+}
+
+/**
+ * Save m_index array to binary file [N, M] (int32)
+ * @param filename Output filename
+ * @param index 2D array index[frame][patch]
+ * @param N Number of frames
+ * @param M Number of patches per frame
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+template<typename IndexArray>
+inline bool save_index(const std::string& filename, const IndexArray& index, int N, int M,
+                      std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    for (int i = 0; i < N; i++) {
+        for (int j = 0; j < M; j++) {
+            int32_t val = static_cast<int32_t>(index[i][j]);
+            file.write(reinterpret_cast<const char*>(&val), sizeof(int32_t));
+        }
+    }
+    
+    file.close();
+    if (logger) logger->info("Saved index [{}*{}] to {}", N, M, filename);
+    return true;
+}
+
+/**
+ * Save m_ix array to binary file [N*M] (int32)
+ * @param filename Output filename
+ * @param ix Array of frame indices for patches
+ * @param size Number of elements (N*M)
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_ix(const std::string& filename, const int* ix, int size,
+                   std::shared_ptr<spdlog::logger> logger = nullptr) {
+    return save_int32_array(filename, reinterpret_cast<const int32_t*>(ix), size, logger);
+}
+
+/**
+ * Save keyframe metadata to text file
+ * @param filename Output filename
+ * @param n_before Number of frames before keyframe
+ * @param m_before Number of patches before keyframe
+ * @param num_edges_before Number of edges before keyframe
+ * @param n_after Number of frames after keyframe
+ * @param m_after Number of patches after keyframe
+ * @param num_edges_after Number of edges after keyframe
+ * @param i Motion check frame i
+ * @param j Motion check frame j
+ * @param k Frame removed (k)
+ * @param motion Motion magnitude
+ * @param should_remove Whether frame was removed
+ * @param KEYFRAME_INDEX Config value
+ * @param KEYFRAME_THRESH Config value
+ * @param PATCH_LIFETIME Config value
+ * @param REMOVAL_WINDOW Config value
+ * @param logger Optional logger for status messages
+ * @return true if successful, false otherwise
+ */
+inline bool save_keyframe_metadata(const std::string& filename,
+                                   int n_before, int m_before, int num_edges_before,
+                                   int n_after, int m_after, int num_edges_after,
+                                   int i, int j, int k, float motion, bool should_remove,
+                                   int KEYFRAME_INDEX, int KEYFRAME_THRESH, int PATCH_LIFETIME, int REMOVAL_WINDOW,
+                                   std::shared_ptr<spdlog::logger> logger = nullptr) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        if (logger) logger->error("Failed to open {} for writing", filename);
+        return false;
+    }
+    
+    file << "n_before=" << n_before << "\n";
+    file << "m_before=" << m_before << "\n";
+    file << "num_edges_before=" << num_edges_before << "\n";
+    file << "n_after=" << n_after << "\n";
+    file << "m_after=" << m_after << "\n";
+    file << "num_edges_after=" << num_edges_after << "\n";
+    file << "i=" << i << "\n";
+    file << "j=" << j << "\n";
+    file << "k=" << k << "\n";
+    file << "motion=" << motion << "\n";
+    file << "should_remove=" << (should_remove ? 1 : 0) << "\n";
+    file << "KEYFRAME_INDEX=" << KEYFRAME_INDEX << "\n";
+    file << "KEYFRAME_THRESH=" << KEYFRAME_THRESH << "\n";
+    file << "PATCH_LIFETIME=" << PATCH_LIFETIME << "\n";
+    file << "REMOVAL_WINDOW=" << REMOVAL_WINDOW << "\n";
+    
+    file.close();
+    if (logger) {
+        logger->info("Saved keyframe metadata to {}", filename);
+    }
     return true;
 }
 

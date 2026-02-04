@@ -6,6 +6,7 @@
 #include "Eigen/Cholesky"
 #include "target_frame.hpp"  // Shared TARGET_FRAME constant
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -35,6 +36,347 @@ static std::string get_bin_file_path(const std::string& filename) {
     }
     
     return bin_dir + "/" + filename;
+}
+
+// =================================================================================================
+// BA Intermediate Value Saving Helper Functions
+// =================================================================================================
+
+// Helper function to get logger (for saving functions)
+static std::shared_ptr<spdlog::logger> get_ba_logger() {
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+        #ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+        #else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+        #endif
+    }
+    return logger;
+}
+
+// STEP 1: Save residuals, validity mask, and coords at center
+static void save_ba_step1(const float* r, const float* v, const float* coords, 
+                          int num_active, int P, int center_idx, 
+                          std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream r_file(get_bin_file_path("ba_step1_residuals.bin"), std::ios::binary);
+    std::ofstream v_file(get_bin_file_path("ba_step1_validity.bin"), std::ios::binary);
+    
+    // Extract coords at center that BA actually uses for residual computation
+    std::vector<float> coords_center_ba(num_active * 2);
+    for (int e = 0; e < num_active; e++) {
+        coords_center_ba[e * 2 + 0] = coords[e * 2 * P * P + 0 * P * P + center_idx];
+        coords_center_ba[e * 2 + 1] = coords[e * 2 * P * P + 1 * P * P + center_idx];
+    }
+    std::ofstream coords_center_file(get_bin_file_path("ba_step1_coords_center.bin"), std::ios::binary);
+    
+    if (r_file.is_open() && v_file.is_open() && coords_center_file.is_open()) {
+        if (logger) {
+            logger->info("BA: Saving STEP 1 residuals (first 3 edges):");
+            for (int e = 0; e < std::min(3, num_active); e++) {
+                logger->info("  Edge[{}]: coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f}), validity={:.1f}", 
+                            e, coords_center_ba[e * 2 + 0], coords_center_ba[e * 2 + 1],
+                            r[e * 2 + 0], r[e * 2 + 1], v[e]);
+            }
+        }
+        r_file.write(reinterpret_cast<const char*>(r), sizeof(float) * num_active * 2);
+        v_file.write(reinterpret_cast<const char*>(v), sizeof(float) * num_active);
+        coords_center_file.write(reinterpret_cast<const char*>(coords_center_ba.data()), sizeof(float) * num_active * 2);
+        r_file.close();
+        v_file.close();
+        coords_center_file.close();
+        if (logger) {
+            logger->info("BA: ✅ Successfully saved STEP 1 - residuals, validity mask, and coords at center");
+            logger->info("BA: File sizes - residuals: {} bytes, validity: {} bytes, coords_center: {} bytes",
+                         num_active * 2 * sizeof(float), num_active * sizeof(float), num_active * 2 * sizeof(float));
+        }
+    } else {
+        if (logger) {
+            logger->error("BA: ❌ Failed to open files for STEP 1 saving!");
+            logger->error("BA: r_file.is_open()={}, v_file.is_open()={}, coords_center_file.is_open()={}",
+                         r_file.is_open(), v_file.is_open(), coords_center_file.is_open());
+        }
+    }
+}
+
+// STEP 2: Save weighted Jacobians
+static void save_ba_step2(const std::vector<Eigen::Matrix<float, 6, 2>>& wJiT,
+                          const std::vector<Eigen::Matrix<float, 6, 2>>& wJjT,
+                          const std::vector<Eigen::Matrix<float, 1, 2>>& wJzT,
+                          const float* weights_masked,
+                          const float* Ji_center,
+                          const float* Jj_center,
+                          int num_active,
+                          std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream wJiT_file(get_bin_file_path("ba_step2_wJiT.bin"), std::ios::binary);
+    std::ofstream wJjT_file(get_bin_file_path("ba_step2_wJjT.bin"), std::ios::binary);
+    std::ofstream wJzT_file(get_bin_file_path("ba_step2_wJzT.bin"), std::ios::binary);
+    std::ofstream weights_masked_file(get_bin_file_path("ba_step2_weights_masked.bin"), std::ios::binary);
+    std::ofstream Ji_center_file(get_bin_file_path("ba_step2_Ji_center.bin"), std::ios::binary);
+    std::ofstream Jj_center_file(get_bin_file_path("ba_step2_Jj_center.bin"), std::ios::binary);
+    
+    if (wJiT_file.is_open() && wJjT_file.is_open() && wJzT_file.is_open() && 
+        weights_masked_file.is_open() && Ji_center_file.is_open() && Jj_center_file.is_open()) {
+        // Eigen matrices are column-major, but Python expects row-major
+        // Write row by row to match Python's expected format
+        for (int e = 0; e < num_active; e++) {
+            // Write wJiT[e] as [6, 2] in row-major order
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 2; j++) {
+                    float val = wJiT[e](i, j);
+                    wJiT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            // Write wJjT[e] as [6, 2] in row-major order
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 2; j++) {
+                    float val = wJjT[e](i, j);
+                    wJjT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            // Write wJzT[e] as [1, 2] in row-major order
+            for (int i = 0; i < 1; i++) {
+                for (int j = 0; j < 2; j++) {
+                    float val = wJzT[e](i, j);
+                    wJzT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+        }
+        weights_masked_file.write(reinterpret_cast<const char*>(weights_masked), sizeof(float) * num_active * 2);
+        // Save Ji_center and Jj_center for debugging (row-major: [num_active, 2, 6])
+        for (int e = 0; e < num_active; e++) {
+            for (int i = 0; i < 2; i++) {
+                for (int j = 0; j < 6; j++) {
+                    float val_ji = Ji_center[e * 2 * 6 + i * 6 + j];
+                    float val_jj = Jj_center[e * 2 * 6 + i * 6 + j];
+                    Ji_center_file.write(reinterpret_cast<const char*>(&val_ji), sizeof(float));
+                    Jj_center_file.write(reinterpret_cast<const char*>(&val_jj), sizeof(float));
+                }
+            }
+        }
+        wJiT_file.close();
+        wJjT_file.close();
+        wJzT_file.close();
+        weights_masked_file.close();
+        Ji_center_file.close();
+        Jj_center_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 2 - weighted Jacobians");
+    } else {
+        if (logger) {
+            logger->error("BA: ❌ Failed to open files for STEP 2 saving!");
+        }
+    }
+}
+
+// STEP 3: Save Hessian blocks
+static void save_ba_step3(const std::vector<Eigen::Matrix<float, 6, 6>>& Bii,
+                          const std::vector<Eigen::Matrix<float, 6, 6>>& Bij,
+                          const std::vector<Eigen::Matrix<float, 6, 6>>& Bji,
+                          const std::vector<Eigen::Matrix<float, 6, 6>>& Bjj,
+                          const std::vector<Eigen::Matrix<float, 6, 1>>& Eik,
+                          const std::vector<Eigen::Matrix<float, 6, 1>>& Ejk,
+                          int num_active,
+                          std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream Bii_file(get_bin_file_path("ba_step3_Bii.bin"), std::ios::binary);
+    std::ofstream Bij_file(get_bin_file_path("ba_step3_Bij.bin"), std::ios::binary);
+    std::ofstream Bji_file(get_bin_file_path("ba_step3_Bji.bin"), std::ios::binary);
+    std::ofstream Bjj_file(get_bin_file_path("ba_step3_Bjj.bin"), std::ios::binary);
+    std::ofstream Eik_file(get_bin_file_path("ba_step3_Eik.bin"), std::ios::binary);
+    std::ofstream Ejk_file(get_bin_file_path("ba_step3_Ejk.bin"), std::ios::binary);
+    
+    if (Bii_file.is_open() && Bij_file.is_open() && Bji_file.is_open() && 
+        Bjj_file.is_open() && Eik_file.is_open() && Ejk_file.is_open()) {
+        // Eigen matrices are column-major, but Python expects row-major
+        // Write row by row to match Python's expected format
+        for (int e = 0; e < num_active; e++) {
+            // Write Bii[e] as [6, 6] in row-major order
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    float val = Bii[e](i, j);
+                    Bii_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            // Write Bij[e] as [6, 6] in row-major order
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    float val = Bij[e](i, j);
+                    Bij_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            // Write Bji[e] as [6, 6] in row-major order
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    float val = Bji[e](i, j);
+                    Bji_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            // Write Bjj[e] as [6, 6] in row-major order
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    float val = Bjj[e](i, j);
+                    Bjj_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+                }
+            }
+            // Write Eik[e] as [6, 1] in row-major order (column vector, so just write column)
+            for (int i = 0; i < 6; i++) {
+                float val = Eik[e](i, 0);
+                Eik_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+            }
+            // Write Ejk[e] as [6, 1] in row-major order (column vector, so just write column)
+            for (int i = 0; i < 6; i++) {
+                float val = Ejk[e](i, 0);
+                Ejk_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
+            }
+        }
+        Bii_file.close();
+        Bij_file.close();
+        Bji_file.close();
+        Bjj_file.close();
+        Eik_file.close();
+        Ejk_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 3 - Hessian blocks");
+    } else {
+        if (logger) {
+            logger->error("BA: ❌ Failed to open files for STEP 3 saving!");
+        }
+    }
+}
+
+// STEP 4: Save gradients
+static void save_ba_step4(const std::vector<Eigen::Matrix<float, 6, 1>>& vi,
+                          const std::vector<Eigen::Matrix<float, 6, 1>>& vj,
+                          const float* w_vec,
+                          int num_active,
+                          std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream vi_file(get_bin_file_path("ba_step4_vi.bin"), std::ios::binary);
+    std::ofstream vj_file(get_bin_file_path("ba_step4_vj.bin"), std::ios::binary);
+    std::ofstream w_vec_file(get_bin_file_path("ba_step4_w_vec.bin"), std::ios::binary);
+    
+    if (vi_file.is_open() && vj_file.is_open() && w_vec_file.is_open()) {
+        for (int e = 0; e < num_active; e++) {
+            vi_file.write(reinterpret_cast<const char*>(vi[e].data()), sizeof(float) * 6);
+            vj_file.write(reinterpret_cast<const char*>(vj[e].data()), sizeof(float) * 6);
+        }
+        w_vec_file.write(reinterpret_cast<const char*>(w_vec), sizeof(float) * num_active);
+        vi_file.close();
+        vj_file.close();
+        w_vec_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 4 - gradients");
+    } else {
+        if (logger) {
+            logger->error("BA: ❌ Failed to open files for STEP 4 saving!");
+        }
+    }
+}
+
+// STEP 9: Save assembled Hessian B
+static void save_ba_step9(const Eigen::MatrixXf& B, int n_adjusted, std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream B_file(get_bin_file_path("ba_step9_B.bin"), std::ios::binary);
+    if (B_file.is_open()) {
+        B_file.write(reinterpret_cast<const char*>(B.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
+        B_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 9 - assembled Hessian B (size: {}x{})", 
+                                 6 * n_adjusted, 6 * n_adjusted);
+    } else {
+        if (logger) logger->error("BA: ❌ Failed to open file for STEP 9 saving!");
+    }
+}
+
+// STEP 10: Save pose-structure coupling E
+static void save_ba_step10(const Eigen::MatrixXf& E, int n_adjusted, int m, std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream E_file(get_bin_file_path("ba_step10_E.bin"), std::ios::binary);
+    if (E_file.is_open()) {
+        E_file.write(reinterpret_cast<const char*>(E.data()), sizeof(float) * 6 * n_adjusted * m);
+        E_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 10 - pose-structure coupling E (size: {}x{})", 
+                                 6 * n_adjusted, m);
+    } else {
+        if (logger) logger->error("BA: ❌ Failed to open file for STEP 10 saving!");
+    }
+}
+
+// STEP 11: Save structure Hessian C
+static void save_ba_step11_C(const Eigen::VectorXf& C, int m, std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream C_file(get_bin_file_path("ba_step11_C.bin"), std::ios::binary);
+    if (C_file.is_open()) {
+        C_file.write(reinterpret_cast<const char*>(C.data()), sizeof(float) * m);
+        C_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 11 - structure Hessian C (size: {})", m);
+    } else {
+        if (logger) logger->error("BA: ❌ Failed to open file for STEP 11 C saving!");
+    }
+}
+
+// STEP 11: Save assembled gradients
+static void save_ba_step11_gradients(const Eigen::VectorXf& v_grad, const Eigen::VectorXf& w_grad, 
+                                      int n_adjusted, int m, std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream v_grad_file(get_bin_file_path("ba_step11_v_grad.bin"), std::ios::binary);
+    std::ofstream w_grad_file(get_bin_file_path("ba_step11_w_grad.bin"), std::ios::binary);
+    if (v_grad_file.is_open() && w_grad_file.is_open()) {
+        v_grad_file.write(reinterpret_cast<const char*>(v_grad.data()), sizeof(float) * 6 * n_adjusted);
+        w_grad_file.write(reinterpret_cast<const char*>(w_grad.data()), sizeof(float) * m);
+        v_grad_file.close();
+        w_grad_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 11 - assembled gradients v_grad (size: {}) and w_grad (size: {})", 
+                                 6 * n_adjusted, m);
+    } else {
+        if (logger) logger->error("BA: ❌ Failed to open files for STEP 11 gradients saving!");
+    }
+}
+
+// STEP 13: Save Q (inverse structure Hessian)
+static void save_ba_step13(const Eigen::VectorXf& Q, int m, std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream Q_file(get_bin_file_path("ba_step13_Q.bin"), std::ios::binary);
+    if (Q_file.is_open()) {
+        Q_file.write(reinterpret_cast<const char*>(Q.data()), sizeof(float) * m);
+        Q_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 13 - Q (inverse structure Hessian, size: {})", m);
+    } else {
+        if (logger) logger->error("BA: ❌ Failed to open file for STEP 13 saving!");
+    }
+}
+
+// STEP 14: Save Schur complement S and RHS y
+static void save_ba_step14(const Eigen::MatrixXf& S, const Eigen::VectorXf& y, 
+                           int n_adjusted, std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream S_file(get_bin_file_path("ba_step14_S.bin"), std::ios::binary);
+    std::ofstream y_file(get_bin_file_path("ba_step14_y.bin"), std::ios::binary);
+    if (S_file.is_open() && y_file.is_open()) {
+        S_file.write(reinterpret_cast<const char*>(S.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
+        y_file.write(reinterpret_cast<const char*>(y.data()), sizeof(float) * 6 * n_adjusted);
+        S_file.close();
+        y_file.close();
+        if (logger) logger->info("BA: ✅ Successfully saved STEP 14 - Schur complement S (size: {}x{}) and RHS y (size: {})", 
+                                  6 * n_adjusted, 6 * n_adjusted, 6 * n_adjusted);
+    } else {
+        if (logger) logger->error("BA: ❌ Failed to open files for STEP 14 saving!");
+    }
+}
+
+// STEP 15-16: Save solution dX and dZ
+static void save_ba_step15_16(const Eigen::VectorXf& dX, const Eigen::VectorXf& dZ, 
+                               std::shared_ptr<spdlog::logger> logger) {
+    std::ofstream dX_file(get_bin_file_path("ba_step15_dX.bin"), std::ios::binary);
+    std::ofstream dZ_file(get_bin_file_path("ba_step16_dZ.bin"), std::ios::binary);
+    if (dX_file.is_open() && dZ_file.is_open()) {
+        dX_file.write(reinterpret_cast<const char*>(dX.data()), sizeof(float) * dX.size());
+        dZ_file.write(reinterpret_cast<const char*>(dZ.data()), sizeof(float) * dZ.size());
+        dX_file.close();
+        dZ_file.close();
+        if (logger) {
+            logger->info("BA: ✅ Successfully saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", 
+                         dX.size(), dZ.size());
+            logger->info("BA: File sizes - dX: {} bytes, dZ: {} bytes", 
+                         dX.size() * sizeof(float), dZ.size() * sizeof(float));
+        }
+    } else {
+        if (logger) {
+            logger->error("BA: ❌ Failed to open files for STEP 15-16 saving!");
+            logger->error("BA: dX_file.is_open()={}, dZ_file.is_open()={}", 
+                         dX_file.is_open(), dZ_file.is_open());
+        }
+    }
 }
 
 // =================================================================================================
@@ -270,44 +612,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 1: Residuals and validity mask
     if (save_intermediates) {
-        std::ofstream r_file(get_bin_file_path("ba_step1_residuals.bin"), std::ios::binary);
-        std::ofstream v_file(get_bin_file_path("ba_step1_validity.bin"), std::ios::binary);
-        // Also save coords at center that BA actually uses for residual computation
-        std::vector<float> coords_center_ba(num_active * 2);
-        for (int e = 0; e < num_active; e++) {
-            coords_center_ba[e * 2 + 0] = coords[e * 2 * P * P + 0 * P * P + center_idx];
-            coords_center_ba[e * 2 + 1] = coords[e * 2 * P * P + 1 * P * P + center_idx];
-        }
-        std::ofstream coords_center_file(get_bin_file_path("ba_step1_coords_center.bin"), std::ios::binary);
-        
-        if (r_file.is_open() && v_file.is_open() && coords_center_file.is_open()) {
-            // Debug: Log what we're saving (first 3 edges)
-            if (logger) {
-                logger->info("BA: Saving STEP 1 residuals (first 3 edges):");
-                for (int e = 0; e < std::min(3, num_active); e++) {
-                    logger->info("  Edge[{}]: coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f}), validity={:.1f}", 
-                                e, coords_center_ba[e * 2 + 0], coords_center_ba[e * 2 + 1],
-                                r[e * 2 + 0], r[e * 2 + 1], v[e]);
-                }
-            }
-            r_file.write(reinterpret_cast<const char*>(r.data()), sizeof(float) * num_active * 2);
-            v_file.write(reinterpret_cast<const char*>(v.data()), sizeof(float) * num_active);
-            coords_center_file.write(reinterpret_cast<const char*>(coords_center_ba.data()), sizeof(float) * num_active * 2);
-            r_file.close();
-            v_file.close();
-            coords_center_file.close();
-            if (logger) {
-                logger->info("BA: ✅ Successfully saved STEP 1 - residuals, validity mask, and coords at center");
-                logger->info("BA: File sizes - residuals: {} bytes, validity: {} bytes, coords_center: {} bytes",
-                             num_active * 2 * sizeof(float), num_active * sizeof(float), num_active * 2 * sizeof(float));
-            }
-        } else {
-            if (logger) {
-                logger->error("BA: ❌ Failed to open files for STEP 1 saving!");
-                logger->error("BA: r_file.is_open()={}, v_file.is_open()={}, coords_center_file.is_open()={}",
-                             r_file.is_open(), v_file.is_open(), coords_center_file.is_open());
-            }
-        }
+        save_ba_step1(r.data(), v.data(), coords.data(), num_active, P, center_idx, logger);
     } else {
         if (logger && m_counter % 10 == 0) {  // Log every 10 frames to avoid spam
             logger->debug("BA: Skipping STEP 1 save (m_counter={} != TARGET_FRAME={})", m_counter, TARGET_FRAME);
@@ -424,121 +729,12 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 2: Weighted Jacobians
     if (save_intermediates) {
-        std::ofstream wJiT_file(get_bin_file_path("ba_step2_wJiT.bin"), std::ios::binary);
-        std::ofstream wJjT_file(get_bin_file_path("ba_step2_wJjT.bin"), std::ios::binary);
-        std::ofstream wJzT_file(get_bin_file_path("ba_step2_wJzT.bin"), std::ios::binary);
-        std::ofstream weights_masked_file(get_bin_file_path("ba_step2_weights_masked.bin"), std::ios::binary);
-        std::ofstream Ji_center_file(get_bin_file_path("ba_step2_Ji_center.bin"), std::ios::binary);
-        std::ofstream Jj_center_file(get_bin_file_path("ba_step2_Jj_center.bin"), std::ios::binary);
-        if (wJiT_file.is_open() && wJjT_file.is_open() && wJzT_file.is_open() && weights_masked_file.is_open() &&
-            Ji_center_file.is_open() && Jj_center_file.is_open()) {
-            // Eigen matrices are column-major, but Python expects row-major
-            // Write row by row to match Python's expected format
-            for (int e = 0; e < num_active; e++) {
-                // Write wJiT[e] as [6, 2] in row-major order
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 2; j++) {
-                        float val = wJiT[e](i, j);
-                        wJiT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-                // Write wJjT[e] as [6, 2] in row-major order
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 2; j++) {
-                        float val = wJjT[e](i, j);
-                        wJjT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-                // Write wJzT[e] as [1, 2] in row-major order
-                for (int i = 0; i < 1; i++) {
-                    for (int j = 0; j < 2; j++) {
-                        float val = wJzT[e](i, j);
-                        wJzT_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-            }
-            weights_masked_file.write(reinterpret_cast<const char*>(weights_masked.data()), sizeof(float) * num_active * 2);
-            // Save Ji_center and Jj_center for debugging (row-major: [num_active, 2, 6])
-            for (int e = 0; e < num_active; e++) {
-                for (int i = 0; i < 2; i++) {
-                    for (int j = 0; j < 6; j++) {
-                        float val_ji = Ji_center[e * 2 * 6 + i * 6 + j];
-                        float val_jj = Jj_center[e * 2 * 6 + i * 6 + j];
-                        Ji_center_file.write(reinterpret_cast<const char*>(&val_ji), sizeof(float));
-                        Jj_center_file.write(reinterpret_cast<const char*>(&val_jj), sizeof(float));
-                    }
-                }
-            }
-            wJiT_file.close();
-            wJjT_file.close();
-            wJzT_file.close();
-            weights_masked_file.close();
-            Ji_center_file.close();
-            Jj_center_file.close();
-            if (logger) logger->info("BA: Saved STEP 2 - weighted Jacobians and masked weights");
-        }
+        save_ba_step2(wJiT, wJjT, wJzT, weights_masked.data(), Ji_center.data(), Jj_center.data(), num_active, logger);
     }
     
     // Save STEP 3: Hessian blocks
     if (save_intermediates) {
-        std::ofstream Bii_file(get_bin_file_path("ba_step3_Bii.bin"), std::ios::binary);
-        std::ofstream Bij_file(get_bin_file_path("ba_step3_Bij.bin"), std::ios::binary);
-        std::ofstream Bji_file(get_bin_file_path("ba_step3_Bji.bin"), std::ios::binary);
-        std::ofstream Bjj_file(get_bin_file_path("ba_step3_Bjj.bin"), std::ios::binary);
-        std::ofstream Eik_file(get_bin_file_path("ba_step3_Eik.bin"), std::ios::binary);
-        std::ofstream Ejk_file(get_bin_file_path("ba_step3_Ejk.bin"), std::ios::binary);
-        if (Bii_file.is_open() && Bij_file.is_open() && Bji_file.is_open() && 
-            Bjj_file.is_open() && Eik_file.is_open() && Ejk_file.is_open()) {
-            // Eigen matrices are column-major, but Python expects row-major
-            // Write row by row to match Python's expected format
-            for (int e = 0; e < num_active; e++) {
-                // Write Bii[e] as [6, 6] in row-major order
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 6; j++) {
-                        float val = Bii[e](i, j);
-                        Bii_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-                // Write Bij[e] as [6, 6] in row-major order
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 6; j++) {
-                        float val = Bij[e](i, j);
-                        Bij_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-                // Write Bji[e] as [6, 6] in row-major order
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 6; j++) {
-                        float val = Bji[e](i, j);
-                        Bji_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-                // Write Bjj[e] as [6, 6] in row-major order
-                for (int i = 0; i < 6; i++) {
-                    for (int j = 0; j < 6; j++) {
-                        float val = Bjj[e](i, j);
-                        Bjj_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                    }
-                }
-                // Write Eik[e] as [6, 1] in row-major order (column vector, so just write column)
-                for (int i = 0; i < 6; i++) {
-                    float val = Eik[e](i, 0);
-                    Eik_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                }
-                // Write Ejk[e] as [6, 1] in row-major order (column vector, so just write column)
-                for (int i = 0; i < 6; i++) {
-                    float val = Ejk[e](i, 0);
-                    Ejk_file.write(reinterpret_cast<const char*>(&val), sizeof(float));
-                }
-            }
-            Bii_file.close();
-            Bij_file.close();
-            Bji_file.close();
-            Bjj_file.close();
-            Eik_file.close();
-            Ejk_file.close();
-            if (logger) logger->info("BA: Saved STEP 3 - Hessian blocks");
-        }
+        save_ba_step3(Bii, Bij, Bji, Bjj, Eik, Ejk, num_active, logger);
     }
 
     // ---------------------------------------------------------
@@ -564,20 +760,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 4: Gradients
     if (save_intermediates) {
-        std::ofstream vi_file(get_bin_file_path("ba_step4_vi.bin"), std::ios::binary);
-        std::ofstream vj_file(get_bin_file_path("ba_step4_vj.bin"), std::ios::binary);
-        std::ofstream w_vec_file(get_bin_file_path("ba_step4_w_vec.bin"), std::ios::binary);
-        if (vi_file.is_open() && vj_file.is_open() && w_vec_file.is_open()) {
-            for (int e = 0; e < num_active; e++) {
-                vi_file.write(reinterpret_cast<const char*>(vi[e].data()), sizeof(float) * 6);
-                vj_file.write(reinterpret_cast<const char*>(vj[e].data()), sizeof(float) * 6);
-            }
-            w_vec_file.write(reinterpret_cast<const char*>(w_vec.data()), sizeof(float) * num_active);
-            vi_file.close();
-            vj_file.close();
-            w_vec_file.close();
-            if (logger) logger->info("BA: Saved STEP 4 - gradients");
-        }
+        save_ba_step4(vi, vj, w_vec.data(), num_active, logger);
     }
 
     // ---------------------------------------------------------
@@ -736,12 +919,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 9: Assembled Hessian B
     if (save_intermediates) {
-        std::ofstream B_file(get_bin_file_path("ba_step9_B.bin"), std::ios::binary);
-        if (B_file.is_open()) {
-            B_file.write(reinterpret_cast<const char*>(B.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
-            B_file.close();
-            if (logger) logger->info("BA: Saved STEP 9 - assembled Hessian B (size: {}x{})", 6 * n_adjusted, 6 * n_adjusted);
-        }
+        save_ba_step9(B, n_adjusted, logger);
     }
 
     // ---------------------------------------------------------
@@ -838,12 +1016,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 10: Pose-structure coupling E
     if (save_intermediates) {
-        std::ofstream E_file(get_bin_file_path("ba_step10_E.bin"), std::ios::binary);
-        if (E_file.is_open()) {
-            E_file.write(reinterpret_cast<const char*>(E.data()), sizeof(float) * 6 * n_adjusted * m);
-            E_file.close();
-            if (logger) logger->info("BA: Saved STEP 10 - pose-structure coupling E (size: {}x{})", 6 * n_adjusted, m);
-        }
+        save_ba_step10(E, n_adjusted, m, logger);
     }
 
     // ---------------------------------------------------------
@@ -868,12 +1041,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 11: Structure Hessian C
     if (save_intermediates) {
-        std::ofstream C_file(get_bin_file_path("ba_step11_C.bin"), std::ios::binary);
-        if (C_file.is_open()) {
-            C_file.write(reinterpret_cast<const char*>(C.data()), sizeof(float) * m);
-            C_file.close();
-            if (logger) logger->info("BA: Saved STEP 11 - structure Hessian C (size: {})", m);
-        }
+        save_ba_step11_C(C, m, logger);
     }
 
     // ---------------------------------------------------------
@@ -970,15 +1138,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 11: Assembled gradients
     if (save_intermediates) {
-        std::ofstream v_grad_file(get_bin_file_path("ba_step11_v_grad.bin"), std::ios::binary);
-        std::ofstream w_grad_file(get_bin_file_path("ba_step11_w_grad.bin"), std::ios::binary);
-        if (v_grad_file.is_open() && w_grad_file.is_open()) {
-            v_grad_file.write(reinterpret_cast<const char*>(v_grad.data()), sizeof(float) * 6 * n_adjusted);
-            w_grad_file.write(reinterpret_cast<const char*>(w_grad.data()), sizeof(float) * m);
-            v_grad_file.close();
-            w_grad_file.close();
-            if (logger) logger->info("BA: Saved STEP 11 - assembled gradients v_grad (size: {}) and w_grad (size: {})", 6 * n_adjusted, m);
-        }
+        save_ba_step11_gradients(v_grad, w_grad, n_adjusted, m, logger);
     }
     
     // Levenberg-Marquardt damping
@@ -987,12 +1147,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 13: Q (inverse structure Hessian)
     if (save_intermediates) {
-        std::ofstream Q_file(get_bin_file_path("ba_step13_Q.bin"), std::ios::binary);
-        if (Q_file.is_open()) {
-            Q_file.write(reinterpret_cast<const char*>(Q.data()), sizeof(float) * m);
-            Q_file.close();
-            if (logger) logger->info("BA: Saved STEP 13 - Q (inverse structure Hessian, size: {})", m);
-        }
+        save_ba_step13(Q, m, logger);
     }
 
     // Schur complement: S = B - E * C^-1 * E^T
@@ -1004,16 +1159,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 14: Schur complement S and RHS y
     if (save_intermediates) {
-        std::ofstream S_file(get_bin_file_path("ba_step14_S.bin"), std::ios::binary);
-        std::ofstream y_file(get_bin_file_path("ba_step14_y.bin"), std::ios::binary);
-        if (S_file.is_open() && y_file.is_open()) {
-            S_file.write(reinterpret_cast<const char*>(S.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
-            y_file.write(reinterpret_cast<const char*>(y.data()), sizeof(float) * 6 * n_adjusted);
-            S_file.close();
-            y_file.close();
-            if (logger) logger->info("BA: Saved STEP 14 - Schur complement S (size: {}x{}) and RHS y (size: {})", 
-                                    6 * n_adjusted, 6 * n_adjusted, 6 * n_adjusted);
-        }
+        save_ba_step14(S, y, n_adjusted, logger);
     }
     
     if (logger) {
@@ -1079,25 +1225,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             
             // Save STEP 15-16: Solution dX and dZ
             if (save_intermediates) {
-                std::ofstream dX_file(get_bin_file_path("ba_step15_dX.bin"), std::ios::binary);
-                std::ofstream dZ_file(get_bin_file_path("ba_step16_dZ.bin"), std::ios::binary);
-                if (dX_file.is_open() && dZ_file.is_open()) {
-                    dX_file.write(reinterpret_cast<const char*>(dX.data()), sizeof(float) * dX.size());
-                    dZ_file.write(reinterpret_cast<const char*>(dZ.data()), sizeof(float) * dZ.size());
-                    dX_file.close();
-                    dZ_file.close();
-                    if (logger) {
-                        logger->info("BA: ✅ Successfully saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", dX.size(), dZ.size());
-                        logger->info("BA: File sizes - dX: {} bytes, dZ: {} bytes", 
-                                     dX.size() * sizeof(float), dZ.size() * sizeof(float));
-                    }
-                } else {
-                    if (logger) {
-                        logger->error("BA: ❌ Failed to open files for STEP 15-16 saving!");
-                        logger->error("BA: dX_file.is_open()={}, dZ_file.is_open()={}", 
-                                     dX_file.is_open(), dZ_file.is_open());
-                    }
-                }
+                save_ba_step15_16(dX, dZ, logger);
             }
         }
     }

@@ -65,8 +65,12 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
       m_is_initialized(false),
       m_DIM(384),    // same as NET_DIM
       m_P(PatchGraph::P),
-      m_pmem(cfg.BUFFER_SIZE),
-      m_mem(cfg.BUFFER_SIZE),
+      // Ring buffers for feature maps (imap, gmap, fmap1, fmap2)
+      // These use modulo indexing, so they can be smaller than BUFFER_SIZE
+      // Python uses pmem=mem=36 regardless of BUFFER_SIZE
+      // For BUFFER_SIZE=4096, we keep ring buffers at a reasonable size to avoid huge memory allocation
+      m_pmem(std::min(cfg.BUFFER_SIZE, 128)),  // Ring buffer for imap/gmap (max 128 frames)
+      m_mem(std::min(cfg.BUFFER_SIZE, 128)),   // Ring buffer for fmap1/fmap2 (max 128 frames)
       m_patchifier(3, 384),  // Initialize with patch_size=3, DIM=384 (matches INet output channels)
       m_currentTimestamp(0),
       m_pg()  // Explicitly initialize PatchGraph (calls reset() which sets m_n=0)
@@ -647,6 +651,17 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
         
         for (int c = 0; c < 3; c++)
             m_pg.m_colors[n_use][i][c] = clr[i * 3 + c];
+        
+        // CRITICAL: Set m_index[frame][patch] to the source frame index
+        // When a patch is first created in frame n_use, its source frame is n_use itself
+        // Python: index_[frame][patch] stores source frame index (initially frame)
+        // This is used in appendFactors: m_ii[e] = m_index[frame][patch]
+        m_pg.m_index[n_use][i] = n_use;
+        
+        // CRITICAL: Set m_ix[kk] to the current frame index
+        // m_ix[kk] stores which frame patch kk belongs to (for Phase C edge removal)
+        int kk = n_use * M + i;
+        m_pg.m_ix[kk] = n_use;
     }
     if (logger) logger->info("DPVO::runAfterPatchify: Store patches completed");
 
@@ -877,7 +892,10 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     
     // SAFETY CHECK: If buffer is getting full, proactively call keyframe() to remove frames
     // This prevents buffer overflow when motion is consistently high
-    const int PROACTIVE_THRESHOLD = PatchGraph::N - 3;  // Start removing when n >= 33 (buffer size 36)
+    // CRITICAL: Cap sliding window size to reasonable value (36-50 frames) regardless of BUFFER_SIZE
+    // BUFFER_SIZE is for ring buffers (m_imap, m_gmap), not sliding window size
+    const int MAX_SLIDING_WINDOW_SIZE = 50;  // Maximum reasonable sliding window size
+    const int PROACTIVE_THRESHOLD = MAX_SLIDING_WINDOW_SIZE - 3;  // Start removing when n >= 47
     if (n >= PROACTIVE_THRESHOLD && m_is_initialized) {
         auto logger = spdlog::get("dpvo");
         if (logger) {
@@ -1771,31 +1789,7 @@ void DPVO::update()
     bool save_ba_inputs = (m_counter == TARGET_FRAME);
     
     if (save_ba_inputs) {
-        if (logger) {
-            logger->info("DPVO::update: Saving BA inputs for frame {} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
-                        TARGET_FRAME, m_counter, m_pg.m_n);
-        }
-        
-        const int N = m_pg.m_n;
-        const int M = m_cfg.PATCHES_PER_FRAME;
-        const int P = m_P;
-        
-        // Save BA inputs using utility functions
-        ba_file_io::save_poses(get_bin_file_path("ba_poses.bin"), m_pg.m_poses, N, logger);
-        ba_file_io::save_patches(get_bin_file_path("ba_patches.bin"), m_pg.m_patches, N, M, P, logger);
-        ba_file_io::save_intrinsics(get_bin_file_path("ba_intrinsics.bin"), m_pg.m_intrinsics, N, logger);
-        ba_file_io::save_edge_indices(get_bin_file_path("ba_ii.bin"), get_bin_file_path("ba_jj.bin"), get_bin_file_path("ba_kk.bin"), 
-                                      m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
-        ba_file_io::save_reprojected_coords_center(get_bin_file_path("ba_reprojected_coords.bin"), coords.data(), 
-                                                   num_active, P, logger);
-        ba_file_io::save_targets(get_bin_file_path("ba_targets.bin"), m_pg.m_target, num_active, logger);
-        ba_file_io::save_weights(get_bin_file_path("ba_weights.bin"), m_pg.m_weight, num_active, logger);
-        
-        // Save metadata
-        const int CORR_DIM = 882;  // 2*49*P*P = 2*49*3*3 = 882 for P=3
-        const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
-        ba_file_io::save_metadata(get_bin_file_path("test_metadata.txt"), num_active, MAX_EDGE, m_DIM, 
-                                  CORR_DIM, M, P, N, logger);
+        save_ba_inputs_to_bin_files(num_active, coords.data());
     }
     
     try {
@@ -1941,8 +1935,49 @@ void DPVO::update()
 //     }
 // }
 void DPVO::keyframe() {
-
+    // Save keyframe inputs if at target frame
+    bool save_keyframe_data = (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME);
+    auto logger = spdlog::get("dpvo");
+    
     int n = m_pg.m_n;
+    int m_before = m_pg.m_m;
+    int num_edges_before = m_pg.m_num_edges;
+    
+    if (save_keyframe_data && logger) {
+        logger->info("DPVO::keyframe: Saving keyframe inputs for frame {} (n={}, m={}, num_edges={})", 
+                    TARGET_FRAME, n, m_before, num_edges_before);
+    }
+    
+    // Save keyframe inputs
+    if (save_keyframe_data) {
+        const int M = PatchGraph::M;
+        const int P = PatchGraph::P;
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        
+        // Save state before keyframe
+        ba_file_io::save_poses(get_bin_file_path("keyframe_poses_before_frame" + frame_suffix + ".bin"), 
+                               m_pg.m_poses, n, logger);
+        ba_file_io::save_patches(get_bin_file_path("keyframe_patches_before_frame" + frame_suffix + ".bin"), 
+                                 m_pg.m_patches, n, M, P, logger);
+        ba_file_io::save_intrinsics(get_bin_file_path("keyframe_intrinsics_before_frame" + frame_suffix + ".bin"), 
+                                    m_pg.m_intrinsics, n, logger);
+        ba_file_io::save_timestamps(get_bin_file_path("keyframe_tstamps_before_frame" + frame_suffix + ".bin"), 
+                                    m_pg.m_tstamps, n, logger);
+        ba_file_io::save_colors(get_bin_file_path("keyframe_colors_before_frame" + frame_suffix + ".bin"), 
+                                m_pg.m_colors, n, M, logger);
+        ba_file_io::save_index(get_bin_file_path("keyframe_index_before_frame" + frame_suffix + ".bin"), 
+                               m_pg.m_index, n, M, logger);
+        ba_file_io::save_ix(get_bin_file_path("keyframe_ix_before_frame" + frame_suffix + ".bin"), 
+                           m_pg.m_ix, n * M, logger);
+        
+        // Save edges before
+        ba_file_io::save_int32_array(get_bin_file_path("keyframe_ii_before_frame" + frame_suffix + ".bin"), 
+                                     reinterpret_cast<const int32_t*>(m_pg.m_ii), num_edges_before, logger);
+        ba_file_io::save_int32_array(get_bin_file_path("keyframe_jj_before_frame" + frame_suffix + ".bin"), 
+                                     reinterpret_cast<const int32_t*>(m_pg.m_jj), num_edges_before, logger);
+        ba_file_io::save_int32_array(get_bin_file_path("keyframe_kk_before_frame" + frame_suffix + ".bin"), 
+                                     reinterpret_cast<const int32_t*>(m_pg.m_kk), num_edges_before, logger);
+    }
 
     // =============================================================
     // Phase A: Keyframe removal decision
@@ -1950,7 +1985,10 @@ void DPVO::keyframe() {
     // SAFETY CHECK: Force frame removal if buffer is getting full
     // This prevents buffer overflow when motion is consistently high
     // Python raises an exception, but we can be more graceful and force removal
-    const int SAFETY_THRESHOLD = PatchGraph::N - 2;  // Force removal when n >= 34 (buffer size 36)
+    // CRITICAL: Cap sliding window size to reasonable value (36-50 frames) regardless of BUFFER_SIZE
+    // BUFFER_SIZE is for ring buffers (m_imap, m_gmap), not sliding window size
+    const int MAX_SLIDING_WINDOW_SIZE = 36;  // Maximum reasonable sliding window size
+    const int SAFETY_THRESHOLD = MAX_SLIDING_WINDOW_SIZE - 0;  // Force removal when n >= 48
     bool force_removal = (n >= SAFETY_THRESHOLD);
     
     int i = n - m_cfg.KEYFRAME_INDEX - 1;
@@ -2050,37 +2088,10 @@ void DPVO::keyframe() {
         removeFactors(remove, /*store=*/false);
 
         // ---------------------------------------------------------
-        // Phase B2: reindex remaining edges
+        // Phase B2: shift per-frame data FIRST (before reindexing edges)
         // ---------------------------------------------------------
-        // CRITICAL FIX: Match Python's reindexing logic exactly
-        // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1; active_jj[mask_jj] -= 1
-        // Python extracts source frame from active_ii (which is self.pg.ii, storing source frame index)
-        // C++ extracts source frame from kk: i_source = kk[e] / M
-        num_active = m_pg.m_num_edges;
-        for (int e = 0; e < num_active; e++) {
-            // Extract source frame from kk (before decrementing)
-            int i_source = m_pg.m_kk[e] / M;
-            
-            // If source frame > k, decrement kk and m_ii
-            // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1
-            if (i_source > k) {
-                m_pg.m_kk[e] -= M;  // Decrement kk by M (one frame worth of patches)
-                // CRITICAL: m_ii[e] stores m_index[frame][patch], which is the source frame index
-                // Python directly decrements: active_ii[mask_ii] -= 1
-                // Since m_index[frame][patch] stores the source frame index, we can directly decrement m_ii
-                m_pg.m_ii[e] -= 1;  // Decrement source frame index by 1 (matching Python)
-            }
-
-            // If target frame > k, decrement jj
-            // Python: active_jj[mask_jj] -= 1
-            if (m_pg.m_jj[e] > k) {
-                m_pg.m_jj[e] -= 1;
-            }
-        }
-
-        // ---------------------------------------------------------
-        // Phase B3: shift per-frame data
-        // ---------------------------------------------------------
+        // CRITICAL: Python shifts frame data first, then reindexes edges
+        // We need to shift m_index BEFORE decrementing m_ii, so m_ii[e] matches m_index[frame][patch] after both operations
         // M is already declared above (line 1986)
         for (int f = k; f < n - 1; f++) {
 
@@ -2112,8 +2123,10 @@ void DPVO::keyframe() {
 				sizeof(m_pg.m_intrinsics[0])
 			);
 
-			// CRITICAL: Update m_index for shifted frame
-			// m_index[frame][patch] stores patch index mapping
+			// CRITICAL: Update m_index for shifted frame BEFORE reindexing edges
+			// m_index[frame][patch] stores SOURCE FRAME INDEX (where patch was created)
+			// Python: index_[frame][patch] stores source frame index, not updated during keyframe removal
+			// We copy m_index[f+1] to m_index[f] to preserve source frame indices
 			for (int patch = 0; patch < M; patch++) {
 				m_pg.m_index[f][patch] = m_pg.m_index[f + 1][patch];
 			}
@@ -2137,6 +2150,37 @@ void DPVO::keyframe() {
 			m_fmap2[f % m_mem] = m_fmap2[(f + 1) % m_mem];
 		}
 
+        // ---------------------------------------------------------
+        // Phase B3: reindex remaining edges AFTER shifting frame data
+        // ---------------------------------------------------------
+        // CRITICAL FIX: Match Python's reindexing logic exactly
+        // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1; active_jj[mask_jj] -= 1
+        // Python extracts source frame from active_ii (which is self.pg.ii, storing source frame index)
+        // C++ extracts source frame from kk: i_source = kk[e] / M
+        // CRITICAL: Now that m_index has been shifted, we can safely decrement m_ii to match
+        num_active = m_pg.m_num_edges;
+        for (int e = 0; e < num_active; e++) {
+            // Extract source frame from kk (before decrementing)
+            int i_source = m_pg.m_kk[e] / M;
+            
+            // If source frame > k, decrement kk and m_ii
+            // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1
+            if (i_source > k) {
+                m_pg.m_kk[e] -= M;  // Decrement kk by M (one frame worth of patches)
+                // CRITICAL: m_ii[e] stores m_index[frame][patch], which is the source frame index
+                // Python directly decrements: active_ii[mask_ii] -= 1
+                // Since m_index[frame][patch] stores the source frame index, we can directly decrement m_ii
+                // Now that m_index has been shifted, m_ii[e] will still match m_index[frame][patch] after decrementing
+                m_pg.m_ii[e] -= 1;  // Decrement source frame index by 1 (matching Python)
+            }
+
+            // If target frame > k, decrement jj
+            // Python: active_jj[mask_jj] -= 1
+            if (m_pg.m_jj[e] > k) {
+                m_pg.m_jj[e] -= 1;
+            }
+        }
+
         m_pg.m_n--;
         m_pg.m_m -= PatchGraph::M;
     }
@@ -2147,13 +2191,79 @@ void DPVO::keyframe() {
     {
         bool remove[MAX_EDGES] = {false};
         int num_active = m_pg.m_num_edges;
+        const int M = PatchGraph::M;
 
         for (int e = 0; e < num_active; e++) {
-            if (m_pg.m_ix[m_pg.m_kk[e]] < m_pg.m_n - m_cfg.REMOVAL_WINDOW)
+            // CRITICAL FIX: Python uses self.ix[active_kk] which is self.pg.index_.view(-1)
+            // This returns the SOURCE FRAME INDEX (where patch was originally created), not current frame index
+            // Python: to_remove = self.ix[active_kk] < self.n - self.cfg.REMOVAL_WINDOW
+            //   where self.ix[kk] = index_[frame][patch] = source frame index
+            // C++ should use m_index[frame][patch] to get source frame index, matching Python
+            int kk = m_pg.m_kk[e];
+            int frame = kk / M;  // Current frame where patch resides
+            int patch = kk % M;  // Patch index within frame
+            
+            // Get source frame index from m_index (matching Python's self.ix[active_kk])
+            int source_frame = m_pg.m_index[frame][patch];
+            
+            // Remove edges where source frame is outside optimization window
+            // Python: self.ix[active_kk] < self.n - self.cfg.REMOVAL_WINDOW
+            if (source_frame < m_pg.m_n - m_cfg.REMOVAL_WINDOW) {
                 remove[e] = true;
+            }
         }
 
         removeFactors(remove, /*store=*/true);
+    }
+    
+    // Save keyframe outputs if at target frame
+    if (save_keyframe_data) {
+        int n_after = m_pg.m_n;
+        int m_after = m_pg.m_m;
+        int num_edges_after = m_pg.m_num_edges;
+        const int M = PatchGraph::M;
+        const int P = PatchGraph::P;
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        
+        // Save state after keyframe
+        ba_file_io::save_poses(get_bin_file_path("keyframe_poses_after_frame" + frame_suffix + ".bin"), 
+                               m_pg.m_poses, n_after, logger);
+        ba_file_io::save_patches(get_bin_file_path("keyframe_patches_after_frame" + frame_suffix + ".bin"), 
+                                 m_pg.m_patches, n_after, M, P, logger);
+        ba_file_io::save_intrinsics(get_bin_file_path("keyframe_intrinsics_after_frame" + frame_suffix + ".bin"), 
+                                    m_pg.m_intrinsics, n_after, logger);
+        ba_file_io::save_timestamps(get_bin_file_path("keyframe_tstamps_after_frame" + frame_suffix + ".bin"), 
+                                    m_pg.m_tstamps, n_after, logger);
+        ba_file_io::save_colors(get_bin_file_path("keyframe_colors_after_frame" + frame_suffix + ".bin"), 
+                                m_pg.m_colors, n_after, M, logger);
+        ba_file_io::save_index(get_bin_file_path("keyframe_index_after_frame" + frame_suffix + ".bin"), 
+                               m_pg.m_index, n_after, M, logger);
+        ba_file_io::save_ix(get_bin_file_path("keyframe_ix_after_frame" + frame_suffix + ".bin"), 
+                           m_pg.m_ix, n_after * M, logger);
+        
+        // Save edges after
+        ba_file_io::save_int32_array(get_bin_file_path("keyframe_ii_after_frame" + frame_suffix + ".bin"), 
+                                     reinterpret_cast<const int32_t*>(m_pg.m_ii), num_edges_after, logger);
+        ba_file_io::save_int32_array(get_bin_file_path("keyframe_jj_after_frame" + frame_suffix + ".bin"), 
+                                     reinterpret_cast<const int32_t*>(m_pg.m_jj), num_edges_after, logger);
+        ba_file_io::save_int32_array(get_bin_file_path("keyframe_kk_after_frame" + frame_suffix + ".bin"), 
+                                     reinterpret_cast<const int32_t*>(m_pg.m_kk), num_edges_after, logger);
+        
+        // Save metadata
+        int k = should_remove ? (n - m_cfg.KEYFRAME_INDEX) : -1;
+        ba_file_io::save_keyframe_metadata(
+            get_bin_file_path("keyframe_metadata_frame" + frame_suffix + ".txt"),
+            n, m_before, num_edges_before,
+            n_after, m_after, num_edges_after,
+            i, j, k, m, should_remove,
+            m_cfg.KEYFRAME_INDEX, m_cfg.KEYFRAME_THRESH, m_cfg.PATCH_LIFETIME, m_cfg.REMOVAL_WINDOW,
+            logger
+        );
+        
+        if (logger) {
+            logger->info("DPVO::keyframe: Saved keyframe outputs for frame {} (n_before={}→n_after={}, m_before={}→m_after={}, edges_before={}→edges_after={})", 
+                        TARGET_FRAME, n, n_after, m_before, m_after, num_edges_before, num_edges_after);
+        }
     }
 }
 
@@ -2473,6 +2583,48 @@ void DPVO::save_reproject_inputs(int num_active)
                     TARGET_FRAME, reproject_poses_filename, reproject_intrinsics_filename,
                     reproject_ii_filename, reproject_jj_filename, reproject_kk_filename);
     }
+}
+
+// -------------------------------------------------------------
+// Save BA inputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_ba_inputs_to_bin_files(int num_active, const float* coords)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (logger) {
+        logger->info("DPVO::update: Saving BA inputs for frame {} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
+                    TARGET_FRAME, m_counter, m_pg.m_n);
+    }
+    
+    const int N = m_pg.m_n;
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    const int P = m_P;
+    
+    // Save BA inputs using utility functions
+    ba_file_io::save_poses(get_bin_file_path("ba_poses.bin"), m_pg.m_poses, N, logger);
+    ba_file_io::save_patches(get_bin_file_path("ba_patches.bin"), m_pg.m_patches, N, M, P, logger);
+    ba_file_io::save_intrinsics(get_bin_file_path("ba_intrinsics.bin"), m_pg.m_intrinsics, N, logger);
+    ba_file_io::save_edge_indices(get_bin_file_path("ba_ii.bin"), get_bin_file_path("ba_jj.bin"), get_bin_file_path("ba_kk.bin"), 
+                                  m_pg.m_kk, m_pg.m_jj, num_active, M, logger);
+    ba_file_io::save_reprojected_coords_center(get_bin_file_path("ba_reprojected_coords.bin"), coords, 
+                                               num_active, P, logger);
+    ba_file_io::save_targets(get_bin_file_path("ba_targets.bin"), m_pg.m_target, num_active, logger);
+    ba_file_io::save_weights(get_bin_file_path("ba_weights.bin"), m_pg.m_weight, num_active, logger);
+    
+    // Save metadata
+    const int CORR_DIM = 882;  // 2*49*P*P = 2*49*3*3 = 882 for P=3
+    const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
+    ba_file_io::save_metadata(get_bin_file_path("test_metadata.txt"), num_active, MAX_EDGE, m_DIM, 
+                              CORR_DIM, M, P, N, logger);
 }
 
 // -----------------------------------------------------------------------------

@@ -35,8 +35,8 @@ struct DPVOConfig {
 
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
-          BUFFER_SIZE(36),
-          PATCH_SIZE(4),
+          BUFFER_SIZE(4096),
+          PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
           MAX_EDGE_AGE(360),
@@ -124,6 +124,9 @@ private:
     
     // Helper function to save reproject inputs for debugging/comparison
     void save_reproject_inputs(int num_active);
+    
+    // Helper function to save BA inputs for debugging/comparison
+    void save_ba_inputs_to_bin_files(int num_active, const float* coords);
     
     // Bundle Adjustment
     void bundleAdjustment(
