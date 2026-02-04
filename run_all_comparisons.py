@@ -722,6 +722,178 @@ def parse_patchify_output(output: str) -> ComparisonResult:
     )
 
 
+def parse_keyframe_output(output: str) -> ComparisonResult:
+    """Parse keyframe comparison output."""
+    match_status = "ERROR"
+    details = ""
+    max_diff = None
+    mean_diff = None
+    
+    # Extract sections from output to avoid false matches from other sections
+    metadata_section = ""
+    poses_section = ""
+    edges_section = ""
+    index_section = ""
+    
+    # Split output into sections
+    if "Metadata Comparison" in output:
+        parts = output.split("Metadata Comparison", 1)
+        if len(parts) > 1:
+            rest = parts[1]
+            if "Poses Comparison" in rest:
+                metadata_section = rest.split("Poses Comparison")[0]
+            else:
+                metadata_section = rest
+    
+    if "Poses Comparison" in output:
+        parts = output.split("Poses Comparison", 1)
+        if len(parts) > 1:
+            rest = parts[1]
+            if "Edge Indices Comparison" in rest:
+                poses_section = rest.split("Edge Indices Comparison")[0]
+            else:
+                poses_section = rest
+    
+    if "Edge Indices Comparison" in output:
+        parts = output.split("Edge Indices Comparison", 1)
+        if len(parts) > 1:
+            rest = parts[1]
+            if "Index Comparison" in rest:
+                edges_section = rest.split("Index Comparison")[0]
+            else:
+                edges_section = rest
+    
+    if "Index Comparison" in output:
+        parts = output.split("Index Comparison", 1)
+        if len(parts) > 1:
+            index_section = parts[1]
+    
+    # Check metadata comparison - all should match
+    metadata_match = True
+    if metadata_section:
+        if "❌ MISMATCH" in metadata_section:
+            metadata_match = False
+    
+    # Check poses comparison
+    poses_match = False
+    poses_max_diff = None
+    poses_mean_diff = None
+    if poses_section:
+        # Extract max diff and mean diff from poses comparison
+        # Format: "Max diff: 0.000000e+00, Mean diff: 0.000000e+00"
+        poses_diff_match = re.search(r'Max diff:\s*([\d.e+-]+),\s*Mean diff:\s*([\d.e+-]+)', poses_section)
+        if poses_diff_match:
+            try:
+                poses_max_diff = float(poses_diff_match.group(1))
+                poses_mean_diff = float(poses_diff_match.group(2))
+            except ValueError:
+                pass
+        
+        # Check if poses match - look specifically in poses_section
+        # Try multiple patterns to catch different formats
+        if re.search(r'✅\s*MATCH', poses_section) or "✅ MATCH" in poses_section:
+            poses_match = True
+        elif re.search(r'❌\s*MISMATCH', poses_section) or "❌ MISMATCH" in poses_section:
+            poses_match = False
+        # Fallback: check if max diff is very small (likely a match)
+        elif poses_max_diff is not None and poses_max_diff < 1e-4:
+            poses_match = True
+        # Another fallback: if we found the diff values but no explicit match status,
+        # assume match if diff is very small
+        elif poses_max_diff is not None and poses_max_diff < 1e-3:
+            poses_match = True
+    
+    # Check edge indices comparison
+    edges_match = True
+    if edges_section:
+        # Check if num_edges_after matches
+        if "❌ MISMATCH" in edges_section:
+            edges_match = False
+        # Check individual components (ii, jj, kk) - look for mismatches in edges_section
+        if "All edges comparison" in edges_section:
+            if "❌ MISMATCH" in edges_section:
+                edges_match = False
+    
+    # Check index comparison
+    index_match = True
+    if index_section:
+        if "❌ MISMATCH" in index_section:
+            index_match = False
+    
+    # Determine overall match status
+    if metadata_match and poses_match and edges_match and index_match:
+        match_status = "MATCH"
+        details_parts = []
+        if metadata_match:
+            details_parts.append("metadata✅")
+        if poses_match:
+            details_parts.append("poses✅")
+        if edges_match:
+            details_parts.append("edges✅")
+        if index_match:
+            details_parts.append("index✅")
+        details = ", ".join(details_parts)
+    else:
+        match_status = "MISMATCH"
+        details_parts = []
+        if not metadata_match:
+            details_parts.append("metadata❌")
+        if not poses_match:
+            details_parts.append("poses❌")
+        if not edges_match:
+            details_parts.append("edges❌")
+        if not index_match:
+            details_parts.append("index❌")
+        details = ", ".join(details_parts) if details_parts else "Mismatches detected"
+    
+    # Use poses max/mean diff as overall diff values
+    max_diff = poses_max_diff
+    mean_diff = poses_mean_diff
+    
+    # If we couldn't find any sections, try a more lenient approach
+    if not metadata_section and not poses_section and not edges_section and not index_section:
+        # Fallback: check for overall success indicators
+        if "Comparison complete!" in output and "✅ MATCH" in output:
+            # Count matches vs mismatches
+            match_count = output.count("✅ MATCH")
+            mismatch_count = output.count("❌ MISMATCH")
+            if mismatch_count == 0 and match_count >= 4:  # At least 4 sections should match
+                match_status = "MATCH"
+                details = "All sections matched"
+            elif mismatch_count > 0:
+                match_status = "MISMATCH"
+                details = f"{mismatch_count} sections mismatched"
+    
+    if match_status == "ERROR":
+        if "File not found" in output or "FileNotFoundError" in output:
+            match_status = "SKIPPED"
+            details = "Required files not found"
+        elif "Error" in output or "Traceback" in output:
+            # Script failed with an error
+            match_status = "ERROR"
+            # Extract error message if possible
+            error_match = re.search(r'Error[^\n]*', output)
+            if error_match:
+                details = error_match.group(0)[:50]
+            else:
+                details = "Script execution error (check output)"
+        else:
+            details = "Could not parse output"
+    
+    return ComparisonResult(
+        name="Keyframe",
+        script="compare_keyframe.py",
+        command=[],
+        exit_code=0,  # Will be set by run_keyframe_comparison
+        success=(match_status != "ERROR"),
+        match_status=match_status,
+        details=details,
+        max_diff=max_diff,
+        mean_diff=mean_diff,
+        output=output
+    )
+
+
 def parse_onnx_output(output: str) -> ComparisonResult:
     """Parse ONNX model comparison output."""
     match_status = "ERROR"
@@ -967,6 +1139,19 @@ def run_patchify_comparison(frame: int) -> ComparisonResult:
     return result
 
 
+def run_keyframe_comparison(frame: int, network_path: Optional[str] = None) -> ComparisonResult:
+    """Run keyframe comparison."""
+    cmd = [sys.executable, "compare_keyframe.py", "--frame", str(frame)]
+    if network_path:
+        cmd.extend(["--network", network_path])
+    exit_code, output = run_command(cmd)
+    result = parse_keyframe_output(output)
+    result.command = cmd
+    result.exit_code = exit_code
+    result.output = output
+    return result
+
+
 def run_onnx_comparison(image_path: str, fnet_model: str, inet_model: str, 
                         fnet_bin: Optional[str] = None, inet_bin: Optional[str] = None) -> ComparisonResult:
     """Run ONNX model comparison."""
@@ -1115,17 +1300,17 @@ Examples:
     parser.add_argument("--edge", type=int, default=0,
                        help="Edge index for reproject comparison (default: 0)")
     parser.add_argument("--update-model", type=str, default=None,
-                       help="Path to update model ONNX file (optional)")
+                       help="Path to update model ONNX file (default: onnx_models/update.onnx)")
     parser.add_argument("--image", type=str, default=None,
-                       help="Path to image file for ONNX comparison (optional)")
+                       help="Path to image file for ONNX comparison (default: build/data/IMG_0482/{frame:05d}.jpg)")
     parser.add_argument("--fnet-model", type=str, default=None,
-                       help="Path to FNet ONNX model (optional)")
+                       help="Path to FNet ONNX model (default: fnet.onnx)")
     parser.add_argument("--inet-model", type=str, default=None,
-                       help="Path to INet ONNX model (optional)")
+                       help="Path to INet ONNX model (default: inet.onnx)")
     parser.add_argument("--fnet-bin", type=str, default=None,
-                       help="Path to C++ FNet output binary (optional)")
+                       help="Path to C++ FNet output binary (default: bin_file/fnet_frame{frame}.bin)")
     parser.add_argument("--inet-bin", type=str, default=None,
-                       help="Path to C++ INet output binary (optional)")
+                       help="Path to C++ INet output binary (default: bin_file/inet_frame{frame}.bin)")
     parser.add_argument("--skip-correlation", action="store_true",
                        help="Skip correlation comparison")
     parser.add_argument("--skip-reproject", action="store_true",
@@ -1138,12 +1323,33 @@ Examples:
                        help="Skip patchify comparison")
     parser.add_argument("--skip-onnx", action="store_true",
                        help="Skip ONNX model comparison")
+    parser.add_argument("--skip-keyframe", action="store_true",
+                       help="Skip keyframe comparison")
     parser.add_argument("--show-output", action="store_true",
                        help="Show full output from each comparison")
     parser.add_argument("--save-output", type=str, default=None,
                        help="Save detailed output to file")
     
     args = parser.parse_args()
+    
+    # Auto-generate default paths based on frame number if not provided
+    if args.image is None:
+        args.image = f"build/data/IMG_0482/{args.frame:05d}.jpg"
+    
+    if args.fnet_model is None:
+        args.fnet_model = "fnet.onnx"
+    
+    if args.inet_model is None:
+        args.inet_model = "inet.onnx"
+    
+    if args.fnet_bin is None:
+        args.fnet_bin = f"bin_file/fnet_frame{args.frame}.bin"
+    
+    if args.inet_bin is None:
+        args.inet_bin = f"bin_file/inet_frame{args.frame}.bin"
+    
+    if args.update_model is None:
+        args.update_model = "onnx_models/update.onnx"
     
     print("="*100)
     print("RUNNING ALL COMPARISONS")
@@ -1152,61 +1358,69 @@ Examples:
     print(f"Edge: {args.edge}")
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*100)
+    print(f"Using defaults:")
+    print(f"  Image: {args.image}")
+    print(f"  FNet model: {args.fnet_model}")
+    print(f"  INet model: {args.inet_model}")
+    print(f"  FNet bin: {args.fnet_bin}")
+    print(f"  INet bin: {args.inet_bin}")
+    print(f"  Update model: {args.update_model}")
+    print("="*100)
     
     results = []
     
     # 1. Correlation comparison
     if not args.skip_correlation:
-        print("\n[1/6] Running correlation comparison...")
+        print("\n[1/7] Running correlation comparison...")
         result = run_correlation_comparison(args.frame)
         results.append(result)
         print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
-        print("\n[1/6] Skipping correlation comparison")
+        print("\n[1/7] Skipping correlation comparison")
     
     # 2. Reproject intermediate comparison
     if not args.skip_reproject:
-        print("\n[2/6] Running reproject intermediate comparison...")
+        print("\n[2/7] Running reproject intermediate comparison...")
         result = run_reproject_comparison(args.frame, args.edge)
         results.append(result)
         print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
-        print("\n[2/6] Skipping reproject intermediate comparison")
+        print("\n[2/7] Skipping reproject intermediate comparison")
     
     # 3. BA step-by-step comparison
     if not args.skip_ba:
-        print("\n[3/6] Running BA step-by-step comparison...")
+        print("\n[3/7] Running BA step-by-step comparison...")
         result = run_ba_comparison()
         results.append(result)
         print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
-        print("\n[3/6] Skipping BA step-by-step comparison")
+        print("\n[3/7] Skipping BA step-by-step comparison")
     
     # 4. Update model comparison
     if not args.skip_update:
         if args.update_model:
-            print("\n[4/6] Running update model comparison...")
+            print("\n[4/7] Running update model comparison...")
             result = run_update_comparison(args.update_model, args.frame)
             results.append(result)
             print(f"    Status: {format_status_with_emoji(result.match_status)}")
         else:
-            print("\n[4/6] Skipping update model comparison (--update-model not provided)")
+            print("\n[4/7] Skipping update model comparison (--update-model not provided)")
     else:
-        print("\n[4/6] Skipping update model comparison")
+        print("\n[4/7] Skipping update model comparison")
     
     # 5. Patchify comparison
     if not args.skip_patchify:
-        print("\n[5/6] Running patchify comparison...")
+        print("\n[5/7] Running patchify comparison...")
         result = run_patchify_comparison(args.frame)
         results.append(result)
         print(f"    Status: {format_status_with_emoji(result.match_status)}")
     else:
-        print("\n[5/6] Skipping patchify comparison")
+        print("\n[5/7] Skipping patchify comparison")
     
     # 6. ONNX model comparison
     if not args.skip_onnx:
         if args.image and args.fnet_model and args.inet_model:
-            print("\n[6/6] Running ONNX model comparison...")
+            print("\n[6/7] Running ONNX model comparison...")
             result = run_onnx_comparison(
                 args.image, args.fnet_model, args.inet_model,
                 args.fnet_bin, args.inet_bin
@@ -1214,9 +1428,38 @@ Examples:
             results.append(result)
             print(f"    Status: {format_status_with_emoji(result.match_status)}")
         else:
-            print("\n[6/6] Skipping ONNX model comparison (--image, --fnet-model, --inet-model not all provided)")
+            print("\n[6/7] Skipping ONNX model comparison (--image, --fnet-model, --inet-model not all provided)")
     else:
-        print("\n[6/6] Skipping ONNX model comparison")
+        print("\n[6/7] Skipping ONNX model comparison")
+    
+    # 7. Keyframe comparison
+    if not args.skip_keyframe:
+        print("\n[7/7] Running keyframe comparison...")
+        # Try to find network path from environment or use default
+         # Common locations for DPVO network file
+        network_path = os.environ.get("DPVO_NETWORK_PATH", None)
+        if not network_path:
+            # Try common locations
+            possible_paths = [
+                "../DPVO_onnx/dpvo.pth",
+                "dpvo.pth",
+                os.path.expanduser("~/DPVO_onnx/dpvo.pth"),
+            ]
+            for path in possible_paths:
+                if os.path.exists(path):
+                    network_path = path
+                    break
+        if network_path and not os.path.exists(network_path):
+            network_path = None  # Invalid path, let script use dummy network
+        result = run_keyframe_comparison(args.frame, network_path)
+        results.append(result)
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
+        if result.exit_code != 0:
+            print(f"    Warning: Script exited with code {result.exit_code}")
+            if args.show_output:
+                print(f"    Output:\n{result.output}")
+    else:
+        print("\n[7/7] Skipping keyframe comparison")
     
     # Print summary table
     print_summary_table(results)
