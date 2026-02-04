@@ -125,8 +125,34 @@ private:
     // Helper function to save reproject inputs for debugging/comparison
     void save_reproject_inputs(int num_active);
     
+    // Helper function to save reproject outputs for debugging/comparison
+    void save_reproject_outputs(int num_active, const float* coords, int P);
+    
+    // Helper function to save correlation outputs for debugging/comparison
+    void save_correlation_outputs(int num_active, const float* coords, const float* corr,
+                                  const float* corr1_8x8, const float* corr2_8x8,
+                                  size_t corr_8x8_size, int P, int D);
+    
+    // Helper function to save update model inputs for debugging/comparison
+    void save_update_model_inputs(int num_active);
+    
+    // Helper function to save update model outputs for debugging/comparison
+    void save_update_model_outputs(const DPVOUpdate_Prediction& pred);
+    
+    // Helper function to save BA outputs for debugging/comparison
+    void save_ba_outputs();
+    
+    // Helper function to save poses after sync for debugging/comparison
+    void save_poses_after_sync(int synced_count);
+    
     // Helper function to save BA inputs for debugging/comparison
     void save_ba_inputs_to_bin_files(int num_active, const float* coords);
+    
+    // Helper functions to save keyframe inputs/outputs for debugging/comparison
+    void save_keyframe_inputs(int n, int m_before, int num_edges_before);
+    void save_keyframe_outputs(int n_before, int m_before, int num_edges_before,
+                               int n_after, int m_after, int num_edges_after,
+                               int i, int j, float m, bool should_remove);
     
     // Bundle Adjustment
     void bundleAdjustment(

@@ -43,22 +43,14 @@ void PatchGraph::reset() {
     std::memset(m_colors, 0, sizeof(m_colors));
 
     // index mapping
-    // CRITICAL: m_index[frame][patch] stores the SOURCE FRAME INDEX (where patch was created)
+    // CRITICAL: m_index[frame][patch] stores SOURCE FRAME INDEX (where patch was created)
     // Python: index_[frame][patch] stores source frame index (initially frame)
-    // This is used in appendFactors: m_ii[e] = m_index[frame][patch]
+    // Initially, patches are created in their own frame, so source frame = frame index
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < M; j++) {
             m_index[i][j] = i;   // Source frame index is initially the frame itself
         }
         m_index_map[i] = i * M;
-    }
-    
-    // CRITICAL: m_ix[kk] stores the CURRENT FRAME INDEX (which frame patch kk belongs to)
-    // Python doesn't have m_ix, but uses ix[kk] = index_[frame][patch] (source frame index)
-    // C++ uses m_ix differently: it stores current frame index for Phase C edge removal
-    // Initialize m_ix: for patch kk = frame*M + patch, m_ix[kk] = frame
-    for (int i = 0; i < N * M; i++) {
-        m_ix[i] = i / M;  // Current frame index = kk / M
     }
 
     // active edges

@@ -69,8 +69,8 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
       // These use modulo indexing, so they can be smaller than BUFFER_SIZE
       // Python uses pmem=mem=36 regardless of BUFFER_SIZE
       // For BUFFER_SIZE=4096, we keep ring buffers at a reasonable size to avoid huge memory allocation
-      m_pmem(std::min(cfg.BUFFER_SIZE, 128)),  // Ring buffer for imap/gmap (max 128 frames)
-      m_mem(std::min(cfg.BUFFER_SIZE, 128)),   // Ring buffer for fmap1/fmap2 (max 128 frames)
+      m_pmem(std::min(cfg.BUFFER_SIZE, 36)),  // Ring buffer for imap/gmap (max 128 frames)
+      m_mem(std::min(cfg.BUFFER_SIZE, 36)),   // Ring buffer for fmap1/fmap2 (max 128 frames)
       m_patchifier(3, 384),  // Initialize with patch_size=3, DIM=384 (matches INet output channels)
       m_currentTimestamp(0),
       m_pg()  // Explicitly initialize PatchGraph (calls reset() which sets m_n=0)
@@ -1077,42 +1077,7 @@ void DPVO::update()
         }
         
         // Save full reproject outputs for Python comparison
-        std::string frame_suffix = std::to_string(TARGET_FRAME);
-        std::string reproject_coords_filename = get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin");
-        
-        // Log Edge 4's center pixel values right before saving to verify they match what was logged inside transformWithJacobians
-        // CRITICAL: Always log this (not just when TARGET_FRAME matches) to debug coordinate modification
-        if (num_active > 4 && logger) {
-            int center_y = P / 2;
-            int center_x = P / 2;
-            int edge4_x_idx = 4 * 2 * P * P + 0 * P * P + center_y * P + center_x;
-            int edge4_y_idx = 4 * 2 * P * P + 1 * P * P + center_y * P + center_x;
-            float edge4_x_before_save = coords[edge4_x_idx];
-            float edge4_y_before_save = coords[edge4_y_idx];
-            
-            // Get the value right after reproject for comparison
-            float edge4_x_after_reproject = 0.0f;
-            float edge4_y_after_reproject = 0.0f;
-            // We can't access the previous log value, so we'll compare with transformWithJacobians log value
-            // The transformWithJacobians log shows: u_pix=147.612701, v_pix=79.520638 (for frame 61)
-            
-            logger->info("[DPVO::update] Edge[4] pixel[{}/{}] coords BEFORE saving to file - "
-                         "coords[{}]={:.6f}, coords[{}]={:.6f}, "
-                         "TARGET_FRAME={}, m_counter={}",
-                         center_y, center_x, edge4_x_idx, edge4_x_before_save, 
-                         edge4_y_idx, edge4_y_before_save, TARGET_FRAME, m_counter);
-            
-            // Check if coordinates changed since reproject() returned
-            // We'll compare with the value logged right after reproject() returns
-            // (This will be logged in the previous log message)
-        }
-        
-        ba_file_io::save_reprojected_coords_full(reproject_coords_filename, coords.data(), 
-                                                 num_active, P, logger);
-        if (logger) {
-            logger->info("[DPVO::update] Saved reproject outputs for frame {}: {}", 
-                        TARGET_FRAME, reproject_coords_filename);
-        }
+        save_reproject_outputs(num_active, coords.data(), P);
     }
 
     // -------------------------------------------------
@@ -1180,18 +1145,6 @@ void DPVO::update()
 		corr2_8x8_ptr    // 8x8 buffer for level 1
 	);
     
-    // Save 8x8 internal correlation buffers for debugging
-    if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME && corr1_8x8_ptr != nullptr) {
-        std::string corr1_8x8_file = "bin_file/corr_frame" + std::to_string(m_counter) + "_8x8_level0.bin";
-        std::string corr2_8x8_file = "bin_file/corr_frame" + std::to_string(m_counter) + "_8x8_level1.bin";
-        correlation_file_io::save_float_array(corr1_8x8_file, corr1_8x8.data(), corr_8x8_size, logger);
-        correlation_file_io::save_float_array(corr2_8x8_file, corr2_8x8.data(), corr_8x8_size, logger);
-        if (logger) {
-            logger->info("[DPVO::update] Saved 8x8 internal correlation buffers for frame {}: {}, {}", 
-                        m_counter, corr1_8x8_file, corr2_8x8_file);
-        }
-    }
-    
     printf("[DPVO::update] computeCorrelation returned\n");
     fflush(stdout);
     
@@ -1214,36 +1167,12 @@ void DPVO::update()
     if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
         // Get correlation parameters - must match correlation_kernel.cpp
         // Note: Python uses altcorr.corr(..., 3), so radius=3
-        // correlation_kernel.cpp computeCorrelation uses the radius parameter passed in
         const int R = 3;  // Correlation radius (matches Python: altcorr.corr(..., 3))
         const int D = 2 * R + 1;  // Correlation window diameter (D = 7 for R=3, matches Python output)
         
-        correlation_file_io::save_correlation_data(
-            m_counter,
-            coords.data(),      // [num_active, 2, P, P]
-            m_pg.m_kk,          // kk - linear patch indices
-            m_pg.m_jj,          // jj - target frame indices
-            m_pg.m_ii,          // ii - patch indices (for reference)
-            m_gmap,             // gmap - patch features ring buffer
-            m_fmap1,            // fmap1 - pyramid level 0
-            m_fmap2,            // fmap2 - pyramid level 1
-            corr.data(),        // corr - correlation output
-            num_active,
-            M,
-            P,
-            D,
-            m_mem,              // num_frames
-            m_pmem,             // num_gmap_frames
-            m_fmap1_H, m_fmap1_W,
-            m_fmap2_H, m_fmap2_W,
-            128,                // feature_dim
-            logger
-        );
-        
-        if (logger) {
-            logger->info("[DPVO::update] Saved correlation inputs/outputs for frame {} (TARGET_FRAME={})", 
-                        m_counter, TARGET_FRAME);
-        }
+        save_correlation_outputs(num_active, coords.data(), corr.data(),
+                                corr1_8x8_ptr, corr2_8x8_ptr,
+                                corr_8x8_size, P, D);
     }
     
     if (logger) logger->info("DPVO::update: Correlation completed");
@@ -1484,44 +1413,7 @@ void DPVO::update()
         }
         // Save metadata and inputs for update model when TARGET_FRAME matches
         if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
-            const int CORR_DIM = 882;
-            const int DIM = 384;
-            std::string frame_suffix = std::to_string(TARGET_FRAME);
-            
-            // Save metadata
-            std::string metadata_filename = get_bin_file_path("update_metadata_frame" + frame_suffix + ".txt");
-            update_file_io::save_metadata(metadata_filename, m_counter, num_active, m_maxEdge, 
-                                         DIM, CORR_DIM, logger);
-            
-            // Save update model inputs for Python comparison
-            std::string net_input_filename = get_bin_file_path("update_net_input_frame" + frame_suffix + ".bin");
-            std::string inp_input_filename = get_bin_file_path("update_inp_input_frame" + frame_suffix + ".bin");
-            std::string corr_input_filename = get_bin_file_path("update_corr_input_frame" + frame_suffix + ".bin");
-            std::string ii_input_filename = get_bin_file_path("update_ii_input_frame" + frame_suffix + ".bin");
-            std::string jj_input_filename = get_bin_file_path("update_jj_input_frame" + frame_suffix + ".bin");
-            std::string kk_input_filename = get_bin_file_path("update_kk_input_frame" + frame_suffix + ".bin");
-            
-            // Save float inputs
-            update_file_io::save_net_input(net_input_filename, m_reshape_net_input.data(), 
-                                          DIM, m_maxEdge, logger);
-            update_file_io::save_inp_input(inp_input_filename, m_reshape_inp_input.data(), 
-                                          DIM, m_maxEdge, logger);
-            update_file_io::save_corr_input(corr_input_filename, m_reshape_corr_input.data(), 
-                                           CORR_DIM, m_maxEdge, logger);
-            
-            // Save index inputs (convert from float to int32)
-            update_file_io::save_index_input(ii_input_filename, m_reshape_ii_input.data(), 
-                                             m_maxEdge, logger, "ii");
-            update_file_io::save_index_input(jj_input_filename, m_reshape_jj_input.data(), 
-                                             m_maxEdge, logger, "jj");
-            update_file_io::save_index_input(kk_input_filename, m_reshape_kk_input.data(), 
-                                             m_maxEdge, logger, "kk");
-            
-            if (logger) {
-                logger->info("[DPVO::update] Saved update model inputs for frame {}: {}, {}, {}, {}, {}, {}", 
-                            TARGET_FRAME, net_input_filename, inp_input_filename, corr_input_filename,
-                            ii_input_filename, jj_input_filename, kk_input_filename);
-            }
+            save_update_model_inputs(num_active);
         }
         
         bool inference_success = false;
@@ -1571,27 +1463,7 @@ void DPVO::update()
             
             // Save update model outputs when TARGET_FRAME matches
             if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME) {
-                const int DIM = 384;
-                std::string frame_suffix = std::to_string(TARGET_FRAME);
-                std::string net_out_filename = get_bin_file_path("update_net_out_cpp_frame" + frame_suffix + ".bin");
-                std::string d_out_filename = get_bin_file_path("update_d_out_cpp_frame" + frame_suffix + ".bin");
-                std::string w_out_filename = get_bin_file_path("update_w_out_cpp_frame" + frame_suffix + ".bin");
-                
-                // Save outputs using utility functions
-                if (pred.netOutBuff != nullptr) {
-                    update_file_io::save_net_output(net_out_filename, pred.netOutBuff, DIM, m_maxEdge, logger);
-                }
-                if (pred.dOutBuff != nullptr) {
-                    update_file_io::save_d_output(d_out_filename, pred.dOutBuff, m_maxEdge, logger);
-                }
-                if (pred.wOutBuff != nullptr) {
-                    update_file_io::save_w_output(w_out_filename, pred.wOutBuff, m_maxEdge, logger);
-                }
-                
-                if (logger) {
-                    logger->info("[DPVO::update] Saved update model outputs for frame {}: {}, {}, {}", 
-                                TARGET_FRAME, net_out_filename, d_out_filename, w_out_filename);
-                }
+                save_update_model_outputs(pred);
             }
             
             // Extract outputs: net_out [1, 384, 384, 1], d_out [1, 2, 384, 1], w_out [1, 2, 384, 1]
@@ -1797,14 +1669,7 @@ void DPVO::update()
         
         // Save BA outputs (updated poses) for target frame
         if (save_ba_inputs) {
-            if (logger) {
-                logger->info("DPVO::update: Saving BA outputs for frame {} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
-                            TARGET_FRAME, m_counter, m_pg.m_n);
-            }
-            
-            const int N = m_pg.m_n;
-            // Save BA outputs (updated poses) using utility function
-            ba_file_io::save_poses(get_bin_file_path("ba_poses_cpp.bin"), m_pg.m_poses, N, logger);
+            save_ba_outputs();
         }
         
         // Sync optimized poses from sliding window (m_pg.m_poses) back to historical buffer (m_allPoses)
@@ -1814,16 +1679,28 @@ void DPVO::update()
         if (!m_allTimestamps.empty() && m_pg.m_n > 0) {
             int synced_count = 0;
             int failed_count = 0;
+            std::vector<std::pair<int, int64_t>> failed_timestamps;  // Store failed timestamps for debugging
+            
             for (int sw_idx = 0; sw_idx < m_pg.m_n; sw_idx++) {
                 int64_t sw_timestamp = m_pg.m_tstamps[sw_idx];
                 
                 // Find the global frame index that matches this timestamp
                 int global_idx = -1;
+                int match_count = 0;  // Count how many matches we find (should be exactly 1)
                 for (int g_idx = 0; g_idx < static_cast<int>(m_allTimestamps.size()); g_idx++) {
                     if (m_allTimestamps[g_idx] == sw_timestamp) {
-                        global_idx = g_idx;
-                        break;
+                        if (match_count == 0) {
+                            global_idx = g_idx;
+                        }
+                        match_count++;
                     }
+                }
+                
+                // Check for duplicate timestamps (this would cause incorrect syncing)
+                if (match_count > 1 && logger) {
+                    logger->error("DPVO::update: WARNING - Duplicate timestamp {} found {} times in m_allTimestamps! "
+                                 "This will cause incorrect pose syncing. sw_idx={}",
+                                 sw_timestamp, match_count, sw_idx);
                 }
                 
                 // Update the corresponding global pose if we found a match
@@ -1832,11 +1709,39 @@ void DPVO::update()
                     synced_count++;
                 } else {
                     failed_count++;
-                    if (logger && failed_count <= 3) {
+                    failed_timestamps.push_back({sw_idx, sw_timestamp});
+                    if (logger && failed_count <= 5) {
                         logger->warn("DPVO::update: Failed to sync pose for sw_idx={}, timestamp={}, "
-                                    "m_allTimestamps.size()={}, m_allPoses.size()={}",
-                                    sw_idx, sw_timestamp, m_allTimestamps.size(), m_allPoses.size());
+                                    "m_allTimestamps.size()={}, m_allPoses.size()={}, match_count={}",
+                                    sw_idx, sw_timestamp, m_allTimestamps.size(), m_allPoses.size(), match_count);
                     }
+                }
+            }
+            
+            // Log detailed failure information if there are many failures
+            if (failed_count > 0 && logger && m_counter >= 30) {
+                logger->error("DPVO::update: CRITICAL - {} failed syncs out of {} poses! This indicates timestamp mismatch issue.",
+                             failed_count, m_pg.m_n);
+                logger->error("DPVO::update: Failed timestamps (sw_idx, timestamp):");
+                for (const auto& [sw_idx, ts] : failed_timestamps) {
+                    logger->error("  sw_idx={}, timestamp={}", sw_idx, ts);
+                }
+                // Log sample of m_allTimestamps to see what we're looking for
+                int sample_size = std::min(10, static_cast<int>(m_allTimestamps.size()));
+                logger->error("DPVO::update: Sample m_allTimestamps (first {}):", sample_size);
+                for (int i = 0; i < sample_size; i++) {
+                    logger->error("  m_allTimestamps[{}] = {}", i, m_allTimestamps[i]);
+                }
+                if (m_allTimestamps.size() > 10) {
+                    logger->error("DPVO::update: Sample m_allTimestamps (last {}):", sample_size);
+                    for (int i = static_cast<int>(m_allTimestamps.size()) - sample_size; i < static_cast<int>(m_allTimestamps.size()); i++) {
+                        logger->error("  m_allTimestamps[{}] = {}", i, m_allTimestamps[i]);
+                    }
+                }
+                // Log current sliding window timestamps
+                logger->error("DPVO::update: Current sliding window timestamps (m_pg.m_n={}):", m_pg.m_n);
+                for (int i = 0; i < m_pg.m_n; i++) {
+                    logger->error("  m_pg.m_tstamps[{}] = {}", i, m_pg.m_tstamps[i]);
                 }
             }
             if (logger && (synced_count > 0 || failed_count > 0)) {
@@ -1881,13 +1786,7 @@ void DPVO::update()
             
             // Save poses after syncing for comparison with Python (at target frame)
             if (TARGET_FRAME >= 0 && m_counter == TARGET_FRAME && synced_count > 0) {
-                // Save all historical poses (m_allPoses) for comparison
-                int num_historical = static_cast<int>(m_allPoses.size());
-                ba_file_io::save_poses(get_bin_file_path("poses_after_sync_frame" + std::to_string(TARGET_FRAME) + ".bin"), 
-                                      m_allPoses.data(), num_historical, logger);
-                if (logger) {
-                    logger->info("DPVO::update: Saved {} historical poses after sync for frame {}", num_historical, TARGET_FRAME);
-                }
+                save_poses_after_sync(synced_count);
             }
         }
         
@@ -1950,33 +1849,7 @@ void DPVO::keyframe() {
     
     // Save keyframe inputs
     if (save_keyframe_data) {
-        const int M = PatchGraph::M;
-        const int P = PatchGraph::P;
-        std::string frame_suffix = std::to_string(TARGET_FRAME);
-        
-        // Save state before keyframe
-        ba_file_io::save_poses(get_bin_file_path("keyframe_poses_before_frame" + frame_suffix + ".bin"), 
-                               m_pg.m_poses, n, logger);
-        ba_file_io::save_patches(get_bin_file_path("keyframe_patches_before_frame" + frame_suffix + ".bin"), 
-                                 m_pg.m_patches, n, M, P, logger);
-        ba_file_io::save_intrinsics(get_bin_file_path("keyframe_intrinsics_before_frame" + frame_suffix + ".bin"), 
-                                    m_pg.m_intrinsics, n, logger);
-        ba_file_io::save_timestamps(get_bin_file_path("keyframe_tstamps_before_frame" + frame_suffix + ".bin"), 
-                                    m_pg.m_tstamps, n, logger);
-        ba_file_io::save_colors(get_bin_file_path("keyframe_colors_before_frame" + frame_suffix + ".bin"), 
-                                m_pg.m_colors, n, M, logger);
-        ba_file_io::save_index(get_bin_file_path("keyframe_index_before_frame" + frame_suffix + ".bin"), 
-                               m_pg.m_index, n, M, logger);
-        ba_file_io::save_ix(get_bin_file_path("keyframe_ix_before_frame" + frame_suffix + ".bin"), 
-                           m_pg.m_ix, n * M, logger);
-        
-        // Save edges before
-        ba_file_io::save_int32_array(get_bin_file_path("keyframe_ii_before_frame" + frame_suffix + ".bin"), 
-                                     reinterpret_cast<const int32_t*>(m_pg.m_ii), num_edges_before, logger);
-        ba_file_io::save_int32_array(get_bin_file_path("keyframe_jj_before_frame" + frame_suffix + ".bin"), 
-                                     reinterpret_cast<const int32_t*>(m_pg.m_jj), num_edges_before, logger);
-        ba_file_io::save_int32_array(get_bin_file_path("keyframe_kk_before_frame" + frame_suffix + ".bin"), 
-                                     reinterpret_cast<const int32_t*>(m_pg.m_kk), num_edges_before, logger);
+        save_keyframe_inputs(n, m_before, num_edges_before);
     }
 
     // =============================================================
@@ -2031,6 +1904,8 @@ void DPVO::keyframe() {
             k = 0;
         }
         
+        const int M = PatchGraph::M;  // Declare M once for use in all phases
+        
         auto logger = spdlog::get("dpvo");
         if (logger) {
             logger->info("DPVO::keyframe: Removing keyframe k={}, m_pg.m_n will decrease from {} to {} (force_removal={})", 
@@ -2064,19 +1939,17 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // Phase B1: remove edges touching frame k
         // ---------------------------------------------------------
-        // CRITICAL FIX: m_ii[e] is NOT a frame index! It's a patch index mapping.
-        // We need to extract the source frame from kk: i_source = kk[e] / M
+        // CRITICAL FIX: m_ii[e] stores the SOURCE FRAME INDEX from m_index[frame][patch]
         // Python: to_remove = (active_ii == k) | (active_jj == k)
-        //   where active_ii is the source frame index extracted from kk
+        //   where active_ii = self.pg.ii[:num_active] (source frame index)
         //   This removes edges that touch frame k (either source or target)
         bool remove[MAX_EDGES] = {false};
 
         int num_active = m_pg.m_num_edges;
-        const int M = PatchGraph::M;
         for (int e = 0; e < num_active; e++) {
-            // Extract source frame from kk (matching BA logic)
-            int i_source = m_pg.m_kk[e] / M;  // Source frame index
-            int j_target = m_pg.m_jj[e];       // Target frame index
+            // Use m_ii[e] directly (stores source frame index, matching Python's active_ii)
+            int i_source = m_pg.m_ii[e];  // Source frame index (from m_index[frame][patch])
+            int j_target = m_pg.m_jj[e];   // Target frame index
             
             // Remove edges where source frame == k OR target frame == k
             // Python: to_remove = (active_ii == k) | (active_jj == k)
@@ -2092,7 +1965,6 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // CRITICAL: Python shifts frame data first, then reindexes edges
         // We need to shift m_index BEFORE decrementing m_ii, so m_ii[e] matches m_index[frame][patch] after both operations
-        // M is already declared above (line 1986)
         for (int f = k; f < n - 1; f++) {
 
 			m_pg.m_tstamps[f] = m_pg.m_tstamps[f + 1];
@@ -2125,11 +1997,16 @@ void DPVO::keyframe() {
 
 			// CRITICAL: Update m_index for shifted frame BEFORE reindexing edges
 			// m_index[frame][patch] stores SOURCE FRAME INDEX (where patch was created)
-			// Python: index_[frame][patch] stores source frame index, not updated during keyframe removal
-			// We copy m_index[f+1] to m_index[f] to preserve source frame indices
-			for (int patch = 0; patch < M; patch++) {
-				m_pg.m_index[f][patch] = m_pg.m_index[f + 1][patch];
-			}
+			// Python: index_[frame][patch] stores source frame index
+			// Python's keyframe() doesn't explicitly copy index_, but comparison shows it IS copied
+			// We copy m_index[f+1] to m_index[f] to preserve source frame indices (matching Python behavior)
+			// Use memcpy for efficiency (same as patches/colors/intrinsics)
+			// m_index[f] is an array of M integers, so copy M * sizeof(int) bytes
+			std::memcpy(
+				m_pg.m_index[f],
+				m_pg.m_index[f + 1],
+				M * sizeof(int)
+			);
 			m_pg.m_index_map[f] = m_pg.m_index_map[f + 1];
 
 			// CRITICAL: Update m_ix for all patches in shifted frame
@@ -2155,22 +2032,18 @@ void DPVO::keyframe() {
         // ---------------------------------------------------------
         // CRITICAL FIX: Match Python's reindexing logic exactly
         // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1; active_jj[mask_jj] -= 1
-        // Python extracts source frame from active_ii (which is self.pg.ii, storing source frame index)
-        // C++ extracts source frame from kk: i_source = kk[e] / M
-        // CRITICAL: Now that m_index has been shifted, we can safely decrement m_ii to match
+        // Python uses active_ii (source frame index) directly: mask_ii = active_ii > k
+        // C++ should use m_ii[e] (source frame index) directly, matching Python
         num_active = m_pg.m_num_edges;
+      
         for (int e = 0; e < num_active; e++) {
-            // Extract source frame from kk (before decrementing)
-            int i_source = m_pg.m_kk[e] / M;
+            // Use m_ii[e] directly (source frame index, matching Python's active_ii)
+            int i_source = m_pg.m_ii[e];
             
             // If source frame > k, decrement kk and m_ii
             // Python: active_kk[mask_ii] -= self.M; active_ii[mask_ii] -= 1
             if (i_source > k) {
                 m_pg.m_kk[e] -= M;  // Decrement kk by M (one frame worth of patches)
-                // CRITICAL: m_ii[e] stores m_index[frame][patch], which is the source frame index
-                // Python directly decrements: active_ii[mask_ii] -= 1
-                // Since m_index[frame][patch] stores the source frame index, we can directly decrement m_ii
-                // Now that m_index has been shifted, m_ii[e] will still match m_index[frame][patch] after decrementing
                 m_pg.m_ii[e] -= 1;  // Decrement source frame index by 1 (matching Python)
             }
 
@@ -2221,49 +2094,9 @@ void DPVO::keyframe() {
         int n_after = m_pg.m_n;
         int m_after = m_pg.m_m;
         int num_edges_after = m_pg.m_num_edges;
-        const int M = PatchGraph::M;
-        const int P = PatchGraph::P;
-        std::string frame_suffix = std::to_string(TARGET_FRAME);
-        
-        // Save state after keyframe
-        ba_file_io::save_poses(get_bin_file_path("keyframe_poses_after_frame" + frame_suffix + ".bin"), 
-                               m_pg.m_poses, n_after, logger);
-        ba_file_io::save_patches(get_bin_file_path("keyframe_patches_after_frame" + frame_suffix + ".bin"), 
-                                 m_pg.m_patches, n_after, M, P, logger);
-        ba_file_io::save_intrinsics(get_bin_file_path("keyframe_intrinsics_after_frame" + frame_suffix + ".bin"), 
-                                    m_pg.m_intrinsics, n_after, logger);
-        ba_file_io::save_timestamps(get_bin_file_path("keyframe_tstamps_after_frame" + frame_suffix + ".bin"), 
-                                    m_pg.m_tstamps, n_after, logger);
-        ba_file_io::save_colors(get_bin_file_path("keyframe_colors_after_frame" + frame_suffix + ".bin"), 
-                                m_pg.m_colors, n_after, M, logger);
-        ba_file_io::save_index(get_bin_file_path("keyframe_index_after_frame" + frame_suffix + ".bin"), 
-                               m_pg.m_index, n_after, M, logger);
-        ba_file_io::save_ix(get_bin_file_path("keyframe_ix_after_frame" + frame_suffix + ".bin"), 
-                           m_pg.m_ix, n_after * M, logger);
-        
-        // Save edges after
-        ba_file_io::save_int32_array(get_bin_file_path("keyframe_ii_after_frame" + frame_suffix + ".bin"), 
-                                     reinterpret_cast<const int32_t*>(m_pg.m_ii), num_edges_after, logger);
-        ba_file_io::save_int32_array(get_bin_file_path("keyframe_jj_after_frame" + frame_suffix + ".bin"), 
-                                     reinterpret_cast<const int32_t*>(m_pg.m_jj), num_edges_after, logger);
-        ba_file_io::save_int32_array(get_bin_file_path("keyframe_kk_after_frame" + frame_suffix + ".bin"), 
-                                     reinterpret_cast<const int32_t*>(m_pg.m_kk), num_edges_after, logger);
-        
-        // Save metadata
-        int k = should_remove ? (n - m_cfg.KEYFRAME_INDEX) : -1;
-        ba_file_io::save_keyframe_metadata(
-            get_bin_file_path("keyframe_metadata_frame" + frame_suffix + ".txt"),
-            n, m_before, num_edges_before,
-            n_after, m_after, num_edges_after,
-            i, j, k, m, should_remove,
-            m_cfg.KEYFRAME_INDEX, m_cfg.KEYFRAME_THRESH, m_cfg.PATCH_LIFETIME, m_cfg.REMOVAL_WINDOW,
-            logger
-        );
-        
-        if (logger) {
-            logger->info("DPVO::keyframe: Saved keyframe outputs for frame {} (n_before={}→n_after={}, m_before={}→m_after={}, edges_before={}→edges_after={})", 
-                        TARGET_FRAME, n, n_after, m_before, m_after, num_edges_before, num_edges_after);
-        }
+        save_keyframe_outputs(n, m_before, num_edges_before,
+                             n_after, m_after, num_edges_after,
+                             i, j, m, should_remove);
     }
 }
 
@@ -2586,6 +2419,275 @@ void DPVO::save_reproject_inputs(int num_active)
 }
 
 // -------------------------------------------------------------
+// Save reproject outputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_reproject_outputs(int num_active, const float* coords, int P)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
+        return;
+    }
+    
+    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    std::string reproject_coords_filename = get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin");
+    
+    // Log Edge 4's center pixel values right before saving to verify they match what was logged inside transformWithJacobians
+    if (num_active > 4 && logger) {
+        int center_y = P / 2;
+        int center_x = P / 2;
+        int edge4_x_idx = 4 * 2 * P * P + 0 * P * P + center_y * P + center_x;
+        int edge4_y_idx = 4 * 2 * P * P + 1 * P * P + center_y * P + center_x;
+        float edge4_x_before_save = coords[edge4_x_idx];
+        float edge4_y_before_save = coords[edge4_y_idx];
+        
+        logger->info("[DPVO::update] Edge[4] pixel[{}/{}] coords BEFORE saving to file - "
+                     "coords[{}]={:.6f}, coords[{}]={:.6f}, "
+                     "TARGET_FRAME={}, m_counter={}",
+                     center_y, center_x, edge4_x_idx, edge4_x_before_save, 
+                     edge4_y_idx, edge4_y_before_save, TARGET_FRAME, m_counter);
+    }
+    
+    ba_file_io::save_reprojected_coords_full(reproject_coords_filename, coords, 
+                                             num_active, P, logger);
+    if (logger) {
+        logger->info("[DPVO::update] Saved reproject outputs for frame {}: {}", 
+                    TARGET_FRAME, reproject_coords_filename);
+    }
+}
+
+// -------------------------------------------------------------
+// Save correlation outputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_correlation_outputs(int num_active, const float* coords, const float* corr,
+                                    const float* corr1_8x8, const float* corr2_8x8,
+                                    size_t corr_8x8_size, int P, int D)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
+        return;
+    }
+    
+    const int M = m_cfg.PATCHES_PER_FRAME;
+    const int R = 3;  // Correlation radius (matches Python: altcorr.corr(..., 3))
+    
+    // Save 8x8 internal correlation buffers for debugging
+    if (corr1_8x8 != nullptr && corr2_8x8 != nullptr) {
+        std::string corr1_8x8_file = "bin_file/corr_frame" + std::to_string(m_counter) + "_8x8_level0.bin";
+        std::string corr2_8x8_file = "bin_file/corr_frame" + std::to_string(m_counter) + "_8x8_level1.bin";
+        correlation_file_io::save_float_array(corr1_8x8_file, corr1_8x8, corr_8x8_size, logger);
+        correlation_file_io::save_float_array(corr2_8x8_file, corr2_8x8, corr_8x8_size, logger);
+        if (logger) {
+            logger->info("[DPVO::update] Saved 8x8 internal correlation buffers for frame {}: {}, {}", 
+                        m_counter, corr1_8x8_file, corr2_8x8_file);
+        }
+    }
+    
+    // Save full correlation data
+    correlation_file_io::save_correlation_data(
+        m_counter,
+        coords,          // [num_active, 2, P, P]
+        m_pg.m_kk,       // kk - linear patch indices
+        m_pg.m_jj,       // jj - target frame indices
+        m_pg.m_ii,       // ii - patch indices (for reference)
+        m_gmap,           // gmap - patch features ring buffer
+        m_fmap1,          // fmap1 - pyramid level 0
+        m_fmap2,          // fmap2 - pyramid level 1
+        corr,             // corr - correlation output
+        num_active,
+        M,
+        P,
+        D,
+        m_mem,            // num_frames
+        m_pmem,           // num_gmap_frames
+        m_fmap1_H, m_fmap1_W,
+        m_fmap2_H, m_fmap2_W,
+        128,              // feature_dim
+        logger
+    );
+    
+    if (logger) {
+        logger->info("[DPVO::update] Saved correlation inputs/outputs for frame {} (TARGET_FRAME={})", 
+                    m_counter, TARGET_FRAME);
+    }
+}
+
+// -------------------------------------------------------------
+// Save update model inputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_update_model_inputs(int num_active)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
+        return;
+    }
+    
+    const int CORR_DIM = 882;
+    const int DIM = 384;
+    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    
+    // Save metadata
+    std::string metadata_filename = get_bin_file_path("update_metadata_frame" + frame_suffix + ".txt");
+    update_file_io::save_metadata(metadata_filename, m_counter, num_active, m_maxEdge, 
+                                   DIM, CORR_DIM, logger);
+    
+    // Save update model inputs for Python comparison
+    std::string net_input_filename = get_bin_file_path("update_net_input_frame" + frame_suffix + ".bin");
+    std::string inp_input_filename = get_bin_file_path("update_inp_input_frame" + frame_suffix + ".bin");
+    std::string corr_input_filename = get_bin_file_path("update_corr_input_frame" + frame_suffix + ".bin");
+    std::string ii_input_filename = get_bin_file_path("update_ii_input_frame" + frame_suffix + ".bin");
+    std::string jj_input_filename = get_bin_file_path("update_jj_input_frame" + frame_suffix + ".bin");
+    std::string kk_input_filename = get_bin_file_path("update_kk_input_frame" + frame_suffix + ".bin");
+    
+    // Save float inputs
+    update_file_io::save_net_input(net_input_filename, m_reshape_net_input.data(), 
+                                  DIM, m_maxEdge, logger);
+    update_file_io::save_inp_input(inp_input_filename, m_reshape_inp_input.data(), 
+                                  DIM, m_maxEdge, logger);
+    update_file_io::save_corr_input(corr_input_filename, m_reshape_corr_input.data(), 
+                                   CORR_DIM, m_maxEdge, logger);
+    
+    // Save index inputs (convert from float to int32)
+    update_file_io::save_index_input(ii_input_filename, m_reshape_ii_input.data(), 
+                                     m_maxEdge, logger, "ii");
+    update_file_io::save_index_input(jj_input_filename, m_reshape_jj_input.data(), 
+                                     m_maxEdge, logger, "jj");
+    update_file_io::save_index_input(kk_input_filename, m_reshape_kk_input.data(), 
+                                     m_maxEdge, logger, "kk");
+    
+    if (logger) {
+        logger->info("[DPVO::update] Saved update model inputs for frame {}: {}, {}, {}, {}, {}, {}", 
+                    TARGET_FRAME, net_input_filename, inp_input_filename, corr_input_filename,
+                    ii_input_filename, jj_input_filename, kk_input_filename);
+    }
+}
+
+// -------------------------------------------------------------
+// Save update model outputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_update_model_outputs(const DPVOUpdate_Prediction& pred)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
+        return;
+    }
+    
+    const int DIM = 384;
+    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    std::string net_out_filename = get_bin_file_path("update_net_out_cpp_frame" + frame_suffix + ".bin");
+    std::string d_out_filename = get_bin_file_path("update_d_out_cpp_frame" + frame_suffix + ".bin");
+    std::string w_out_filename = get_bin_file_path("update_w_out_cpp_frame" + frame_suffix + ".bin");
+    
+    // Save outputs using utility functions
+    if (pred.netOutBuff != nullptr) {
+        update_file_io::save_net_output(net_out_filename, pred.netOutBuff, DIM, m_maxEdge, logger);
+    }
+    if (pred.dOutBuff != nullptr) {
+        update_file_io::save_d_output(d_out_filename, pred.dOutBuff, m_maxEdge, logger);
+    }
+    if (pred.wOutBuff != nullptr) {
+        update_file_io::save_w_output(w_out_filename, pred.wOutBuff, m_maxEdge, logger);
+    }
+    
+    if (logger) {
+        logger->info("[DPVO::update] Saved update model outputs for frame {}: {}, {}, {}", 
+                    TARGET_FRAME, net_out_filename, d_out_filename, w_out_filename);
+    }
+}
+
+// -------------------------------------------------------------
+// Save BA outputs for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_ba_outputs()
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
+        return;
+    }
+    
+    if (logger) {
+        logger->info("DPVO::update: Saving BA outputs for frame {} (m_counter={}, m_pg.m_n={}) (for BA comparison)", 
+                    TARGET_FRAME, m_counter, m_pg.m_n);
+    }
+    
+    const int N = m_pg.m_n;
+    // Save BA outputs (updated poses) using utility function
+    ba_file_io::save_poses(get_bin_file_path("ba_poses_cpp.bin"), m_pg.m_poses, N, logger);
+}
+
+// -------------------------------------------------------------
+// Save poses after sync for debugging/comparison
+// -------------------------------------------------------------
+void DPVO::save_poses_after_sync(int synced_count)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME || synced_count <= 0) {
+        return;
+    }
+    
+    // Save all historical poses (m_allPoses) for comparison
+    int num_historical = static_cast<int>(m_allPoses.size());
+    ba_file_io::save_poses(get_bin_file_path("poses_after_sync_frame" + std::to_string(TARGET_FRAME) + ".bin"), 
+                          m_allPoses.data(), num_historical, logger);
+    if (logger) {
+        logger->info("DPVO::update: Saved {} historical poses after sync for frame {}", num_historical, TARGET_FRAME);
+    }
+}
+
+// -------------------------------------------------------------
 // Save BA inputs for debugging/comparison
 // -------------------------------------------------------------
 void DPVO::save_ba_inputs_to_bin_files(int num_active, const float* coords)
@@ -2625,6 +2727,117 @@ void DPVO::save_ba_inputs_to_bin_files(int num_active, const float* coords)
     const int MAX_EDGE = MAX_EDGES;  // 360 (from patch_graph.hpp)
     ba_file_io::save_metadata(get_bin_file_path("test_metadata.txt"), num_active, MAX_EDGE, m_DIM, 
                               CORR_DIM, M, P, N, logger);
+}
+
+// -----------------------------------------------------------------------------
+// Save keyframe inputs (before keyframe removal)
+// -----------------------------------------------------------------------------
+void DPVO::save_keyframe_inputs(int n, int m_before, int num_edges_before)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    if (logger) {
+        logger->info("DPVO::keyframe: Saving keyframe inputs for frame {} (n={}, m={}, num_edges={})", 
+                    TARGET_FRAME, n, m_before, num_edges_before);
+    }
+    
+    const int M = PatchGraph::M;
+    const int P = PatchGraph::P;
+    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    
+    // Save state before keyframe
+    ba_file_io::save_poses(get_bin_file_path("keyframe_poses_before_frame" + frame_suffix + ".bin"), 
+                           m_pg.m_poses, n, logger);
+    ba_file_io::save_patches(get_bin_file_path("keyframe_patches_before_frame" + frame_suffix + ".bin"), 
+                             m_pg.m_patches, n, M, P, logger);
+    ba_file_io::save_intrinsics(get_bin_file_path("keyframe_intrinsics_before_frame" + frame_suffix + ".bin"), 
+                                m_pg.m_intrinsics, n, logger);
+    ba_file_io::save_timestamps(get_bin_file_path("keyframe_tstamps_before_frame" + frame_suffix + ".bin"), 
+                                m_pg.m_tstamps, n, logger);
+    ba_file_io::save_colors(get_bin_file_path("keyframe_colors_before_frame" + frame_suffix + ".bin"), 
+                            m_pg.m_colors, n, M, logger);
+    ba_file_io::save_index(get_bin_file_path("keyframe_index_before_frame" + frame_suffix + ".bin"), 
+                           m_pg.m_index, n, M, logger);
+    ba_file_io::save_ix(get_bin_file_path("keyframe_ix_before_frame" + frame_suffix + ".bin"), 
+                       m_pg.m_ix, n * M, logger);
+    
+    // Save edges before
+    ba_file_io::save_int32_array(get_bin_file_path("keyframe_ii_before_frame" + frame_suffix + ".bin"), 
+                                 reinterpret_cast<const int32_t*>(m_pg.m_ii), num_edges_before, logger);
+    ba_file_io::save_int32_array(get_bin_file_path("keyframe_jj_before_frame" + frame_suffix + ".bin"), 
+                                 reinterpret_cast<const int32_t*>(m_pg.m_jj), num_edges_before, logger);
+    ba_file_io::save_int32_array(get_bin_file_path("keyframe_kk_before_frame" + frame_suffix + ".bin"), 
+                                 reinterpret_cast<const int32_t*>(m_pg.m_kk), num_edges_before, logger);
+}
+
+// -----------------------------------------------------------------------------
+// Save keyframe outputs (after keyframe removal)
+// -----------------------------------------------------------------------------
+void DPVO::save_keyframe_outputs(int n_before, int m_before, int num_edges_before,
+                                 int n_after, int m_after, int num_edges_after,
+                                 int i, int j, float m, bool should_remove)
+{
+    auto logger = spdlog::get("dpvo");
+    if (!logger) {
+#ifdef SPDLOG_USE_SYSLOG
+        logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
+#else
+        logger = spdlog::stdout_color_mt("dpvo");
+        logger->set_pattern("[%n] [%^%l%$] %v");
+#endif
+    }
+    
+    const int M = PatchGraph::M;
+    const int P = PatchGraph::P;
+    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    
+    // Save state after keyframe
+    ba_file_io::save_poses(get_bin_file_path("keyframe_poses_after_frame" + frame_suffix + ".bin"), 
+                           m_pg.m_poses, n_after, logger);
+    ba_file_io::save_patches(get_bin_file_path("keyframe_patches_after_frame" + frame_suffix + ".bin"), 
+                             m_pg.m_patches, n_after, M, P, logger);
+    ba_file_io::save_intrinsics(get_bin_file_path("keyframe_intrinsics_after_frame" + frame_suffix + ".bin"), 
+                                m_pg.m_intrinsics, n_after, logger);
+    ba_file_io::save_timestamps(get_bin_file_path("keyframe_tstamps_after_frame" + frame_suffix + ".bin"), 
+                                m_pg.m_tstamps, n_after, logger);
+    ba_file_io::save_colors(get_bin_file_path("keyframe_colors_after_frame" + frame_suffix + ".bin"), 
+                            m_pg.m_colors, n_after, M, logger);
+    ba_file_io::save_index(get_bin_file_path("keyframe_index_after_frame" + frame_suffix + ".bin"), 
+                           m_pg.m_index, n_after, M, logger);
+    ba_file_io::save_ix(get_bin_file_path("keyframe_ix_after_frame" + frame_suffix + ".bin"), 
+                       m_pg.m_ix, n_after * M, logger);
+    
+    // Save edges after
+    ba_file_io::save_int32_array(get_bin_file_path("keyframe_ii_after_frame" + frame_suffix + ".bin"), 
+                                 reinterpret_cast<const int32_t*>(m_pg.m_ii), num_edges_after, logger);
+    ba_file_io::save_int32_array(get_bin_file_path("keyframe_jj_after_frame" + frame_suffix + ".bin"), 
+                                 reinterpret_cast<const int32_t*>(m_pg.m_jj), num_edges_after, logger);
+    ba_file_io::save_int32_array(get_bin_file_path("keyframe_kk_after_frame" + frame_suffix + ".bin"), 
+                                 reinterpret_cast<const int32_t*>(m_pg.m_kk), num_edges_after, logger);
+    
+    // Save metadata
+    int k = should_remove ? (n_before - m_cfg.KEYFRAME_INDEX) : -1;
+    ba_file_io::save_keyframe_metadata(
+        get_bin_file_path("keyframe_metadata_frame" + frame_suffix + ".txt"),
+        n_before, m_before, num_edges_before,
+        n_after, m_after, num_edges_after,
+        i, j, k, m, should_remove,
+        m_cfg.KEYFRAME_INDEX, m_cfg.KEYFRAME_THRESH, m_cfg.PATCH_LIFETIME, m_cfg.REMOVAL_WINDOW,
+        logger
+    );
+    
+    if (logger) {
+        logger->info("DPVO::keyframe: Saved keyframe outputs for frame {} (n_before={}→n_after={}, m_before={}→m_after={}, edges_before={}→edges_after={})", 
+                    TARGET_FRAME, n_before, n_after, m_before, m_after, num_edges_before, num_edges_after);
+    }
 }
 
 // -----------------------------------------------------------------------------
