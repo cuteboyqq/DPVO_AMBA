@@ -657,6 +657,9 @@ def compare_results(bin_dir: str, frame_num: int, metadata: dict, python_state: 
     cpp_index = load_index(os.path.join(bin_dir, f"keyframe_index_after_{frame_suffix}.bin"), n_after, M)
     py_index = load_index(os.path.join(bin_dir, f"keyframe_index_after_py_{frame_suffix}.bin"), n_after, M)
     
+    # Also load "before" indices to understand what was shifted
+    cpp_index_before = load_index(os.path.join(bin_dir, f"keyframe_index_before_{frame_suffix}.bin"), metadata['n_before'], M)
+    
     index_match = np.array_equal(cpp_index, py_index)
     print("Index Comparison:")
     print("-" * 80)
@@ -668,6 +671,56 @@ def compare_results(bin_dir: str, frame_num: int, metadata: dict, python_state: 
         diff_mask = cpp_index != py_index
         diff_count = np.sum(diff_mask)
         print(f"  Details: {diff_count} mismatches out of {n_after * M} total")
+        
+        # Show detailed mismatch information
+        print()
+        print("  Detailed Mismatches:")
+        print("  " + "-" * 100)
+        print(f"  {'Frame':<8} {'Patch':<8} {'C++ After':<12} {'Python After':<15} {'C++ Before[frame+1]':<20} {'Diff':<10}")
+        print("  " + "-" * 100)
+        
+        mismatch_count = 0
+        max_mismatches_to_show = 20  # Limit output
+        
+        # Find which frame was removed (k)
+        k = metadata.get('k', metadata['n_before'] - metadata.get('KEYFRAME_INDEX', 4))
+        
+        for frame_idx in range(n_after):
+            for patch_idx in range(M):
+                if cpp_index[frame_idx, patch_idx] != py_index[frame_idx, patch_idx]:
+                    cpp_val = cpp_index[frame_idx, patch_idx]
+                    py_val = py_index[frame_idx, patch_idx]
+                    diff = abs(cpp_val - py_val)
+                    
+                    # Show what C++ had before shifting (frame_idx+1 before shift)
+                    cpp_before_val = "N/A"
+                    if frame_idx + 1 < metadata['n_before']:
+                        cpp_before_val = str(cpp_index_before[frame_idx + 1, patch_idx])
+                    
+                    print(f"  {frame_idx:<8} {patch_idx:<8} {cpp_val:<12} {py_val:<15} {cpp_before_val:<20} {diff:<10}")
+                    mismatch_count += 1
+                    if mismatch_count >= max_mismatches_to_show:
+                        remaining = diff_count - max_mismatches_to_show
+                        if remaining > 0:
+                            print(f"  ... ({remaining} more mismatches)")
+                        break
+            if mismatch_count >= max_mismatches_to_show:
+                break
+        
+        print("  " + "-" * 100)
+        print(f"  Note: Frame k={k} was removed. After removal, frame {k+1} shifted to position {k}.")
+        print(f"        'C++ Before[frame+1]' shows what C++ had at frame {k+1} BEFORE shifting.")
+        
+        # Show summary statistics
+        if diff_count > 0:
+            cpp_vals = cpp_index[diff_mask]
+            py_vals = py_index[diff_mask]
+            print(f"\n  Summary:")
+            print(f"    C++ index values: {np.unique(cpp_vals)}")
+            print(f"    Python index values: {np.unique(py_vals)}")
+            print(f"    Average C++ index: {np.mean(cpp_vals):.2f}")
+            print(f"    Average Python index: {np.mean(py_vals):.2f}")
+            print(f"    Average difference: {np.mean(np.abs(cpp_vals - py_vals)):.2f}")
     print("-" * 80)
     print()
 

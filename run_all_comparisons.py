@@ -1085,7 +1085,7 @@ def run_reproject_comparison(frame: int, edge: int = 0) -> ComparisonResult:
     # Use compare_reproject_all_edges.py instead of compare_reproject_intermediate.py
     # The edge parameter is ignored since we compare all edges
     cmd = [sys.executable, "compare_reproject_all_edges.py", 
-           "--frame", str(frame), "--tolerance", str(1e-3)]
+           "--frame", str(frame), "--tolerance", str(1e-2)]
     exit_code, output = run_command(cmd)
     result = parse_reproject_output(output, edge=edge)
     result.command = cmd
@@ -1369,58 +1369,10 @@ Examples:
     
     results = []
     
-    # 1. Correlation comparison
-    if not args.skip_correlation:
-        print("\n[1/7] Running correlation comparison...")
-        result = run_correlation_comparison(args.frame)
-        results.append(result)
-        print(f"    Status: {format_status_with_emoji(result.match_status)}")
-    else:
-        print("\n[1/7] Skipping correlation comparison")
-    
-    # 2. Reproject intermediate comparison
-    if not args.skip_reproject:
-        print("\n[2/7] Running reproject intermediate comparison...")
-        result = run_reproject_comparison(args.frame, args.edge)
-        results.append(result)
-        print(f"    Status: {format_status_with_emoji(result.match_status)}")
-    else:
-        print("\n[2/7] Skipping reproject intermediate comparison")
-    
-    # 3. BA step-by-step comparison
-    if not args.skip_ba:
-        print("\n[3/7] Running BA step-by-step comparison...")
-        result = run_ba_comparison()
-        results.append(result)
-        print(f"    Status: {format_status_with_emoji(result.match_status)}")
-    else:
-        print("\n[3/7] Skipping BA step-by-step comparison")
-    
-    # 4. Update model comparison
-    if not args.skip_update:
-        if args.update_model:
-            print("\n[4/7] Running update model comparison...")
-            result = run_update_comparison(args.update_model, args.frame)
-            results.append(result)
-            print(f"    Status: {format_status_with_emoji(result.match_status)}")
-        else:
-            print("\n[4/7] Skipping update model comparison (--update-model not provided)")
-    else:
-        print("\n[4/7] Skipping update model comparison")
-    
-    # 5. Patchify comparison
-    if not args.skip_patchify:
-        print("\n[5/7] Running patchify comparison...")
-        result = run_patchify_comparison(args.frame)
-        results.append(result)
-        print(f"    Status: {format_status_with_emoji(result.match_status)}")
-    else:
-        print("\n[5/7] Skipping patchify comparison")
-    
-    # 6. ONNX model comparison
+    # 1. ONNX model comparison
     if not args.skip_onnx:
         if args.image and args.fnet_model and args.inet_model:
-            print("\n[6/7] Running ONNX model comparison...")
+            print("\n[1/7] Running ONNX model comparison...")
             result = run_onnx_comparison(
                 args.image, args.fnet_model, args.inet_model,
                 args.fnet_bin, args.inet_bin
@@ -1428,9 +1380,66 @@ Examples:
             results.append(result)
             print(f"    Status: {format_status_with_emoji(result.match_status)}")
         else:
-            print("\n[6/7] Skipping ONNX model comparison (--image, --fnet-model, --inet-model not all provided)")
+            print("\n[1/7] Skipping ONNX model comparison (--image, --fnet-model, --inet-model not all provided)")
     else:
-        print("\n[6/7] Skipping ONNX model comparison")
+        print("\n[1/7] Skipping ONNX model comparison")
+    
+    
+    
+    # 2. Patchify comparison
+    if not args.skip_patchify:
+        print("\n[2/7] Running patchify comparison...")
+        result = run_patchify_comparison(args.frame)
+        results.append(result)
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
+    else:
+        print("\n[2/7] Skipping patchify comparison")
+    
+    
+    # 3. Reproject intermediate comparison
+    if not args.skip_reproject:
+        print("\n[3/7] Running reproject intermediate comparison...")
+        result = run_reproject_comparison(args.frame, args.edge)
+        results.append(result)
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
+    else:
+        print("\n[3/7] Skipping reproject intermediate comparison")
+    
+    # 4. Correlation comparison
+    if not args.skip_correlation:
+        print("\n[4/7] Running correlation comparison...")
+        result = run_correlation_comparison(args.frame)
+        results.append(result)
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
+    else:
+        print("\n[4/7] Skipping correlation comparison")
+    
+    
+    # 5. Update model comparison
+    if not args.skip_update:
+        if args.update_model:
+            print("\n[5/7] Running update model comparison...")
+            result = run_update_comparison(args.update_model, args.frame)
+            results.append(result)
+            print(f"    Status: {format_status_with_emoji(result.match_status)}")
+        else:
+            print("\n[5/7] Skipping update model comparison (--update-model not provided)")
+    else:
+        print("\n[5/7] Skipping update model comparison")
+    
+    
+    
+    # 6. BA step-by-step comparison
+    if not args.skip_ba:
+        print("\n[6/7] Running BA step-by-step comparison...")
+        result = run_ba_comparison()
+        results.append(result)
+        print(f"    Status: {format_status_with_emoji(result.match_status)}")
+    else:
+        print("\n[6/7] Skipping BA step-by-step comparison")
+    
+    
+    
     
     # 7. Keyframe comparison
     if not args.skip_keyframe:

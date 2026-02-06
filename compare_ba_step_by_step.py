@@ -2047,8 +2047,27 @@ def main():
         wJiT_py, wJjT_py, wJzT_py, r_py_masked, num_active
     )
     
-    # STEP 7: Fix first pose (gauge freedom)
-    n_py, n_adjusted_py, ii_py_adjusted, jj_py_adjusted = step7_fix_first_pose(ii_torch, jj_torch)
+    # CRITICAL FIX: Compute t0 (fixedp) to match C++ BA logic BEFORE STEP 7
+    # C++: t0 = m_pg.m_n - OPTIMIZATION_WINDOW if m_is_initialized else 1
+    #      t0 = max(t0, 1)
+    # Python: OPTIMIZATION_WINDOW = 12 (from config.py)
+    OPTIMIZATION_WINDOW = 12
+    # Compute n_py first to determine if initialized
+    n_py_temp = max(ii_torch.max().item(), jj_torch.max().item()) + 1
+    # Assume initialized if n_py > OPTIMIZATION_WINDOW (reasonable heuristic)
+    is_initialized = (n_py_temp > OPTIMIZATION_WINDOW)
+    t0 = (n_py_temp - OPTIMIZATION_WINDOW) if is_initialized else 1
+    t0 = max(t0, 1)
+    fixedp = t0
+    
+    print(f"\n  🔧 BA fixedp computation (matching C++):")
+    print(f"     n_py={n_py_temp}, OPTIMIZATION_WINDOW={OPTIMIZATION_WINDOW}, is_initialized={is_initialized}")
+    print(f"     t0 = {n_py_temp} - {OPTIMIZATION_WINDOW} = {n_py_temp - OPTIMIZATION_WINDOW} (if initialized) or 1 (if not)")
+    print(f"     t0 = max({t0}, 1) = {t0}")
+    print(f"     fixedp = {fixedp}, will optimize poses [{fixedp}, {n_py_temp-1}]")
+    
+    # STEP 7: Fix first pose (gauge freedom) - now uses computed fixedp
+    n_py, n_adjusted_py, ii_py_adjusted, jj_py_adjusted = step7_fix_first_pose(ii_torch, jj_torch, fixedp=fixedp)
     
     # STEP 8: Reindex structure variables
     kx_py, kk_py_new, m_py = step8_reindex_structure(kk_torch)
@@ -2086,9 +2105,9 @@ def main():
     # Reshape dX for STEP 17 (matching Python BA: dX.view(b, -1, 6))
     dX_py = dX_py_raw.view(1, -1, 6)
     
-    # STEP 17: Apply updates
+    # STEP 17: Apply updates (fixedp was computed before STEP 7)
     poses_py_updated, patches_py_updated = step17_apply_updates(
-        poses_se3, patches_torch, dX_py, dZ_py, kx_py, fixedp=1, n_adjusted_py=n_adjusted_py
+        poses_se3, patches_torch, dX_py, dZ_py, kx_py, fixedp=fixedp, n_adjusted_py=n_adjusted_py
     )
     
     # Compare final outputs
