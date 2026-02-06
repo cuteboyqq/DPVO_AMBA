@@ -427,6 +427,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         int j = m_pg.m_jj[e];      // target frame index
         n = std::max(n, std::max(i, j) + 1);
     }
+    
+    if (logger) {
+        logger->info("BA: fixedp={}, n={} (computed from edges), will optimize poses [{}, {}] (matching Python t0/t1 logic)", 
+                     fixedp, n, fixedp, n - 1);
+    }
 
     // ---------------------------------------------------------
     // Forward projection (coordinates) + Jacobians
@@ -794,6 +799,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     int n_adjusted = n - fixedp; // number of pose variables after fixing
+    
+    // CRITICAL: Early return if no poses to adjust (all poses are fixed)
+    // This prevents creating empty matrices and causing assertion failures
+    if (n_adjusted <= 0) {
+        if (logger) {
+            logger->warn("BA: Early return - n_adjusted={} (n={}, fixedp={}). All poses are fixed, nothing to optimize.",
+                        n_adjusted, n, fixedp);
+        }
+        return;  // No poses to optimize, skip BA
+    }
     
     if (logger) {
         logger->info("BA: num_active={}, n={}, fixedp={}, n_adjusted={}", 

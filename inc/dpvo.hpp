@@ -32,6 +32,7 @@ struct DPVOConfig {
     int KEYFRAME_THRESH;
     int PATCH_LIFETIME;
     int REMOVAL_WINDOW;
+    int OPTIMIZATION_WINDOW;  // Match Python's OPTIMIZATION_WINDOW=12
 
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
@@ -42,8 +43,9 @@ struct DPVOConfig {
           MAX_EDGE_AGE(360),
           KEYFRAME_INDEX(4),
           KEYFRAME_THRESH(10),
-          PATCH_LIFETIME(4), // 6 
-          REMOVAL_WINDOW(8)
+          PATCH_LIFETIME(6), // 6 
+          REMOVAL_WINDOW(8),
+          OPTIMIZATION_WINDOW(12)  // Match Python default
     {}
 };
 

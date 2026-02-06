@@ -547,35 +547,42 @@ void DPVOViewer::drawPoses()
             glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
         }
         
-        // Camera position (pyramid tip at back)
-        Eigen::Vector3f tip(cam_x, cam_y, cam_z);
+        // Camera position (square base at camera position - represents camera view)
+        Eigen::Vector3f square_center(cam_x, cam_y, cam_z);
         
-        // Square face is in front of camera (forward direction)
-        Eigen::Vector3f base_center = tip + forward * pyramid_height;
+        // Pyramid tip/point is at head (forward direction from camera)
+        Eigen::Vector3f tip = square_center + forward * pyramid_height;
         
-        // Base square corners
-        Eigen::Vector3f base_corner1 = base_center + right * pyramid_base_size + up * pyramid_base_size;
-        Eigen::Vector3f base_corner2 = base_center - right * pyramid_base_size + up * pyramid_base_size;
-        Eigen::Vector3f base_corner3 = base_center - right * pyramid_base_size - up * pyramid_base_size;
-        Eigen::Vector3f base_corner4 = base_center + right * pyramid_base_size - up * pyramid_base_size;
+        // Square corners (square at camera position, represents camera view)
+        Eigen::Vector3f base_corner1 = square_center + right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner2 = square_center - right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner3 = square_center - right * pyramid_base_size - up * pyramid_base_size;
+        Eigen::Vector3f base_corner4 = square_center + right * pyramid_base_size - up * pyramid_base_size;
         
-        // Draw pyramid using lines
+        // Set color for edges
+        if (i + 1 == m_numFrames) {
+            glColor3f(1.0f, 0.0f, 0.0f);  // Red for current frame
+        } else {
+            glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
+        }
+        
+        // Draw pyramid edges (lines from square corners to tip)
         glBegin(GL_LINES);
         
-        // Lines from tip to base corners
-        glVertex3f(tip.x(), tip.y(), tip.z());
+        // Lines from square corners (camera position) to tip (forward direction)
         glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
-        
         glVertex3f(tip.x(), tip.y(), tip.z());
+        
         glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
-        
         glVertex3f(tip.x(), tip.y(), tip.z());
+        
         glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
-        
         glVertex3f(tip.x(), tip.y(), tip.z());
-        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
         
-        // Base square edges
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        
+        // Base square edges (outline of square at camera position)
         glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
         glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
         
@@ -999,36 +1006,42 @@ void DPVOViewer::drawPoses_fake()
         const float pyramid_base_size = 0.01f;  // Size of pyramid base (reduced for better visibility)
         const float pyramid_height = 0.02f;      // Distance from tip to base (reduced for better visibility)
         
-        // Camera position (pyramid tip at back)
-        Eigen::Vector3f tip(cam_x, cam_y, cam_z);
+        // Camera position (square base at camera position - represents camera view)
+        Eigen::Vector3f square_center(cam_x, cam_y, cam_z);
         
-        // Square face is in front of camera (forward direction)
-        Eigen::Vector3f base_center = tip + forward * pyramid_height;
+        // Pyramid tip/point is at head (forward direction from camera)
+        Eigen::Vector3f tip = square_center + forward * pyramid_height;
         
-        // Base square corners
-        Eigen::Vector3f base_corner1 = base_center + right * pyramid_base_size + up * pyramid_base_size;
-        Eigen::Vector3f base_corner2 = base_center - right * pyramid_base_size + up * pyramid_base_size;
-        Eigen::Vector3f base_corner3 = base_center - right * pyramid_base_size - up * pyramid_base_size;
-        Eigen::Vector3f base_corner4 = base_center + right * pyramid_base_size - up * pyramid_base_size;
+        // Square corners (square at camera position, represents camera view)
+        Eigen::Vector3f base_corner1 = square_center + right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner2 = square_center - right * pyramid_base_size + up * pyramid_base_size;
+        Eigen::Vector3f base_corner3 = square_center - right * pyramid_base_size - up * pyramid_base_size;
+        Eigen::Vector3f base_corner4 = square_center + right * pyramid_base_size - up * pyramid_base_size;
         
-        // Draw pyramid using lines
+        // Set color for edges
+        if (i + 1 == m_numFrames) {
+            glColor3f(1.0f, 0.0f, 0.0f);  // Red for current frame
+        } else {
+            glColor3f(0.0f, 0.0f, 1.0f);  // Blue for other frames
+        }
+        
         glLineWidth(2.0f);
         glBegin(GL_LINES);
         
-        // Lines from tip to base corners
-        glVertex3f(tip.x(), tip.y(), tip.z());
+        // Lines from square corners (camera position) to tip (forward direction)
         glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
-        
         glVertex3f(tip.x(), tip.y(), tip.z());
+        
         glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
-        
         glVertex3f(tip.x(), tip.y(), tip.z());
+        
         glVertex3f(base_corner3.x(), base_corner3.y(), base_corner3.z());
-        
         glVertex3f(tip.x(), tip.y(), tip.z());
-        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
         
-        // Base square edges
+        glVertex3f(base_corner4.x(), base_corner4.y(), base_corner4.z());
+        glVertex3f(tip.x(), tip.y(), tip.z());
+        
+        // Base square edges (outline of square at camera position)
         glVertex3f(base_corner1.x(), base_corner1.y(), base_corner1.z());
         glVertex3f(base_corner2.x(), base_corner2.y(), base_corner2.z());
         

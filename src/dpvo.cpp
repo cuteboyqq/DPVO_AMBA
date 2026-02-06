@@ -346,6 +346,23 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     }
     
     // -------------------------------------------------
+    // 1. Save num_edges after patchify (before forward/backward edges)
+    // -------------------------------------------------
+    // Save num_edges right after patchify, before forward/backward edges are added
+    // This is needed for Python to correctly initialize the state
+    if (m_counter == TARGET_FRAME) {
+        int num_edges_after_patchify = m_pg.m_num_edges;
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        std::string num_edges_filename = get_bin_file_path("cpp_num_edges_after_patchify_frame" + frame_suffix + ".bin");
+        int32_t num_edges_value = static_cast<int32_t>(num_edges_after_patchify);
+        ba_file_io::save_int32_array(num_edges_filename, &num_edges_value, 1, logger);
+        if (logger) {
+            logger->info("DPVO::runAfterPatchify: Saved num_edges={} after patchify (before forward/backward) to {}", 
+                        num_edges_after_patchify, num_edges_filename);
+        }
+    }
+
+    // -------------------------------------------------
     // 2. Bookkeeping
     // -------------------------------------------------
     if (logger) logger->info("DPVO::runAfterPatchify: Starting bookkeeping, n={}", n_use);
@@ -740,26 +757,42 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     if (logger) logger->info("DPVO::runAfterPatchify: Downsample fmap1->fmap2 completed");
 
     // -------------------------------------------------
-    // 7. Motion probe check
+    // 7. Counter increment (before motion probe check, matching Python)
     // -------------------------------------------------
+    // Python: self.counter += 1 (line 1337) happens BEFORE motion probe check
+    // This ensures counter is incremented even if frame is skipped
+    m_counter++;
+    if (logger) logger->info("DPVO::runAfterPatchify: Incremented m_counter to {} (before motion probe check)", m_counter);
+
+    // -------------------------------------------------
+    // 8. Motion probe check
+    // -------------------------------------------------
+    // Python: if self.n > 0 and not self.is_initialized:
+    //             if self.motion_probe() < 2.0:
+    //                 self.pg.delta[self.counter - 1] = (self.counter - 2, Id[0])
+    //                 return
     if (n_use > 0 && !m_is_initialized) {
         if (logger) logger->info("DPVO::runAfterPatchify: Running motion probe check before initialization");
         float motion_val = motionProbe();
         if (motion_val < 2.0f) {
-            if (logger) logger->info("DPVO::runAfterPatchify: Motion probe returned {} < 2.0, skipping frame", motion_val);
+            if (logger) {
+                logger->info("DPVO::runAfterPatchify: Motion probe returned {} < 2.0, skipping frame", motion_val);
+                logger->info("DPVO::runAfterPatchify: NOTE - Python stores delta[self.counter-1] = (self.counter-2, Id[0]) here, "
+                            "but C++ doesn't have delta dictionary structure (used for loop closure)");
+            }
             return;
         }
         if (logger) logger->info("DPVO::runAfterPatchify: Motion probe returned {} >= 2.0, proceeding", motion_val);
     }
 
     // -------------------------------------------------
-    // 8. Counters
+    // 9. Update frame and patch counters
     // -------------------------------------------------
-    if (logger) logger->info("DPVO::runAfterPatchify: Updating counters");
+    // Python: self.n += 1; self.m += self.M (lines 1343-1344)
+    if (logger) logger->info("DPVO::runAfterPatchify: Updating frame and patch counters");
     try {
         m_pg.m_n = n_use + 1;
         m_pg.m_m += M;
-        m_counter++;
         if (logger) logger->info("DPVO::runAfterPatchify: Counters updated, m_n={} (current window size), m_m={}, m_counter={} (total frames processed)", 
                                  m_pg.m_n, m_pg.m_m, m_counter);
     } catch (...) {
@@ -768,7 +801,7 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     }
 
     // -------------------------------------------------
-    // 9. Build edges
+    // 11. Build edges
     // -------------------------------------------------
     if (logger) logger->info("DPVO::runAfterPatchify: Starting build edges");
     std::vector<int> kk, jj;
@@ -780,9 +813,22 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     if (logger) logger->info("DPVO::runAfterPatchify: edgesBackward completed, kk.size()={}, jj.size()={}", kk.size(), jj.size());
     appendFactors(kk, jj);
     if (logger) logger->info("DPVO::runAfterPatchify: appendFactors (backward) completed");
+    
+    // Save num_edges after forward/backward edges are added (for comparison with Python)
+    if (m_counter == TARGET_FRAME) {
+        int num_edges_after_forward_backward = m_pg.m_num_edges;
+        std::string frame_suffix = std::to_string(TARGET_FRAME);
+        std::string num_edges_filename = get_bin_file_path("cpp_num_edges_after_forward_backward_frame" + frame_suffix + ".bin");
+        int32_t num_edges_value = static_cast<int32_t>(num_edges_after_forward_backward);
+        ba_file_io::save_int32_array(num_edges_filename, &num_edges_value, 1, logger);
+        if (logger) {
+            logger->info("DPVO::runAfterPatchify: Saved num_edges={} after forward/backward edges to {}", 
+                        num_edges_after_forward_backward, num_edges_filename);
+        }
+    }
 
     // -------------------------------------------------
-    // 10. Optimization
+    // 11. Optimization
     // -------------------------------------------------
     if (logger) logger->info("DPVO::runAfterPatchify: Starting optimization, m_is_initialized={}, m_n={}", m_is_initialized, m_pg.m_n);
     if (m_is_initialized) {
@@ -894,19 +940,19 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     // This prevents buffer overflow when motion is consistently high
     // CRITICAL: Cap sliding window size to reasonable value (36-50 frames) regardless of BUFFER_SIZE
     // BUFFER_SIZE is for ring buffers (m_imap, m_gmap), not sliding window size
-    const int MAX_SLIDING_WINDOW_SIZE = 50;  // Maximum reasonable sliding window size
-    const int PROACTIVE_THRESHOLD = MAX_SLIDING_WINDOW_SIZE - 3;  // Start removing when n >= 47
-    if (n >= PROACTIVE_THRESHOLD && m_is_initialized) {
-        auto logger = spdlog::get("dpvo");
-        if (logger) {
-            logger->warn("DPVO::run: Buffer nearly full (n={} >= {}), proactively calling keyframe() to remove frames", 
-                         n, PROACTIVE_THRESHOLD);
-        }
-        // Call keyframe() to remove frames before adding a new one
-        keyframe();
-        // Update n after keyframe removal
-        n = m_pg.m_n;
-    }
+    // const int MAX_SLIDING_WINDOW_SIZE = 50;  // Maximum reasonable sliding window size
+    // const int PROACTIVE_THRESHOLD = MAX_SLIDING_WINDOW_SIZE - 3;  // Start removing when n >= 47
+    // if (n >= PROACTIVE_THRESHOLD && m_is_initialized) {
+    //     auto logger = spdlog::get("dpvo");
+    //     if (logger) {
+    //         logger->warn("DPVO::run: Buffer nearly full (n={} >= {}), proactively calling keyframe() to remove frames", 
+    //                      n, PROACTIVE_THRESHOLD);
+    //     }
+    //     // Call keyframe() to remove frames before adding a new one
+    //     keyframe();
+    //     // Update n after keyframe removal
+    //     n = m_pg.m_n;
+    // }
     
     if (n + 1 >= PatchGraph::N) {
         auto logger = spdlog::get("dpvo");
@@ -1664,8 +1710,20 @@ void DPVO::update()
         save_ba_inputs_to_bin_files(num_active, coords.data());
     }
     
+    // CRITICAL FIX: Match Python's t0 computation for BA
+    // Python: t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
+    //         t0 = max(t0, 1)
+    // This ensures BA only optimizes the last OPTIMIZATION_WINDOW poses, matching Python
+    int t0 = m_is_initialized ? (m_pg.m_n - m_cfg.OPTIMIZATION_WINDOW) : 1;
+    t0 = std::max(t0, 1);
+    
+    if (logger) {
+        logger->info("BA: Computing t0 (fixedp) - m_pg.m_n={}, OPTIMIZATION_WINDOW={}, m_is_initialized={}, t0={}", 
+                     m_pg.m_n, m_cfg.OPTIMIZATION_WINDOW, m_is_initialized, t0);
+    }
+    
     try {
-        bundleAdjustment(1e-4f, 100.0f, false, 1);
+        bundleAdjustment(1e-4f, 100.0f, false, t0);
         
         // Save BA outputs (updated poses) for target frame
         if (save_ba_inputs) {
@@ -1718,10 +1776,10 @@ void DPVO::update()
                 }
             }
             
-            // Log detailed failure information if there are many failures
-            if (failed_count > 0 && logger && m_counter >= 30) {
-                logger->error("DPVO::update: CRITICAL - {} failed syncs out of {} poses! This indicates timestamp mismatch issue.",
-                             failed_count, m_pg.m_n);
+            // Log detailed failure information if there are failures (especially around frame 36)
+            if (failed_count > 0 && logger) {
+                logger->error("DPVO::update: CRITICAL - {} failed syncs out of {} poses! This indicates timestamp mismatch issue. m_counter={}",
+                             failed_count, m_pg.m_n, m_counter);
                 logger->error("DPVO::update: Failed timestamps (sw_idx, timestamp):");
                 for (const auto& [sw_idx, ts] : failed_timestamps) {
                     logger->error("  sw_idx={}, timestamp={}", sw_idx, ts);
@@ -1855,31 +1913,21 @@ void DPVO::keyframe() {
     // =============================================================
     // Phase A: Keyframe removal decision
     // =============================================================
-    // SAFETY CHECK: Force frame removal if buffer is getting full
-    // This prevents buffer overflow when motion is consistently high
-    // Python raises an exception, but we can be more graceful and force removal
-    // CRITICAL: Cap sliding window size to reasonable value (36-50 frames) regardless of BUFFER_SIZE
-    // BUFFER_SIZE is for ring buffers (m_imap, m_gmap), not sliding window size
-    const int MAX_SLIDING_WINDOW_SIZE = 36;  // Maximum reasonable sliding window size
-    const int SAFETY_THRESHOLD = MAX_SLIDING_WINDOW_SIZE - 0;  // Force removal when n >= 48
-    bool force_removal = (n >= SAFETY_THRESHOLD);
-    
+    // Python: i = self.n - self.cfg.KEYFRAME_INDEX - 1
+    //         j = self.n - self.cfg.KEYFRAME_INDEX + 1
+    //         m = self.motionmag(i, j) + self.motionmag(j, i)
+    //         if m / 2 < self.cfg.KEYFRAME_THRESH:
+    //             # remove frame k = self.n - self.cfg.KEYFRAME_INDEX
+    // Python does NOT force removal - it only removes if motion is low
+    // Matching Python exactly: no force removal logic
     int i = n - m_cfg.KEYFRAME_INDEX - 1;
     int j = n - m_cfg.KEYFRAME_INDEX + 1;
     
     float m = 0.0f;
     bool should_remove = false;
     
-    if (force_removal) {
-        // Buffer is getting full - force removal regardless of motion
-        should_remove = true;
-        auto logger = spdlog::get("dpvo");
-        if (logger) {
-            logger->warn("DPVO::keyframe: Buffer nearly full (n={} >= {}), forcing frame removal regardless of motion", 
-                         n, SAFETY_THRESHOLD);
-        }
-    } else if (i >= 0 && j >= 0) {
-        // Normal keyframe removal based on motion
+    if (i >= 0 && j >= 0) {
+        // Normal keyframe removal based on motion (matching Python exactly)
         m = motionMagnitude(i, j) + motionMagnitude(j, i);
         should_remove = (0.5f * m < m_cfg.KEYFRAME_THRESH);
         
@@ -1895,7 +1943,8 @@ void DPVO::keyframe() {
 
     if (should_remove) {
         // Determine which frame to remove
-        // Always use KEYFRAME_INDEX position for consistency with shifting logic
+        // Python: k = self.n - self.cfg.KEYFRAME_INDEX
+        // Always use KEYFRAME_INDEX position, matching Python exactly
         // Force removal just bypasses motion check, but still removes the same frame position
         int k = n - m_cfg.KEYFRAME_INDEX;
         
@@ -1908,12 +1957,14 @@ void DPVO::keyframe() {
         
         auto logger = spdlog::get("dpvo");
         if (logger) {
-            logger->info("DPVO::keyframe: Removing keyframe k={}, m_pg.m_n will decrease from {} to {} (force_removal={})", 
-                         k, n, n - 1, force_removal);
+            logger->info("DPVO::keyframe: Removing keyframe k={}, m_pg.m_n will decrease from {} to {} (motion={:.4f} < threshold={:.4f})", 
+                         k, n, n - 1, 0.5f * m, m_cfg.KEYFRAME_THRESH);
         }
 
         // CRITICAL: Sync pose of frame k to m_allPoses BEFORE removing it from sliding window
         // This ensures the removed frame has its latest optimized pose for visualization
+        // NOTE: This sync happens AFTER BA (which runs in update() before keyframe()),
+        // so the synced pose should be the latest optimized pose
         if (k >= 0 && k < n && !m_allTimestamps.empty()) {
             int64_t k_timestamp = m_pg.m_tstamps[k];
             int global_idx = -1;
@@ -1924,11 +1975,23 @@ void DPVO::keyframe() {
                 }
             }
             if (global_idx >= 0 && global_idx < static_cast<int>(m_allPoses.size())) {
-                m_allPoses[global_idx] = m_pg.m_poses[k];
+                // Store the pose BEFORE syncing (for comparison)
+                SE3 pose_before_sync = m_allPoses[global_idx];
+                SE3 pose_after_ba = m_pg.m_poses[k];
+                
+                // Sync the latest optimized pose (from BA) to historical buffer
+                m_allPoses[global_idx] = pose_after_ba;
+                
                 if (logger) {
-                    Eigen::Vector3f t = m_pg.m_poses[k].t;
-                    logger->info("DPVO::keyframe: Synced pose of frame k={} (global_idx={}) to m_allPoses before removal, t=({:.3f}, {:.3f}, {:.3f})",
-                                k, global_idx, t.x(), t.y(), t.z());
+                    Eigen::Vector3f t_before = pose_before_sync.t;
+                    Eigen::Vector3f t_after = pose_after_ba.t;
+                    Eigen::Vector3f t_diff = t_after - t_before;
+                    float t_diff_norm = t_diff.norm();
+                    
+                    logger->info("DPVO::keyframe: Synced pose of frame k={} (global_idx={}) to m_allPoses before removal", k, global_idx);
+                    logger->info("  Before sync: t=({:.3f}, {:.3f}, {:.3f})", t_before.x(), t_before.y(), t_before.z());
+                    logger->info("  After BA:    t=({:.3f}, {:.3f}, {:.3f})", t_after.x(), t_after.y(), t_after.z());
+                    logger->info("  Change:      t_diff_norm={:.6f} (should be small if pose was already synced after BA)", t_diff_norm);
                 }
             } else if (logger) {
                 logger->warn("DPVO::keyframe: Failed to sync pose of frame k={} (timestamp={}) before removal, global_idx={}, m_allTimestamps.size()={}, m_allPoses.size()={}",
@@ -3870,102 +3933,116 @@ void DPVO::updateViewer()
         }
         
         // Update poses
-        // CRITICAL: Use m_allPoses (all historical frames) instead of m_pg.m_poses (sliding window only)
-        // m_pg.m_n is the sliding window size (8-10 frames), but for visualization we want to see
-        // the full trajectory (all frames processed so far, tracked by m_counter)
+        // CRITICAL: Use m_allPoses (historical buffer) for visualization to show ALL frames
+        // The sync mechanism (after BA and before keyframe removal) ensures m_allPoses has the latest optimized poses
+        // This allows visualization of the full trajectory, not just the sliding window
         if (m_counter > 0 && !m_allPoses.empty()) {
-            // Pass all historical poses to viewer
-            // CRITICAL: m_counter is the total number of frames processed (0-indexed, so frame N has m_counter = N+1)
-            // But m_allPoses is indexed by m_counter (frame 0 stored at index 0, frame 1 at index 1, etc.)
-            // So after processing N frames, m_counter = N and m_allPoses should have N entries (indices 0 to N-1)
-            // However, we store at index m_counter BEFORE incrementing, so:
-            //   Frame 0: store at index 0, then m_counter becomes 1
-            //   Frame 1: store at index 1, then m_counter becomes 2
-            //   ...
-            //   Frame N: store at index N, then m_counter becomes N+1
-            // So after N frames, m_counter = N+1 and m_allPoses.size() should be N+1 (indices 0 to N)
-            // But we want to pass frames 0 to N (N+1 frames total), so we should pass m_counter frames
-            // Actually, wait - let me check the logic again:
-            //   After frame 0: m_counter=1, m_allPoses[0] exists, so we have 1 frame (index 0)
-            //   After frame 1: m_counter=2, m_allPoses[0] and m_allPoses[1] exist, so we have 2 frames
-            //   After frame N: m_counter=N+1, m_allPoses has indices 0 to N, so we have N+1 frames
-            // So we should pass m_counter frames (which equals the number of frames stored)
-            // CRITICAL: After processing N+1 frames (0 to N), m_counter = N+1 and m_allPoses has N+1 entries
-            // So we pass m_counter frames, which is correct
             int num_historical_frames = m_counter;
             
-            // CRITICAL: Ensure m_allPoses has enough entries
-            // If m_allPoses.size() < m_counter, it means some frames weren't stored
-            // This can happen if frames were processed before m_allPoses was initialized
-            // In that case, we can only pass what we have
+            // Ensure m_allPoses has enough entries
             if (num_historical_frames > static_cast<int>(m_allPoses.size())) {
                 if (logger) {
                     logger->warn("Viewer update: WARNING - m_counter={} > m_allPoses.size()={}. "
-                                 "Some frames were not stored in m_allPoses. Limiting to {} frames. "
-                                 "This suggests m_allPoses was not initialized early enough.",
+                                 "Some frames were not stored in m_allPoses. Limiting to {} frames.",
                                  m_counter, m_allPoses.size(), m_allPoses.size());
                 }
                 num_historical_frames = static_cast<int>(m_allPoses.size());
             }
             
-            // CRITICAL: If m_allPoses.size() is only 8 (sliding window size), it means we're only storing
-            // poses from the sliding window, not all historical frames. This is a bug.
-            if (num_historical_frames == m_pg.m_n && m_counter > m_pg.m_n && logger) {
-                logger->error("Viewer update: ERROR - Only {} poses stored (sliding window size) but {} frames processed. "
-                              "m_allPoses is not being populated correctly! Check that m_allPoses[m_counter] is set in run().",
-                              num_historical_frames, m_counter);
-            }
-            
-            // Debug: Log details to diagnose why only 8 frames are shown
-            static int viewer_update_count = 0;
-            bool should_log_poses = (viewer_update_count++ % 5 == 0);  // Log every 5th update
-            
             if (logger) {
-                logger->info("Viewer update: m_pg.m_n={} (sliding window), m_counter={} (total frames processed), "
+                logger->info("Viewer update: Using historical poses (m_allPoses) for visualization, "
+                             "m_pg.m_n={} (sliding window size), m_counter={} (total frames processed), "
                              "m_allPoses.size()={}, passing {} frames to viewer", 
                              m_pg.m_n, m_counter, m_allPoses.size(), num_historical_frames);
                 
-                // Check if m_allPoses has valid data
-                int valid_poses_count = 0;
-                for (int i = 0; i < num_historical_frames; i++) {
-                    Eigen::Vector3f t = m_allPoses[i].t;
-                    if (std::isfinite(t.x()) && std::isfinite(t.y()) && std::isfinite(t.z())) {
-                        valid_poses_count++;
+                // Check for consecutive poses (to detect gaps)
+                // Frames removed from sliding window will have stale poses, causing jumps
+                int consecutive_count = 0;
+                int non_consecutive_gaps = 0;
+                std::vector<int> gap_frames;
+                for (int i = 1; i < num_historical_frames; i++) {
+                    Eigen::Vector3f t_prev = m_allPoses[i-1].t;
+                    Eigen::Vector3f t_curr = m_allPoses[i].t;
+                    Eigen::Vector3f t_diff = t_curr - t_prev;
+                    float t_diff_norm = t_diff.norm();
+                    
+                    // Check if poses are consecutive (translation should change smoothly)
+                    // Lower threshold (0.1) to detect smaller jumps that indicate stale poses
+                    // Normal frame-to-frame motion is typically < 0.1 units
+                    if (t_diff_norm > 0.1f) {
+                        non_consecutive_gaps++;
+                        gap_frames.push_back(i);
+                        if (non_consecutive_gaps <= 5) {
+                            logger->warn("Viewer update: Non-consecutive pose detected at frame {}: "
+                                       "t_diff_norm={:.3f} (prev: ({:.3f}, {:.3f}, {:.3f}), curr: ({:.3f}, {:.3f}, {:.3f}))",
+                                       i, t_diff_norm,
+                                       t_prev.x(), t_prev.y(), t_prev.z(),
+                                       t_curr.x(), t_curr.y(), t_curr.z());
+                        }
+                    } else {
+                        consecutive_count++;
                     }
                 }
-                logger->info("Viewer update: {} out of {} historical poses are valid", 
-                             valid_poses_count, num_historical_frames);
                 
-                // Debug: Log first 5 pose translations to see if they're all the same
-                if (should_log_poses && num_historical_frames > 0) {
-                    logger->info("Viewer update: First 5 pose translations (T_wc):");
-                    for (int i = 0; i < std::min(5, num_historical_frames); i++) {
-                        Eigen::Vector3f t = m_allPoses[i].t;
-                        logger->info("  Frame[{}]: t=({:.3f}, {:.3f}, {:.3f}), norm={:.3f}", 
-                                     i, t.x(), t.y(), t.z(), t.norm());
+                if (non_consecutive_gaps > 0) {
+                    logger->warn("Viewer update: Found {} non-consecutive pose gaps out of {} frame transitions. "
+                                "This indicates stale poses for frames removed from sliding window.",
+                                non_consecutive_gaps, num_historical_frames - 1);
+                    if (gap_frames.size() <= 10) {
+                        std::string gap_str;
+                        for (size_t idx = 0; idx < gap_frames.size(); idx++) {
+                            if (idx > 0) gap_str += ", ";
+                            gap_str += std::to_string(gap_frames[idx]);
+                        }
+                        logger->warn("Viewer update: Gap frames: [{}]", gap_str);
+                    } else {
+                        std::string gap_str;
+                        for (size_t idx = 0; idx < 5; idx++) {
+                            if (idx > 0) gap_str += ", ";
+                            gap_str += std::to_string(gap_frames[idx]);
+                        }
+                        gap_str += ", ..., ";
+                        for (size_t idx = gap_frames.size() - 5; idx < gap_frames.size(); idx++) {
+                            gap_str += std::to_string(gap_frames[idx]);
+                            if (idx < gap_frames.size() - 1) gap_str += ", ";
+                        }
+                        logger->warn("Viewer update: Gap frames (first 5, last 5): [{}]", gap_str);
+                    }
+                }
+                
+                // Log first 3 and last 3 poses being passed to viewer
+                if (num_historical_frames > 0) {
+                    logger->info("Viewer update: About to pass {} historical poses to viewer. First 3 poses (T_wc):", 
+                                 num_historical_frames);
+                    for (int i = 0; i < std::min(3, num_historical_frames); i++) {
+                        Eigen::Vector3f t_wc = m_allPoses[i].t;
+                        Eigen::Quaternionf q_wc = m_allPoses[i].q;
+                        SE3 T_cw = m_allPoses[i].inverse();
+                        Eigen::Vector3f t_cw = T_cw.t;
+                        logger->info("  Historical[{}]: T_wc.t=({:.3f}, {:.3f}, {:.3f}), T_cw.t=({:.3f}, {:.3f}, {:.3f}), "
+                                     "q_wc=({:.3f}, {:.3f}, {:.3f}, {:.3f})",
+                                     i, t_wc.x(), t_wc.y(), t_wc.z(), t_cw.x(), t_cw.y(), t_cw.z(),
+                                     q_wc.x(), q_wc.y(), q_wc.z(), q_wc.w());
+                    }
+                    if (num_historical_frames > 3) {
+                        logger->info("Viewer update: Last 3 poses (T_wc):");
+                        for (int i = std::max(3, num_historical_frames - 3); i < num_historical_frames; i++) {
+                            Eigen::Vector3f t_wc = m_allPoses[i].t;
+                            Eigen::Quaternionf q_wc = m_allPoses[i].q;
+                            SE3 T_cw = m_allPoses[i].inverse();
+                            Eigen::Vector3f t_cw = T_cw.t;
+                            logger->info("  Historical[{}]: T_wc.t=({:.3f}, {:.3f}, {:.3f}), T_cw.t=({:.3f}, {:.3f}, {:.3f}), "
+                                         "q_wc=({:.3f}, {:.3f}, {:.3f}, {:.3f})",
+                                         i, t_wc.x(), t_wc.y(), t_wc.z(), t_cw.x(), t_cw.y(), t_cw.z(),
+                                         q_wc.x(), q_wc.y(), q_wc.z(), q_wc.w());
+                        }
                     }
                 }
             }
             
-            // DIAGNOSTIC: Log poses being passed to viewer to verify they're correct
-            if (logger && num_historical_frames > 0) {
-                logger->info("Viewer update: About to pass {} poses to viewer. First 3 poses (T_wc):", num_historical_frames);
-                for (int i = 0; i < std::min(3, num_historical_frames); i++) {
-                    Eigen::Vector3f t_wc = m_allPoses[i].t;
-                    Eigen::Quaternionf q_wc = m_allPoses[i].q;
-                    SE3 T_cw = m_allPoses[i].inverse();
-                    Eigen::Vector3f t_cw = T_cw.t;
-                    logger->info("  Frame[{}]: T_wc.t=({:.3f}, {:.3f}, {:.3f}), T_cw.t=({:.3f}, {:.3f}, {:.3f}), "
-                                 "q_wc=({:.3f}, {:.3f}, {:.3f}, {:.3f})",
-                                 i, t_wc.x(), t_wc.y(), t_wc.z(), t_cw.x(), t_cw.y(), t_cw.z(),
-                                 q_wc.x(), q_wc.y(), q_wc.z(), q_wc.w());
-                }
-            }
-            
-            // CRITICAL: Pass all historical poses to viewer, even though some may have stale poses
-            // Frames that have been removed from the sliding window by keyframe() will have poses
-            // from when they were last optimized. This is correct for optimization but may cause
-            // visualization jumps. The viewer should handle this gracefully.
+            // CRITICAL: Pass all historical poses to viewer
+            // The sync mechanism ensures frames in the sliding window have the latest optimized poses
+            // Frames removed from the sliding window retain their last optimized pose (synced before removal)
             m_viewer->updatePoses(m_allPoses.data(), num_historical_frames);
             if (logger && m_pg.m_n > 0) {
                 // Log first and last pose to track movement
