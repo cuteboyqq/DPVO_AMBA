@@ -36,7 +36,7 @@ struct DPVOConfig {
 
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
-          BUFFER_SIZE(4096),
+          BUFFER_SIZE(8192),
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
@@ -45,7 +45,7 @@ struct DPVOConfig {
           KEYFRAME_THRESH(10),
           PATCH_LIFETIME(6), // 6 
           REMOVAL_WINDOW(8),
-          OPTIMIZATION_WINDOW(12)  // Match Python default
+          OPTIMIZATION_WINDOW(5)  // Match Python default 12
     {}
 };
 
