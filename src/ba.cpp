@@ -421,11 +421,23 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     //   - m_pg.m_jj[e] = target frame index
     //   - Source frame i is extracted from kk: i = kk[e] / M
     // So we need: n = max(max(i from kk), max(jj)) + 1
-    int n = 0;
+    // 
+    // CRITICAL: Limit n to m_pg.m_n (actual sliding window size) to prevent optimizing
+    // unconstrained poses that have no edges. This prevents BA from optimizing hundreds
+    // of poses with 0 constraints, which is slow and causes wrong poses.
+    int n_max_from_edges = 0;
     for (int e = 0; e < num_active; e++) {
         int i = m_pg.m_kk[e] / M;  // source frame index (extracted from kk, matching reproject logic)
         int j = m_pg.m_jj[e];      // target frame index
-        n = std::max(n, std::max(i, j) + 1);
+        n_max_from_edges = std::max(n_max_from_edges, std::max(i, j) + 1);
+    }
+    
+    // Limit n to actual sliding window size to prevent optimizing unconstrained poses
+    int n = std::min(n_max_from_edges, m_pg.m_n);
+    
+    if (logger && n_max_from_edges > m_pg.m_n) {
+        logger->warn("BA: Limiting n from {} (from edges) to {} (sliding window size) to prevent optimizing unconstrained poses",
+                     n_max_from_edges, m_pg.m_n);
     }
     
     if (logger) {
@@ -798,6 +810,19 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         }
     }
     
+    // CRITICAL: Find the maximum pose index that actually has edges
+    // This prevents optimizing poses with 0 constraints (which causes slowdown and wrong poses)
+    int max_pose_with_edges = fixedp;
+    for (int pose_idx = fixedp; pose_idx < n; pose_idx++) {
+        int edges_as_i = edges_to_pose_i[pose_idx].size();
+        int edges_as_j = edges_to_pose_j[pose_idx].size();
+        if (edges_as_i > 0 || edges_as_j > 0) {
+            max_pose_with_edges = pose_idx + 1;  // +1 because n is exclusive
+        }
+    }
+    
+    // Limit n to only include poses that have edges
+    n = std::min(n, max_pose_with_edges);
     int n_adjusted = n - fixedp; // number of pose variables after fixing
     
     // CRITICAL: Early return if no poses to adjust (all poses are fixed)
@@ -811,8 +836,13 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     if (logger) {
-        logger->info("BA: num_active={}, n={}, fixedp={}, n_adjusted={}", 
+        logger->info("BA: num_active={}, n={} (limited to poses with edges), fixedp={}, n_adjusted={}", 
                      num_active, n, fixedp, n_adjusted);
+        
+        if (max_pose_with_edges < m_pg.m_n) {
+            logger->warn("BA: Limited optimization window from {} to {} poses (only poses with edges are optimized)",
+                        m_pg.m_n, max_pose_with_edges);
+        }
         
         // Debug: Log edge connections for first few poses
         for (int pose_idx = 0; pose_idx < std::min(5, n); pose_idx++) {

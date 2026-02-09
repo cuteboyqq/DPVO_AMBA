@@ -45,7 +45,7 @@ struct DPVOConfig {
           KEYFRAME_THRESH(10),
           PATCH_LIFETIME(6), // 6 
           REMOVAL_WINDOW(8),
-          OPTIMIZATION_WINDOW(5)  // Match Python default 12
+          OPTIMIZATION_WINDOW(5)  // Match Python default 12 , Alister test 5 on DPVO python , it works
     {}
 };
 

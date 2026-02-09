@@ -1064,39 +1064,6 @@ void DPVO::update()
     // 3. Context slice from imap
     // -------------------------------------------------
     
-    // Check m_imap buffer statistics before slicing
-    // if (logger) {
-    //     // Sample first few entries to check if m_imap is populated
-    //     float imap_sample_min = std::numeric_limits<float>::max();
-    //     float imap_sample_max = std::numeric_limits<float>::lowest();
-    //     int imap_sample_zero = 0;
-    //     int imap_sample_nonzero = 0;
-    //     int sample_size = std::min(100, M * m_pmem * m_DIM);
-    //     for (int i = 0; i < sample_size; i++) {
-    //         float val = m_imap[i];
-    //         if (val == 0.0f) imap_sample_zero++;
-    //         else imap_sample_nonzero++;
-    //         if (val < imap_sample_min) imap_sample_min = val;
-    //         if (val > imap_sample_max) imap_sample_max = val;
-    //     }
-        
-    //     // Also check the most recent frame (should be frame 8 if n=9, so pm=8)
-    //     int current_n = m_pg.m_n;
-    //     int current_pm = (current_n - 1) % m_pmem;  // Most recently written frame
-    //     int current_imap_offset = imap_idx(current_pm, 0, 0);
-    //     float current_frame_sample = m_imap[current_imap_offset];
-        
-    //     // Check all frames in ring buffer
-    //     int frames_with_data = 0;
-    //     int frames_without_data = 0;
-    //     for (int f = 0; f < m_pmem; f++) {
-    //         int frame_offset = imap_idx(f, 0, 0);
-    //         float frame_sample = m_imap[frame_offset];
-    //         if (frame_sample != 0.0f) frames_with_data++;
-    //         else frames_without_data++;
-    //     }
-    // }
-    
     std::vector<float> ctx(num_active * m_DIM);
     for (int e = 0; e < num_active; e++) {
         // CRITICAL: kk is a linear patch index: kk = frame * M + patch
@@ -1307,7 +1274,7 @@ void DPVO::update()
         }
 #endif
         
-                if (inference_success)
+        if (inference_success)
         {
             
             // Save update model outputs when TARGET_FRAME matches
@@ -1378,7 +1345,7 @@ void DPVO::update()
                             if (val > net_out_max) net_out_max = val;
                         }
                     }
-                                    } else {
+                } else {
                     if (logger) logger->warn("DPVO::update: pred.netOutBuff is null - m_pg.m_net will not be updated");
                 }
             }
@@ -1410,7 +1377,7 @@ void DPVO::update()
     // -------------------------------------------------
     // 5. Compute target positions
     // -------------------------------------------------
-        // Compute target positions directly without validation (matching Python behavior)
+    // Compute target positions directly without validation (matching Python behavior)
     // Python: target = coords[...,self.P//2,self.P//2] + delta.float()
     // Python doesn't validate NaN/Inf - it relies on the framework to handle it
     for (int e = 0; e < num_active; e++) {
