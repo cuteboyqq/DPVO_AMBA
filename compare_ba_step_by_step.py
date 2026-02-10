@@ -1249,19 +1249,40 @@ def step9_assemble_hessian_b(Bii_py, Bij_py, Bji_py, Bjj_py, ii_py_adjusted, jj_
     # Compare with C++ STEP 9 assembled Hessian B
     B_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step9_B.bin"), warn_if_missing=True)
     if B_cpp_data is not None:
-        B_cpp = B_cpp_data.reshape(6 * n_adjusted_py, 6 * n_adjusted_py)
+        # CRITICAL: Infer n_adjusted from C++ file size, as C++ computes n differently
+        # C++ saves: 6 * n_adjusted * 6 * n_adjusted = 36 * n_adjusted^2 elements
+        # So: n_adjusted = sqrt(file_size / 36)
+        B_cpp_size = len(B_cpp_data)
+        n_adjusted_cpp = int(np.sqrt(B_cpp_size / 36))
+        if n_adjusted_cpp != n_adjusted_py:
+            print(f"\n  ⚠️  WARNING: C++ n_adjusted ({n_adjusted_cpp}) differs from Python ({n_adjusted_py})")
+            print(f"     C++ file size: {B_cpp_size} elements, inferred n_adjusted: {n_adjusted_cpp}")
+            print(f"     Python computed n_adjusted: {n_adjusted_py}")
+            print(f"     This is expected - C++ limits n based on filtered edges and max_pose_with_edges")
+            print(f"     Will compare using C++'s n_adjusted={n_adjusted_cpp}")
+        
+        B_cpp = B_cpp_data.reshape(6 * n_adjusted_cpp, 6 * n_adjusted_cpp)
+        # Reshape Python B to match C++ size (use first n_adjusted_cpp poses)
         B_py_reshaped = B_py[0].permute(0, 2, 1, 3).contiguous().view(6 * n_adjusted_py, 6 * n_adjusted_py).cpu().numpy()
+        # Extract the matching submatrix if sizes differ
+        if n_adjusted_cpp != n_adjusted_py:
+            B_py_reshaped = B_py_reshaped[:6*n_adjusted_cpp, :6*n_adjusted_cpp]
         
         # Debug: Find which block has the maximum difference (for summary only)
+        # Use the minimum size to avoid indexing errors
+        n_compare_blocks = min(n_adjusted_cpp, n_adjusted_py)
         diff_B = np.abs(B_cpp - B_py_reshaped)
-        max_diff_per_block = np.zeros((n_adjusted_py, n_adjusted_py))
-        for i in range(n_adjusted_py):
-            for j in range(n_adjusted_py):
+        max_diff_per_block = np.zeros((n_compare_blocks, n_compare_blocks))
+        for i in range(n_compare_blocks):
+            for j in range(n_compare_blocks):
                 block_diff = diff_B[6*i:6*(i+1), 6*j:6*(j+1)].max()
                 max_diff_per_block[i, j] = block_diff
         
-        max_block_i, max_block_j = np.unravel_index(max_diff_per_block.argmax(), max_diff_per_block.shape)
-        print(f"\n  🔍 Block with max difference: [{max_block_i}, {max_block_j}] (diff={max_diff_per_block[max_block_i, max_block_j]:.6e})")
+        if n_compare_blocks > 0:
+            max_block_i, max_block_j = np.unravel_index(max_diff_per_block.argmax(), max_diff_per_block.shape)
+            print(f"\n  🔍 Block with max difference: [{max_block_i}, {max_block_j}] (diff={max_diff_per_block[max_block_i, max_block_j]:.6e})")
+        else:
+            print(f"\n  ⚠️  Cannot compare blocks - n_compare_blocks={n_compare_blocks}")
         
         # Use table format for comparison (similar to STEP 14, showing as block matrix)
         # For Hessian B, only show a few blocks (e.g., 2x2 = 4 blocks) to avoid too much output
@@ -1315,8 +1336,18 @@ def step10_assemble_coupling_e(Eik_py, Ejk_py, ii_py_adjusted, jj_py_adjusted, k
     # Compare with C++ STEP 10 pose-structure coupling E
     E_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step10_E.bin"), warn_if_missing=True)
     if E_cpp_data is not None:
-        E_cpp = E_cpp_data.reshape(6 * n_adjusted_py, m_py)
+        # Infer n_adjusted from C++ file size: E is [6*n_adjusted, m]
+        E_cpp_size = len(E_cpp_data)
+        n_adjusted_cpp = E_cpp_size // (6 * m_py)
+        if n_adjusted_cpp != n_adjusted_py:
+            print(f"  ⚠️  WARNING: C++ n_adjusted ({n_adjusted_cpp}) differs from Python ({n_adjusted_py}) for E matrix")
+            print(f"     C++ file size: {E_cpp_size} elements, inferred n_adjusted: {n_adjusted_cpp}")
+        
+        E_cpp = E_cpp_data.reshape(6 * n_adjusted_cpp, m_py)
         E_py_reshaped = E_py[0].permute(0, 2, 1, 3).contiguous().view(6 * n_adjusted_py, m_py).cpu().numpy()
+        # Extract matching submatrix if sizes differ
+        if n_adjusted_cpp != n_adjusted_py:
+            E_py_reshaped = E_py_reshaped[:6*n_adjusted_cpp, :]
         
         # Debug: Check which entries differ significantly
         diff = np.abs(E_cpp - E_py_reshaped)
@@ -1488,9 +1519,20 @@ def step12_assemble_gradients(vi_py, vj_py, wJzT_py, r_py_masked, ii_py_adjusted
     w_grad_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step11_w_grad.bin"), warn_if_missing=True)
     
     if v_grad_cpp_data is not None:
-        v_grad_cpp = v_grad_cpp_data
-        v_grad_py_np = v_py_grad[0, :, 0, :, 0].cpu().numpy()
+        # Infer n_adjusted from C++ file size: v_grad is [6*n_adjusted]
+        v_grad_cpp_size = len(v_grad_cpp_data)
+        n_adjusted_cpp = v_grad_cpp_size // 6
+        if n_adjusted_cpp != n_adjusted_py:
+            print(f"  ⚠️  WARNING: C++ n_adjusted ({n_adjusted_cpp}) differs from Python ({n_adjusted_py}) for v_grad")
+        
+        # Extract matching portion from Python v_grad
+        n_compare = min(n_adjusted_cpp, n_adjusted_py)
+        v_grad_cpp = v_grad_cpp_data[:6*n_compare] if len(v_grad_cpp_data) >= 6*n_compare else v_grad_cpp_data
+        v_grad_py_np = v_py_grad[0, :n_compare, 0, :, 0].cpu().numpy()
         v_grad_py_np_flat = v_grad_py_np.flatten()
+        # Truncate C++ to match if needed
+        if len(v_grad_cpp) > len(v_grad_py_np_flat):
+            v_grad_cpp = v_grad_cpp[:len(v_grad_py_np_flat)]
         compare_tensors("v_grad", v_grad_cpp, v_grad_py_np_flat, show_table=True, max_edges=3)
     
     if w_grad_cpp_data is not None:
@@ -1556,15 +1598,35 @@ def step14_schur_complement(B_py, E_py, Q_py, v_py_grad, w_py_grad, n_adjusted_p
     y_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step14_y.bin"), warn_if_missing=True)
     
     if S_cpp_data is not None:
-        S_cpp = S_cpp_data.reshape(6 * n_adjusted_py, 6 * n_adjusted_py)
+        # Infer n_adjusted from C++ file size: S is [6*n_adjusted, 6*n_adjusted]
+        S_cpp_size = len(S_cpp_data)
+        n_adjusted_cpp = int(np.sqrt(S_cpp_size / 36))
+        if n_adjusted_cpp != n_adjusted_py:
+            print(f"  ⚠️  WARNING: C++ n_adjusted ({n_adjusted_cpp}) differs from Python ({n_adjusted_py}) for S matrix")
+        
+        S_cpp = S_cpp_data.reshape(6 * n_adjusted_cpp, 6 * n_adjusted_cpp)
         S_py_reshaped = S_py[0].permute(0, 2, 1, 3).contiguous().view(6 * n_adjusted_py, 6 * n_adjusted_py).cpu().numpy()
+        # Extract matching submatrix if sizes differ
+        if n_adjusted_cpp != n_adjusted_py:
+            S_py_reshaped = S_py_reshaped[:6*n_adjusted_cpp, :6*n_adjusted_cpp]
         # For Schur complement, only show a few blocks (e.g., 2x2 = 4 blocks) to avoid too much output
         compare_tensors("S (Schur complement)", S_cpp, S_py_reshaped, show_table=True, max_edges=2)
     
     if y_cpp_data is not None:
-        y_cpp = y_cpp_data
-        y_py_np = y_py[0, :, 0, :, 0].cpu().numpy()
+        # Infer n_adjusted from C++ file size: y is [6*n_adjusted]
+        y_cpp_size = len(y_cpp_data)
+        n_adjusted_cpp = y_cpp_size // 6
+        if n_adjusted_cpp != n_adjusted_py:
+            print(f"  ⚠️  WARNING: C++ n_adjusted ({n_adjusted_cpp}) differs from Python ({n_adjusted_py}) for y vector")
+        
+        y_cpp = y_cpp_data[:6*n_adjusted_cpp] if len(y_cpp_data) >= 6*n_adjusted_cpp else y_cpp_data
+        # Extract matching portion from Python y
+        n_compare = min(n_adjusted_cpp, n_adjusted_py)
+        y_py_np = y_py[0, :n_compare, 0, :, 0].cpu().numpy()
         y_py_np_flat = y_py_np.flatten()
+        # Truncate C++ to match if needed
+        if len(y_cpp) > len(y_py_np_flat):
+            y_cpp = y_cpp[:len(y_py_np_flat)]
         compare_tensors("y (RHS)", y_cpp, y_py_np_flat, show_table=True, max_edges=3)
     
     return S_py, y_py
@@ -1595,9 +1657,20 @@ def step15_solve_pose_increments(S_py, y_py, ep=100.0, n_adjusted_py=None):
     if n_adjusted_py is not None:
         dX_cpp_data = load_binary_file(os.path.join(bin_dir, "ba_step15_dX.bin"))
         if dX_cpp_data is not None:
-            dX_cpp = dX_cpp_data
-            dX_py_np = dX_py_reshaped[0].cpu().numpy()
+            # Infer n_adjusted from C++ file size: dX is [6*n_adjusted]
+            dX_cpp_size = len(dX_cpp_data)
+            n_adjusted_cpp = dX_cpp_size // 6
+            if n_adjusted_cpp != n_adjusted_py:
+                print(f"  ⚠️  WARNING: C++ n_adjusted ({n_adjusted_cpp}) differs from Python ({n_adjusted_py}) for dX")
+            
+            # Extract matching portion from Python dX
+            n_compare = min(n_adjusted_cpp, n_adjusted_py)
+            dX_cpp = dX_cpp_data[:6*n_compare] if len(dX_cpp_data) >= 6*n_compare else dX_cpp_data
+            dX_py_np = dX_py_reshaped[0, :n_compare].cpu().numpy()
             dX_py_np_flat = dX_py_np.flatten()
+            # Truncate C++ to match if needed
+            if len(dX_cpp) > len(dX_py_np_flat):
+                dX_cpp = dX_cpp[:len(dX_py_np_flat)]
             compare_tensors("dX (solution)", dX_cpp, dX_py_np_flat, show_table=True, max_edges=15)
     
     return dX_py  # Return raw output, not reshaped

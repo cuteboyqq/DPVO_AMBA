@@ -205,15 +205,62 @@ def load_and_reshape_cpp_data(frame_num, meta, bin_dir="bin_file"):
     jj_cpp = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_jj.bin"))
     ii_cpp = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_ii.bin"))
     gmap_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_gmap.bin"))
-    fmap1_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap1.bin"))
-    fmap2_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap2.bin"))
+    
+    # Load fmap1 and fmap2 in new deduplicated format
+    # New format: unique frames only + jj1 mapping + unique frame indices
+    fmap1_unique = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap1.bin"))
+    jj1_mapping = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_jj1.bin"))
+    fmap1_unique_frames = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap1_unique_frames.bin"))
+    
+    fmap2_unique = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap2.bin"))
+    fmap2_unique_frames = load_binary_int32(os.path.join(bin_dir, f"corr_frame{frame_num}_fmap2_unique_frames.bin"))
+    
     corr_cpp = load_binary_float(os.path.join(bin_dir, f"corr_frame{frame_num}_corr.bin"))
     
     # Reshape C++ data
     coords_cpp = coords_cpp.reshape(num_active, 2, P, P)
     gmap_cpp = gmap_cpp.reshape(num_active, feature_dim, 3, 3)
-    fmap1_cpp = fmap1_cpp.reshape(num_active, feature_dim, fmap1_H, fmap1_W)
-    fmap2_cpp = fmap2_cpp.reshape(num_active, feature_dim, fmap2_H, fmap2_W)
+    
+    # Reconstruct per-edge fmap1/fmap2 from unique frames using jj1 mapping
+    num_unique_fmap1 = len(fmap1_unique_frames)
+    fmap1_unique = fmap1_unique.reshape(num_unique_fmap1, feature_dim, fmap1_H, fmap1_W)
+    
+    print(f"Loaded fmap1: {num_unique_fmap1} unique frames (deduplicated from {num_active} edges)")
+    print(f"  File size: {num_unique_fmap1 * feature_dim * fmap1_H * fmap1_W * 4 / (1024**2):.1f} MB "
+          f"(vs {num_active * feature_dim * fmap1_H * fmap1_W * 4 / (1024**2):.1f} MB if not deduplicated)")
+    
+    # Build mapping: jj1_ring_buffer_index -> unique_frame_slot
+    jj1_to_slot = {jj1: slot for slot, jj1 in enumerate(fmap1_unique_frames)}
+    
+    # Reconstruct fmap1 per edge: for each edge, find its jj1 and look up the unique frame
+    fmap1_cpp = np.zeros((num_active, feature_dim, fmap1_H, fmap1_W), dtype=np.float32)
+    for e in range(num_active):
+        jj1 = jj1_mapping[e]  # Ring buffer index for this edge
+        if jj1 in jj1_to_slot:
+            slot = jj1_to_slot[jj1]
+            fmap1_cpp[e] = fmap1_unique[slot]
+        else:
+            print(f"WARNING: Edge {e} has jj1={jj1} not found in unique frames")
+    
+    # Same for fmap2
+    num_unique_fmap2 = len(fmap2_unique_frames)
+    fmap2_unique = fmap2_unique.reshape(num_unique_fmap2, feature_dim, fmap2_H, fmap2_W)
+    
+    print(f"Loaded fmap2: {num_unique_fmap2} unique frames (deduplicated from {num_active} edges)")
+    print(f"  File size: {num_unique_fmap2 * feature_dim * fmap2_H * fmap2_W * 4 / (1024**2):.1f} MB "
+          f"(vs {num_active * feature_dim * fmap2_H * fmap2_W * 4 / (1024**2):.1f} MB if not deduplicated)")
+    
+    jj1_to_slot_fmap2 = {jj1: slot for slot, jj1 in enumerate(fmap2_unique_frames)}
+    
+    fmap2_cpp = np.zeros((num_active, feature_dim, fmap2_H, fmap2_W), dtype=np.float32)
+    for e in range(num_active):
+        jj1 = jj1_mapping[e]  # Same jj1 mapping for fmap2
+        if jj1 in jj1_to_slot_fmap2:
+            slot = jj1_to_slot_fmap2[jj1]
+            fmap2_cpp[e] = fmap2_unique[slot]
+        else:
+            print(f"WARNING: Edge {e} has jj1={jj1} not found in fmap2 unique frames")
+    
     corr_cpp = corr_cpp.reshape(num_active, D, D, P, P, 2)
     
     # Print data summary
