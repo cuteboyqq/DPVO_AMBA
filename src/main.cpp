@@ -1682,6 +1682,21 @@ void processDPVOApp(
 		// This will also start the processing thread (via _startThreads)
 		dpvo->setPatchifierModels(config, config);
 		
+		// Enable inference cache: saves FNet/INet/Update model outputs to bin files.
+		// First run: models run normally and outputs are saved to cache directory.
+		// Subsequent runs: cached outputs are loaded, model inference is SKIPPED (much faster).
+		// Cache is organized by video/input name, e.g. inference_cache/IMG_0492/fnet/...
+		// Delete the cache directory to force re-running inference.
+		// Controlled by EnableInferenceCache in app_config.txt (0=disabled, 1=enabled)
+		if (config->enableInferenceCache) {
+			std::string baseName = PathUtils::extractBaseName(inputPath);
+			std::string cachePath = "inference_cache/" + baseName;
+			logger->info("Inference cache ENABLED, path: {}", cachePath);
+			dpvo->enableInferenceCache(cachePath);
+		} else {
+			logger->info("Inference cache DISABLED (set EnableInferenceCache = 1 in app_config.txt to enable)");
+		}
+		
 		// Enable visualization (optional)
 		// NOTE: Requires Pangolin library to be installed and linked
 		// Visualization displays 3D point cloud, camera trajectory, and current video frame

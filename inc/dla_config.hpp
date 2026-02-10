@@ -118,6 +118,10 @@ typedef struct
     // DPVO Inference Backend
     bool useOnnxRuntime;            // If true, use ONNX Runtime instead of AMBA EazyAI
                                     // Set to true if model paths end with .onnx
+    
+    // DPVO Inference Cache
+    bool enableInferenceCache;      // If true, save/load FNet/INet/Update model outputs to bin files
+                                    // First run saves outputs, subsequent runs load from cache (skips inference)
 
     // Model Input Size
     int modelWidth;

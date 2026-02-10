@@ -45,6 +45,13 @@ public:
     // Returns 0,0 if models are not set
     int getInputHeight() const;
     int getInputWidth() const;
+    
+    // Inference cache support: save/load FNet/INet outputs to avoid re-running inference
+    // Call setCachePath() before first forward() to enable caching.
+    // First run: inference runs normally and outputs are saved to cache.
+    // Subsequent runs: cached outputs are loaded, inference is skipped.
+    void setCachePath(const std::string& cachePath);
+    bool isCacheEnabled() const { return m_cacheEnabled; }
 
 private:
     // Helper function to extract patches after inference has been run
@@ -71,5 +78,15 @@ private:
     
     // Store last coordinates used (for patch coordinate storage)
     std::vector<float> m_last_coords;
+    
+    // Inference cache: save/load FNet/INet outputs to bin files
+    std::string m_cachePath;       // Directory for cache files (empty = disabled)
+    bool m_cacheEnabled = false;   // Whether caching is active
+    int m_cacheFrameCounter = 0;   // Frame counter for cache file naming
+    
+    // Helper: try to load FNet/INet from cache; returns true on success
+    bool _loadFromCache(int fmap_H, int fmap_W, int inet_C);
+    // Helper: save FNet/INet to cache after inference
+    void _saveToCache(int fmap_H, int fmap_W, int inet_C);
 };
 

@@ -178,6 +178,14 @@ void AppConfigReader::read(std::string configPath)
                 logger->info("Auto-detected ONNX Runtime mode (model paths contain .onnx extension)");
             }
         }
+        // Inference Cache
+        bool enableInferenceCache = false;
+        string enableInferenceCacheStr = "";
+        configReader->getValue("EnableInferenceCache", enableInferenceCacheStr);
+        if (!enableInferenceCacheStr.empty() && (enableInferenceCacheStr == "true" || enableInferenceCacheStr == "1" || enableInferenceCacheStr == "True")) {
+            enableInferenceCache = true;
+        }
+
         configReader->getValue("ModelWidth", modelWidth);
         configReader->getValue("ModelHeight", modelHeight);
 
@@ -265,6 +273,7 @@ void AppConfigReader::read(std::string configPath)
             logger->info("UpdateModelPath \t= {}",  updateModelPath);
             logger->info("UseOnnxRuntime \t\t= {} (auto-detected: {})", useOnnxRuntime, 
                         (useOnnxRuntimeStr.empty() ? "yes" : "no"));
+            logger->info("EnableInferenceCache \t= {}", enableInferenceCache);
             logger->info("ModelWidth \t\t= {}",     modelWidth);
             logger->info("ModelHeight \t\t= {}",    modelHeight);
             
@@ -369,6 +378,7 @@ void AppConfigReader::read(std::string configPath)
         m_config->inetModelPath  = inetModelPath;
         m_config->updateModelPath = updateModelPath;
         m_config->useOnnxRuntime = useOnnxRuntime;
+        m_config->enableInferenceCache = enableInferenceCache;
         m_config->modelWidth     = modelWidth;
         m_config->modelHeight    = modelHeight;
 

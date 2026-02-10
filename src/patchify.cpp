@@ -399,69 +399,92 @@ void Patchifier::forward(
         m_imap_buffer.resize(inet_output_channels * fmap_H * fmap_W);
     }
     
-    // Run inference using tensor directly
+    // ---- Inference Cache: try loading from cache before running models ----
+    bool loaded_from_cache = _loadFromCache(fmap_H, fmap_W, inet_output_channels);
+    
+    if (!loaded_from_cache) {
+        // Cache miss → run inference
+        // Run inference using tensor directly
 #ifdef USE_ONNX_RUNTIME
-    if (m_useOnnxRuntime) {
-        // Use ONNX Runtime models
-        if (logger_patch) logger_patch->info("[Patchifier] About to call fnet_onnx->runInference (tensor)");
-        bool fnet_success = false;
-        if (m_fnet_onnx && !m_fnet_onnx->runInference(imgTensor, m_fmap_buffer.data())) {
-            if (logger_patch) logger_patch->error("[Patchifier] fnet_onnx->runInference (tensor) failed");
-            std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
-        } else {
-            fnet_success = true;
-            if (logger_patch) logger_patch->info("[Patchifier] fnet_onnx->runInference (tensor) successful");
-        }
-        
-        if (logger_patch) logger_patch->info("[Patchifier] About to call inet_onnx->runInference (tensor)");
-        bool inet_success = false;
-        if (m_inet_onnx && !m_inet_onnx->runInference(imgTensor, m_imap_buffer.data())) {
-            if (logger_patch) logger_patch->error("[Patchifier] inet_onnx->runInference (tensor) failed");
-            std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
-        } else {
-            inet_success = true;
-            if (logger_patch) logger_patch->info("[Patchifier] inet_onnx->runInference (tensor) successful");
-        }
-        
-        // Save ONNX model outputs for a specific frame to binary files for comparison with Python
-        // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
-        static int frame_counter = 0;
-        if (fnet_success && inet_success) {
-            frame_counter++;
-            int current_frame = frame_counter - 1;  // frame_counter is 1-indexed, current_frame is 0-indexed
+        if (m_useOnnxRuntime) {
+            // Use ONNX Runtime models
+            if (logger_patch) logger_patch->info("[Patchifier] About to call fnet_onnx->runInference (tensor)");
+            bool fnet_success = false;
+            if (m_fnet_onnx && !m_fnet_onnx->runInference(imgTensor, m_fmap_buffer.data())) {
+                if (logger_patch) logger_patch->error("[Patchifier] fnet_onnx->runInference (tensor) failed");
+                std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+            } else {
+                fnet_success = true;
+                if (logger_patch) logger_patch->info("[Patchifier] fnet_onnx->runInference (tensor) successful");
+            }
             
-            // Get output dimensions for logging
-            int fnet_C = 128;  // FNet output channels
-            int fnet_H = fmap_H;
-            int fnet_W = fmap_W;
-            int inet_C = inet_output_channels;  // INet output channels (384)
-            int inet_H = fmap_H;
-            int inet_W = fmap_W;
+            if (logger_patch) logger_patch->info("[Patchifier] About to call inet_onnx->runInference (tensor)");
+            bool inet_success = false;
+            if (m_inet_onnx && !m_inet_onnx->runInference(imgTensor, m_imap_buffer.data())) {
+                if (logger_patch) logger_patch->error("[Patchifier] inet_onnx->runInference (tensor) failed");
+                std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+            } else {
+                inet_success = true;
+                if (logger_patch) logger_patch->info("[Patchifier] inet_onnx->runInference (tensor) successful");
+            }
             
-            // Save the target frame
-            if (TARGET_FRAME >= 0 && current_frame == TARGET_FRAME) {
-                std::string frame_suffix = std::to_string(TARGET_FRAME);
+            // Save ONNX model outputs for a specific frame to binary files for comparison with Python
+            // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
+            static int frame_counter = 0;
+            if (fnet_success && inet_success) {
+                frame_counter++;
+                int current_frame = frame_counter - 1;  // frame_counter is 1-indexed, current_frame is 0-indexed
                 
-                // Save fnet output
-                std::string fnet_filename = get_bin_file_path("fnet_frame" + frame_suffix + ".bin");
-                patchify_file_io::save_model_output(fnet_filename, m_fmap_buffer.data(), 
-                                                     fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
+                // Get output dimensions for logging
+                int fnet_C = 128;  // FNet output channels
+                int fnet_H = fmap_H;
+                int fnet_W = fmap_W;
+                int inet_C = inet_output_channels;  // INet output channels (384)
+                int inet_H = fmap_H;
+                int inet_W = fmap_W;
                 
-                // Save inet output
-                std::string inet_filename = get_bin_file_path("inet_frame" + frame_suffix + ".bin");
-                patchify_file_io::save_model_output(inet_filename, m_imap_buffer.data(), 
-                                                     inet_C, inet_H, inet_W, logger_patch, "inet");
-                
-                if (logger_patch) {
-                    logger_patch->info("[Patchifier] Saved ONNX outputs for frame {}: {} and {}", 
-                                      current_frame, fnet_filename, inet_filename);
+                // Save the target frame
+                if (TARGET_FRAME >= 0 && current_frame == TARGET_FRAME) {
+                    std::string frame_suffix = std::to_string(TARGET_FRAME);
+                    
+                    // Save fnet output
+                    std::string fnet_filename = get_bin_file_path("fnet_frame" + frame_suffix + ".bin");
+                    patchify_file_io::save_model_output(fnet_filename, m_fmap_buffer.data(), 
+                                                         fnet_C, fnet_H, fnet_W, logger_patch, "fnet");
+                    
+                    // Save inet output
+                    std::string inet_filename = get_bin_file_path("inet_frame" + frame_suffix + ".bin");
+                    patchify_file_io::save_model_output(inet_filename, m_imap_buffer.data(), 
+                                                         inet_C, inet_H, inet_W, logger_patch, "inet");
+                    
+                    if (logger_patch) {
+                        logger_patch->info("[Patchifier] Saved ONNX outputs for frame {}: {} and {}", 
+                                          current_frame, fnet_filename, inet_filename);
+                    }
                 }
             }
+        } else {
+            // Use AMBA EazyAI models
+            if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+            if (m_fnet && !m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
+                if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
+                std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
+            } else {
+                if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
+            }
+            
+            if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+            if (m_inet && !m_inet->runInference(imgTensor, m_imap_buffer.data())) {
+                if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
+                std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
+            } else {
+                if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+            }
         }
-    } else {
-        // Use AMBA EazyAI models
+#else
+        // ONNX Runtime not available, use AMBA models
         if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
-        if (m_fnet && !m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
+        if (!m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
             if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
             std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
         } else {
@@ -469,31 +492,19 @@ void Patchifier::forward(
         }
         
         if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
-        if (m_inet && !m_inet->runInference(imgTensor, m_imap_buffer.data())) {
+        if (!m_inet->runInference(imgTensor, m_imap_buffer.data())) {
             if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
             std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
         } else {
             if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
         }
-    }
-#else
-    // ONNX Runtime not available, use AMBA models
-    if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
-    if (!m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
-        if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
-        std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
-    } else {
-        if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
-    }
-    
-    if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
-    if (!m_inet->runInference(imgTensor, m_imap_buffer.data())) {
-        if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
-        std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
-    } else {
-        if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
-    }
 #endif
+        // ---- Save to cache after inference (only when not loaded from cache) ----
+        _saveToCache(fmap_H, fmap_W, inet_output_channels);
+    } // end if (!loaded_from_cache)
+    
+    // Increment cache frame counter (always, whether loaded from cache or not)
+    m_cacheFrameCounter++;
     
     // Copy fmap buffer to output
     std::memcpy(fmap, m_fmap_buffer.data(), 128 * fmap_H * fmap_W * sizeof(float));
@@ -568,5 +579,131 @@ int Patchifier::getInputWidth() const
         return m_fnet->getInputWidth();
     }
     return 0;
+}
+
+// =====================================================================
+// Recursive mkdir helper
+// =====================================================================
+static void mkdirp(const std::string& path)
+{
+    struct stat info;
+    if (stat(path.c_str(), &info) == 0) return;  // already exists
+
+    size_t pos = path.find_last_of('/');
+    if (pos != std::string::npos && pos > 0) {
+        mkdirp(path.substr(0, pos));
+    }
+    mkdir(path.c_str(), 0755);
+}
+
+// =====================================================================
+// Inference Cache: save / load FNet/INet outputs to binary files
+// =====================================================================
+void Patchifier::setCachePath(const std::string& cachePath)
+{
+    m_cachePath = cachePath;
+    m_cacheEnabled = !cachePath.empty();
+    m_cacheFrameCounter = 0;
+    
+    if (m_cacheEnabled) {
+        // Create cache directories (including all parents)
+        mkdirp(cachePath);
+        std::string fnet_dir = cachePath + "/fnet";
+        std::string inet_dir = cachePath + "/inet";
+        mkdirp(fnet_dir);
+        mkdirp(inet_dir);
+        
+        auto logger = spdlog::get("fnet");
+        if (!logger) logger = spdlog::get("inet");
+        if (logger) {
+            logger->info("[Patchifier] Inference cache enabled: {}", cachePath);
+        }
+    }
+}
+
+bool Patchifier::_loadFromCache(int fmap_H, int fmap_W, int inet_C)
+{
+    if (!m_cacheEnabled) return false;
+    
+    std::string fnet_file = m_cachePath + "/fnet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    std::string inet_file = m_cachePath + "/inet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    
+    std::ifstream fnet_in(fnet_file, std::ios::binary);
+    std::ifstream inet_in(inet_file, std::ios::binary);
+    
+    if (!fnet_in.good() || !inet_in.good()) {
+        return false;  // Cache miss
+    }
+    
+    size_t fmap_size = 128 * fmap_H * fmap_W;
+    size_t imap_size = inet_C * fmap_H * fmap_W;
+    
+    // Verify file sizes match expected
+    fnet_in.seekg(0, std::ios::end);
+    inet_in.seekg(0, std::ios::end);
+    size_t fnet_file_size = fnet_in.tellg();
+    size_t inet_file_size = inet_in.tellg();
+    fnet_in.seekg(0, std::ios::beg);
+    inet_in.seekg(0, std::ios::beg);
+    
+    if (fnet_file_size != fmap_size * sizeof(float) ||
+        inet_file_size != imap_size * sizeof(float)) {
+        auto logger = spdlog::get("fnet");
+        if (logger) {
+            logger->warn("[Patchifier] Cache file size mismatch for frame {}. "
+                        "Expected fnet={} bytes (got {}), inet={} bytes (got {}). Re-running inference.",
+                        m_cacheFrameCounter,
+                        fmap_size * sizeof(float), fnet_file_size,
+                        imap_size * sizeof(float), inet_file_size);
+        }
+        return false;
+    }
+    
+    // Ensure buffers are allocated
+    if (m_fmap_buffer.size() != fmap_size) m_fmap_buffer.resize(fmap_size);
+    if (m_imap_buffer.size() != imap_size) m_imap_buffer.resize(imap_size);
+    
+    fnet_in.read(reinterpret_cast<char*>(m_fmap_buffer.data()), fmap_size * sizeof(float));
+    inet_in.read(reinterpret_cast<char*>(m_imap_buffer.data()), imap_size * sizeof(float));
+    fnet_in.close();
+    inet_in.close();
+    
+    auto logger = spdlog::get("dpvo");
+    if (!logger) logger = spdlog::get("fnet");
+    if (logger) {
+        logger->info("\033[32mFNet: Loaded from cache: frame {}\033[0m", m_cacheFrameCounter);
+        logger->info("\033[32mINet: Loaded from cache: frame {}\033[0m", m_cacheFrameCounter);
+    }
+    return true;
+}
+
+void Patchifier::_saveToCache(int fmap_H, int fmap_W, int inet_C)
+{
+    if (!m_cacheEnabled) return;
+    
+    std::string fnet_file = m_cachePath + "/fnet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    std::string inet_file = m_cachePath + "/inet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
+    
+    size_t fmap_size = 128 * fmap_H * fmap_W;
+    size_t imap_size = inet_C * fmap_H * fmap_W;
+    
+    std::ofstream fnet_out(fnet_file, std::ios::binary);
+    if (fnet_out.good()) {
+        fnet_out.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fmap_size * sizeof(float));
+        fnet_out.close();
+    }
+    
+    std::ofstream inet_out(inet_file, std::ios::binary);
+    if (inet_out.good()) {
+        inet_out.write(reinterpret_cast<const char*>(m_imap_buffer.data()), imap_size * sizeof(float));
+        inet_out.close();
+    }
+    
+    auto logger = spdlog::get("dpvo");
+    if (!logger) logger = spdlog::get("fnet");
+    if (logger) {
+        logger->info("\033[36mFNet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+        logger->info("\033[36mINet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+    }
 }
 

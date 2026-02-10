@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdio>
 #include <limits>
+#include <chrono>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
@@ -482,50 +483,70 @@ void computeCorrelationSingle(
                         bool is_center = (corr_ii == R && corr_jj == R);
                         
                         // Compute correlation: dot product over features using bilinear interpolation
-                        // This matches Python's grid_sample behavior:
-                        // - Normalizes coordinates to [-1, 1] range
-                        // - Uses bilinear interpolation instead of nearest neighbor
-                        // - Returns 0.0 for out-of-bounds coordinates
+                        // OPTIMIZATION: Precompute bilinear weights and corner addresses ONCE,
+                        // then reuse them for all 128 feature channels (was computing 128x redundantly)
                         float sum = 0.0f;
                         
                         // Extract patch feature from gmap (unchanged)
                             int gmap_i = i0 + gmap_center_offset;
                             int gmap_j = j0 + gmap_center_offset;
-                            
-                            // Dot product over feature channels
-                            int features_processed = 0;
-                            for (int f = 0; f < feature_dim; f++) {
-                            // fmap1: patch feature from gmap (unchanged - still uses integer indexing)
-                                size_t fmap1_idx = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
-                                                   static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
-                                                   static_cast<size_t>(f) * D_gmap * D_gmap +
-                                                   static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
-                                
-                            // Bounds check for gmap access
-                            if (fmap1_idx >= gmap_total_size) {
-                                continue;
-                            }
-                            
-                                    float f1 = gmap[fmap1_idx];
-                            
-                            // fmap2: frame feature from pyramid using bilinear interpolation
-                            // Use normalized coordinates directly (already computed above)
-                            size_t frame_offset = static_cast<size_t>(pyramid_frame) * static_cast<size_t>(feature_dim) * static_cast<size_t>(fmap_H) * static_cast<size_t>(fmap_W);
-                            float f2 = bilinear_sample_grid_sample(
-                                pyramid,
-                                x_norm, y_norm,
-                                fmap_H, fmap_W,
-                                f, feature_dim,
-                                frame_offset
-                            );
-                            
-                                    sum += f1 * f2;
-                                    features_processed++;
-                        }
                         
-                        // Note: Out-of-bounds sampling returns 0.0 from bilinear_sample_grid_sample
-                        // (matching Python's grid_sample behavior)
-                        // The code correctly skips correlation computation for out-of-bounds pixels
+                        // Precompute bilinear sampling parameters (shared across all channels)
+                        float x_pixel_bi = (x_norm + 1.0f) * 0.5f * static_cast<float>(fmap_W - 1);
+                        float y_pixel_bi = (y_norm + 1.0f) * 0.5f * static_cast<float>(fmap_H - 1);
+                        
+                        const float bi_tolerance = 0.5f;
+                        bool bi_oob = (x_pixel_bi < -bi_tolerance || x_pixel_bi > static_cast<float>(fmap_W - 1) + bi_tolerance ||
+                                       y_pixel_bi < -bi_tolerance || y_pixel_bi > static_cast<float>(fmap_H - 1) + bi_tolerance);
+                        
+                        if (!bi_oob) {
+                            int bx0 = static_cast<int>(std::floor(x_pixel_bi));
+                            int by0 = static_cast<int>(std::floor(y_pixel_bi));
+                            bx0 = std::max(0, std::min(bx0, fmap_W - 1));
+                            by0 = std::max(0, std::min(by0, fmap_H - 1));
+                            int bx1 = std::min(bx0 + 1, fmap_W - 1);
+                            int by1 = std::min(by0 + 1, fmap_H - 1);
+                            
+                            x_pixel_bi = std::max(0.0f, std::min(x_pixel_bi, static_cast<float>(fmap_W - 1)));
+                            y_pixel_bi = std::max(0.0f, std::min(y_pixel_bi, static_cast<float>(fmap_H - 1)));
+                            float bdx = x_pixel_bi - static_cast<float>(bx0);
+                            float bdy = y_pixel_bi - static_cast<float>(by0);
+                            
+                            float bw00 = (1.0f - bdx) * (1.0f - bdy);
+                            float bw01 = bdx * (1.0f - bdy);
+                            float bw10 = (1.0f - bdx) * bdy;
+                            float bw11 = bdx * bdy;
+                            
+                            // Precompute base offsets for pyramid corners (stride = H * W per channel)
+                            size_t frame_offset = static_cast<size_t>(pyramid_frame) * static_cast<size_t>(feature_dim) * static_cast<size_t>(fmap_H) * static_cast<size_t>(fmap_W);
+                            size_t hw = static_cast<size_t>(fmap_H) * static_cast<size_t>(fmap_W);
+                            size_t off00 = frame_offset + static_cast<size_t>(by0) * fmap_W + bx0;
+                            size_t off01 = frame_offset + static_cast<size_t>(by0) * fmap_W + bx1;
+                            size_t off10 = frame_offset + static_cast<size_t>(by1) * fmap_W + bx0;
+                            size_t off11 = frame_offset + static_cast<size_t>(by1) * fmap_W + bx1;
+                            
+                            // Gmap base offset (stride = D_gmap * D_gmap per channel)
+                            size_t gmap_base = static_cast<size_t>(gmap_frame) * M * feature_dim * D_gmap * D_gmap +
+                                               static_cast<size_t>(patch_idx) * feature_dim * D_gmap * D_gmap +
+                                               static_cast<size_t>(gmap_i) * D_gmap + static_cast<size_t>(gmap_j);
+                            size_t gmap_stride = static_cast<size_t>(D_gmap) * D_gmap;
+                            
+                            // Dot product over all 128 feature channels (tight inner loop)
+                            for (int f = 0; f < feature_dim; f++) {
+                                size_t fmap1_idx = gmap_base + static_cast<size_t>(f) * gmap_stride;
+                                if (fmap1_idx >= gmap_total_size) continue;
+                                float f1 = gmap[fmap1_idx];
+                                
+                                size_t ch_off = static_cast<size_t>(f) * hw;
+                                float f2 = bw00 * pyramid[off00 + ch_off]
+                                         + bw01 * pyramid[off01 + ch_off]
+                                         + bw10 * pyramid[off10 + ch_off]
+                                         + bw11 * pyramid[off11 + ch_off];
+                                
+                                sum += f1 * f2;
+                            }
+                        }
+                        // If bi_oob, sum stays 0.0 (matches grid_sample padding_mode='zeros')
                         
                         // Store correlation in internal 8x8 buffer
                         // Layout: [num_active, D_internal, D_internal, P, P]
@@ -709,6 +730,7 @@ void computeCorrelation(
     std::vector<float> corr2_8x8(corr_8x8_size);
     
     // Call computeCorrelationSingle for pyramid0 (matches Python: corr1 = altcorr.corr(..., coords / 1, ...))
+    auto corr_t0 = std::chrono::high_resolution_clock::now();
     computeCorrelationSingle(
         gmap, pyramid0, coords,
         ii1.data(), jj1.data(),
@@ -721,6 +743,7 @@ void computeCorrelation(
         corr1.data(),
         corr1_8x8.data()  // Save 8x8 internal buffer
     );
+    auto corr_t1 = std::chrono::high_resolution_clock::now();
     
     // Call computeCorrelationSingle for pyramid1 (matches Python: corr2 = altcorr.corr(..., coords / 4, ...))
     computeCorrelationSingle(
@@ -735,6 +758,17 @@ void computeCorrelation(
         corr2.data(),
         corr2_8x8.data()  // Save 8x8 internal buffer
     );
+    auto corr_t2 = std::chrono::high_resolution_clock::now();
+    
+    {
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            double corr1_ms = std::chrono::duration_cast<std::chrono::microseconds>(corr_t1 - corr_t0).count() / 1000.0;
+            double corr2_ms = std::chrono::duration_cast<std::chrono::microseconds>(corr_t2 - corr_t1).count() / 1000.0;
+            logger->info("[TIMING] Correlation breakdown: Level0({}x{}): {:.1f} ms | Level1({}x{}): {:.1f} ms | edges={}",
+                         fmap1_H, fmap1_W, corr1_ms, fmap2_H, fmap2_W, corr2_ms, num_active);
+        }
+    }
     
     // Copy 8x8 buffers to output if requested
     if (corr1_8x8_out != nullptr) {

@@ -10,6 +10,7 @@
 #include <eazyai.h>
 #endif
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <memory>
 #include <thread>
@@ -36,15 +37,15 @@ struct DPVOConfig {
 
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
-          BUFFER_SIZE(8192),
+          BUFFER_SIZE(16384),
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
           MAX_EDGE_AGE(360),
           KEYFRAME_INDEX(4),
-          KEYFRAME_THRESH(10),
+          KEYFRAME_THRESH(10), // 10
           PATCH_LIFETIME(6), // 6 
-          REMOVAL_WINDOW(8),
+          REMOVAL_WINDOW(8), // 8
           OPTIMIZATION_WINDOW(5)  // Match Python default 12 , Alister test 5 on DPVO python , it works
     {}
 };
@@ -94,6 +95,18 @@ public:
     
     // Initialize threads (called from constructor, similar to WNC_APP::_init)
     void _startThreads();
+    
+    // Inference cache: save/load FNet/INet/Update model outputs to binary files.
+    // First run: models run normally and outputs are saved to cachePath.
+    // Subsequent runs: outputs are loaded from cache, model inference is SKIPPED.
+    // This can dramatically speed up processing when replaying the same video.
+    // Call AFTER setPatchifierModels() and setUpdateModel().
+    //
+    // cachePath: directory for cache files (e.g. "inference_cache")
+    //   └── fnet/          FNet outputs per frame
+    //   └── inet/          INet outputs per frame  
+    //   └── update/        Update model outputs per update call
+    void enableInferenceCache(const std::string& cachePath = "inference_cache");
     
     // Visualization
     void enableVisualization(bool enable = true);

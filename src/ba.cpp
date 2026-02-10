@@ -410,6 +410,39 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     const int b = 1; // batch size = 1
 
     // ---------------------------------------------------------
+    // CRITICAL: Filter edges that reference frames outside sliding window
+    // ---------------------------------------------------------
+    // Edges may reference very old frames (e.g., frame 980) that are no longer in the
+    // sliding window (which only has 15-16 frames). These edges cause BA to fail because
+    // the poses for those frames don't exist. Filter them out before BA.
+    std::vector<bool> edge_valid(num_active, true);
+    int filtered_count = 0;
+    for (int e = 0; e < num_active; e++) {
+        int i = m_pg.m_kk[e] / M;  // source frame index (sliding window index)
+        int j = m_pg.m_jj[e];      // target frame index (sliding window index)
+        
+        // Filter out edges that reference frames outside the sliding window
+        if (i >= m_pg.m_n || j >= m_pg.m_n || i < 0 || j < 0) {
+            edge_valid[e] = false;
+            filtered_count++;
+        }
+    }
+    
+    if (filtered_count > 0 && logger) {
+        logger->warn("BA: Filtered out {} edges that reference frames outside sliding window (n={})",
+                     filtered_count, m_pg.m_n);
+    }
+    
+    // If all edges were filtered, skip BA
+    int valid_edge_count = num_active - filtered_count;
+    if (valid_edge_count == 0) {
+        if (logger) {
+            logger->warn("BA: All edges filtered out, skipping BA");
+        }
+        return;
+    }
+
+    // ---------------------------------------------------------
     // Basic setup: find number of pose variables
     // ---------------------------------------------------------
     // CRITICAL FIX: Match Python BA exactly!
@@ -427,6 +460,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // of poses with 0 constraints, which is slow and causes wrong poses.
     int n_max_from_edges = 0;
     for (int e = 0; e < num_active; e++) {
+        if (!edge_valid[e]) continue;  // Skip filtered edges
+        
         int i = m_pg.m_kk[e] / M;  // source frame index (extracted from kk, matching reproject logic)
         int j = m_pg.m_jj[e];      // target frame index
         n_max_from_edges = std::max(n_max_from_edges, std::max(i, j) + 1);
@@ -448,21 +483,53 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     // Forward projection (coordinates) + Jacobians
     // ---------------------------------------------------------
-    std::vector<float> coords(num_active * 2 * P * P); // [num_active, 2, P, P]
-    std::vector<float> Ji(num_active * 2 * P * P * 6); // [num_active, 2, P, P, 6]
-    std::vector<float> Jj(num_active * 2 * P * P * 6); // [num_active, 2, P, P, 6]
-    std::vector<float> Jz(num_active * 2 * P * P * 1); // [num_active, 2, P, P, 1]
-    std::vector<float> valid(num_active * P * P); // [num_active, P, P]
+    // CRITICAL: Create filtered edge arrays to pass to reproject
+    // Only include edges that reference frames within the sliding window
+    std::vector<int> ii_filtered, jj_filtered, kk_filtered;
+    std::vector<float> target_filtered;
+    std::vector<float> weight_filtered;
+    std::vector<float> net_filtered;
+    ii_filtered.reserve(valid_edge_count);
+    jj_filtered.reserve(valid_edge_count);
+    kk_filtered.reserve(valid_edge_count);
+    target_filtered.reserve(valid_edge_count * 2);
+    weight_filtered.reserve(valid_edge_count * 2);
+    net_filtered.reserve(valid_edge_count * NET_DIM);
+    
+    for (int e = 0; e < num_active; e++) {
+        if (edge_valid[e]) {
+            ii_filtered.push_back(m_pg.m_ii[e]);
+            jj_filtered.push_back(m_pg.m_jj[e]);
+            kk_filtered.push_back(m_pg.m_kk[e]);
+            target_filtered.push_back(m_pg.m_target[e * 2 + 0]);
+            target_filtered.push_back(m_pg.m_target[e * 2 + 1]);
+            weight_filtered.push_back(m_pg.m_weight[e][0]);
+            weight_filtered.push_back(m_pg.m_weight[e][1]);
+            for (int d = 0; d < NET_DIM; d++) {
+                net_filtered.push_back(m_pg.m_net[e][d]);
+            }
+        }
+    }
+    
+    std::vector<float> coords(valid_edge_count * 2 * P * P); // [valid_edge_count, 2, P, P]
+    std::vector<float> Ji(valid_edge_count * 2 * P * P * 6); // [valid_edge_count, 2, P, P, 6]
+    std::vector<float> Jj(valid_edge_count * 2 * P * P * 6); // [valid_edge_count, 2, P, P, 6]
+    std::vector<float> Jz(valid_edge_count * 2 * P * P * 1); // [valid_edge_count, 2, P, P, 1]
+    std::vector<float> valid(valid_edge_count * P * P); // [valid_edge_count, P, P]
     
     reproject(
-        m_pg.m_ii, m_pg.m_jj, m_pg.m_kk, 
-        num_active, 
+        ii_filtered.data(), jj_filtered.data(), kk_filtered.data(), 
+        valid_edge_count, 
         coords.data(),
         Ji.data(),  // Jacobian w.r.t. pose i
         Jj.data(),  // Jacobian w.r.t. pose j
         Jz.data(),  // Jacobian w.r.t. inverse depth
         valid.data() // validity mask
     );
+    
+    // Use valid_edge_count for all subsequent operations (num_active is const)
+    // All arrays are now filtered, so use valid_edge_count instead of num_active
+    const int num_active_filtered = valid_edge_count;
 
     // ---------------------------------------------------------
     // Compute residual at patch center
@@ -473,27 +540,27 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Debug: Log coords from BA's reproject() call for comparison
     if (logger && m_counter == TARGET_FRAME) {
         logger->info("BA: Coords from second reproject() call (first 3 edges):");
-        for (int e = 0; e < std::min(3, num_active); e++) {
+        for (int e = 0; e < std::min(3, num_active_filtered); e++) {
             float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
             float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
             logger->info("  Edge[{}]: coords=({:.6f}, {:.6f})", e, cx, cy);
         }
     }
-    std::vector<float> r(num_active * 2); // [num_active, 2]
-    std::vector<float> v(num_active, 1.0f); // validity mask
+    std::vector<float> r(num_active_filtered * 2); // [num_active_filtered, 2]
+    std::vector<float> v(num_active_filtered, 1.0f); // validity mask
 
     float residual_sum = 0.0f;
     int valid_residuals = 0;
 
     int nan_residual_count = 0;
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         // Extract coordinates at patch center
         float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
         float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
         
         // Validate inputs before computing residual
-        float target_x = m_pg.m_target[e * 2 + 0];
-        float target_y = m_pg.m_target[e * 2 + 1];
+        float target_x = target_filtered[e * 2 + 0];
+        float target_y = target_filtered[e * 2 + 1];
         
         // Debug: Log first few edges to diagnose target mismatch (always log for debugging)
         // Expected: residual = targets - coords should equal delta from update model
@@ -547,20 +614,20 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     if (logger && nan_residual_count > 0) {
-        logger->warn("BA: {} out of {} edges have NaN/Inf residuals", nan_residual_count, num_active);
+        logger->warn("BA: {} out of {} edges have NaN/Inf residuals", nan_residual_count, num_active_filtered);
     }
     
     if (logger) {
         logger->info("BA: Residual stats - valid={}/{}, mean_residual={:.4f}", 
-                     valid_residuals, num_active, 
+                     valid_residuals, num_active_filtered, 
                      valid_residuals > 0 ? residual_sum / valid_residuals : 0.0f);
         if (valid_residuals > 0 && valid_residuals < 5) {
             // Log first few residuals for debugging
-            for (int e = 0; e < std::min(3, num_active); e++) {
+            for (int e = 0; e < std::min(3, num_active_filtered); e++) {
                 float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
                 logger->info("BA: Residual[{}]: target=({:.2f}, {:.2f}), coords=({:.2f}, {:.2f}), "
                              "residual=({:.4f}, {:.4f}), norm={:.4f}, valid={}",
-                             e, m_pg.m_target[e * 2 + 0], m_pg.m_target[e * 2 + 1],
+                             e, target_filtered[e * 2 + 0], target_filtered[e * 2 + 1],
                              coords[e * 2 * P * P + 0 * P * P + center_idx],
                              coords[e * 2 * P * P + 1 * P * P + center_idx],
                              r[e * 2 + 0], r[e * 2 + 1], r_norm, v[e]);
@@ -587,7 +654,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     // Continue with remaining validity checks (this was outside the loop, moved here)
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         // Extract coordinates at patch center for bounds check
         float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
         float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
@@ -617,33 +684,33 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Match Python BA: use both weight channels separately (matching Python [1, M, 2] format)
     // Python: weights shape [1, M, 2] -> [1, M, 2, 1] after unsqueeze, then multiply with Ji [1, M, 2, 6]
     // Channel 0 (w0) applies to x-direction, Channel 1 (w1) applies to y-direction
-    std::vector<float> weights_masked(num_active * 2);
-    for (int e = 0; e < num_active; e++) {
+    std::vector<float> weights_masked(num_active_filtered * 2);
+    for (int e = 0; e < num_active_filtered; e++) {
         r[e * 2 + 0] *= v[e];
         r[e * 2 + 1] *= v[e];
-        float w0 = m_pg.m_weight[e][0] * v[e];  // Channel 0: weight for x-direction
-        float w1 = m_pg.m_weight[e][1] * v[e];  // Channel 1: weight for y-direction
+        float w0 = weight_filtered[e * 2 + 0] * v[e];  // Channel 0: weight for x-direction
+        float w1 = weight_filtered[e * 2 + 1] * v[e];  // Channel 1: weight for y-direction
         weights_masked[e * 2 + 0] = w0;  // Weight for x-direction
         weights_masked[e * 2 + 1] = w1;  // Weight for y-direction (matching Python)
     }
     
     // Save STEP 1: Residuals and validity mask
     if (save_intermediates) {
-        save_ba_step1(r.data(), v.data(), coords.data(), num_active, P, center_idx, logger);
+        save_ba_step1(r.data(), v.data(), coords.data(), num_active_filtered, P, center_idx, logger);
     } else {
         if (logger && m_counter % 10 == 0) {  // Log every 10 frames to avoid spam
             logger->debug("BA: Skipping STEP 1 save (m_counter={} != TARGET_FRAME={})", m_counter, TARGET_FRAME);
         }
     }
     
-    // Extract Jacobians at patch center: [num_active, 2, 6] for Ji, Jj, [num_active, 2, 1] for Jz
-    std::vector<float> Ji_center(num_active * 2 * 6); // [num_active, 2, 6]
-    std::vector<float> Jj_center(num_active * 2 * 6); // [num_active, 2, 6]
-    std::vector<float> Jz_center(num_active * 2 * 1); // [num_active, 2, 1]
+    // Extract Jacobians at patch center: [num_active_filtered, 2, 6] for Ji, Jj, [num_active_filtered, 2, 1] for Jz
+    std::vector<float> Ji_center(num_active_filtered * 2 * 6); // [num_active_filtered, 2, 6]
+    std::vector<float> Jj_center(num_active_filtered * 2 * 6); // [num_active_filtered, 2, 6]
+    std::vector<float> Jz_center(num_active_filtered * 2 * 1); // [num_active_filtered, 2, 1]
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         // Extract Jacobians at patch center
-        // Ji: [num_active, 2, P, P, 6] -> [num_active, 2, 6] at center
+        // Ji: [num_active_filtered, 2, P, P, 6] -> [num_active_filtered, 2, 6] at center
         for (int c = 0; c < 2; c++) {
             for (int d = 0; d < 6; d++) {
                 int src_idx = e * 2 * P * P * 6 + c * P * P * 6 + center_idx * 6 + d;
@@ -663,16 +730,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     // Step 2: Build weighted Jacobians: wJiT, wJjT, wJzT
     // ---------------------------------------------------------
-    // Reshape r to [num_active, 2, 1] for matrix operations
-    // wJiT = (weights * Ji).transpose(2, 3) -> [num_active, 6, 2]
-    // wJjT = (weights * Jj).transpose(2, 3) -> [num_active, 6, 2]
-    // wJzT = (weights * Jz).transpose(2, 3) -> [num_active, 1, 2]
+    // Reshape r to [num_active_filtered, 2, 1] for matrix operations
+    // wJiT = (weights * Ji).transpose(2, 3) -> [num_active_filtered, 6, 2]
+    // wJjT = (weights * Jj).transpose(2, 3) -> [num_active_filtered, 6, 2]
+    // wJzT = (weights * Jz).transpose(2, 3) -> [num_active_filtered, 1, 2]
     
-    std::vector<Eigen::Matrix<float, 6, 2>> wJiT(num_active);
-    std::vector<Eigen::Matrix<float, 6, 2>> wJjT(num_active);
-    std::vector<Eigen::Matrix<float, 1, 2>> wJzT(num_active);
+    std::vector<Eigen::Matrix<float, 6, 2>> wJiT(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 2>> wJjT(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 1, 2>> wJzT(num_active_filtered);
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         // Match Python BA: use both weight channels separately (matching Python [1, M, 2] format)
         // Python: weights shape [1, M, 2] -> [1, M, 2, 1] after unsqueeze, then multiply with Ji [1, M, 2, 6]
         // Channel 0 (w0) applies to x-direction, Channel 1 (w1) applies to y-direction
@@ -683,9 +750,9 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         // Even if weights are zero, the computation should proceed (result will be zero, but consistent with Python)
         // Removing the early skip to match Python behavior
         
-        // Ji_center: [num_active, 2, 6] -> transpose to [6, 2]
-        // Jj_center: [num_active, 2, 6] -> transpose to [6, 2]
-        // Jz_center: [num_active, 2, 1] -> transpose to [1, 2]
+        // Ji_center: [num_active_filtered, 2, 6] -> transpose to [6, 2]
+        // Jj_center: [num_active_filtered, 2, 6] -> transpose to [6, 2]
+        // Jz_center: [num_active_filtered, 2, 1] -> transpose to [1, 2]
         // Apply w0 to x-direction and w1 to y-direction (matching Python broadcasting)
         for (int i = 0; i < 6; i++) {
             wJiT[e](i, 0) = w0 * Ji_center[e * 2 * 6 + 0 * 6 + i];  // x-direction: use w0
@@ -706,14 +773,14 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Bjj = wJjT @ Jj [6, 6]
     // Eik = wJiT @ Jz [6, 1]
     // Ejk = wJjT @ Jz [6, 1]
-    std::vector<Eigen::Matrix<float, 6, 6>> Bii(num_active);
-    std::vector<Eigen::Matrix<float, 6, 6>> Bij(num_active);
-    std::vector<Eigen::Matrix<float, 6, 6>> Bji(num_active);
-    std::vector<Eigen::Matrix<float, 6, 6>> Bjj(num_active);
-    std::vector<Eigen::Matrix<float, 6, 1>> Eik(num_active);
-    std::vector<Eigen::Matrix<float, 6, 1>> Ejk(num_active);
+    std::vector<Eigen::Matrix<float, 6, 6>> Bii(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 6>> Bij(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 6>> Bji(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 6>> Bjj(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 1>> Eik(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 1>> Ejk(num_active_filtered);
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         // Ji_center: [2, 6], Jj_center: [2, 6], Jz_center: [2, 1]
         Eigen::Matrix<float, 2, 6> Ji_mat, Jj_mat;
         Eigen::Matrix<float, 2, 1> Jz_mat;
@@ -738,20 +805,20 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     if (save_intermediates) {
         std::ofstream Ejk_file(get_bin_file_path("ba_step3_Ejk.bin"), std::ios::binary);
         if (Ejk_file.is_open()) {
-            Ejk_file.write(reinterpret_cast<const char*>(Ejk.data()), sizeof(float) * num_active * 6 * 1);
+            Ejk_file.write(reinterpret_cast<const char*>(Ejk.data()), sizeof(float) * num_active_filtered * 6 * 1);
             Ejk_file.close();
-            if (logger) logger->info("BA: Saved STEP 3 - Ejk blocks (size: {}x{}x{})", num_active, 6, 1);
+            if (logger) logger->info("BA: Saved STEP 3 - Ejk blocks (size: {}x{}x{})", num_active_filtered, 6, 1);
         }
     }
     
     // Save STEP 2: Weighted Jacobians
     if (save_intermediates) {
-        save_ba_step2(wJiT, wJjT, wJzT, weights_masked.data(), Ji_center.data(), Jj_center.data(), num_active, logger);
+        save_ba_step2(wJiT, wJjT, wJzT, weights_masked.data(), Ji_center.data(), Jj_center.data(), num_active_filtered, logger);
     }
     
     // Save STEP 3: Hessian blocks
     if (save_intermediates) {
-        save_ba_step3(Bii, Bij, Bji, Bjj, Eik, Ejk, num_active, logger);
+        save_ba_step3(Bii, Bij, Bji, Bjj, Eik, Ejk, num_active_filtered, logger);
     }
 
     // ---------------------------------------------------------
@@ -761,11 +828,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // vj = wJjT @ r [6, 1]
     // w = wJzT @ r [1, 1]
     
-    std::vector<Eigen::Matrix<float, 6, 1>> vi(num_active);
-    std::vector<Eigen::Matrix<float, 6, 1>> vj(num_active);
-    std::vector<float> w_vec(num_active);
+    std::vector<Eigen::Matrix<float, 6, 1>> vi(num_active_filtered);
+    std::vector<Eigen::Matrix<float, 6, 1>> vj(num_active_filtered);
+    std::vector<float> w_vec(num_active_filtered);
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         Eigen::Matrix<float, 2, 1> r_vec;
         r_vec(0, 0) = r[e * 2 + 0];
         r_vec(1, 0) = r[e * 2 + 1];
@@ -777,7 +844,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Save STEP 4: Gradients
     if (save_intermediates) {
-        save_ba_step4(vi, vj, w_vec.data(), num_active, logger);
+        save_ba_step4(vi, vj, w_vec.data(), num_active_filtered, logger);
     }
 
     // ---------------------------------------------------------
@@ -791,22 +858,22 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     //   - m_pg.m_ii[e] = patch index mapping (NOT frame index!)
     //   - Source frame i must be extracted from kk: i = kk[e] / M
     //   - m_pg.m_jj[e] = target frame index
-    std::vector<int> ii_new(num_active);
-    std::vector<int> jj_new(num_active);
+    std::vector<int> ii_new(num_active_filtered);
+    std::vector<int> jj_new(num_active_filtered);
     
     // Debug: Track which edges connect to which poses
     std::map<int, std::vector<int>> edges_to_pose_i;
     std::map<int, std::vector<int>> edges_to_pose_j;
     
-    for (int e = 0; e < num_active; e++) {
-        int i_source = m_pg.m_kk[e] / M;  // Extract source frame index from kk (matching reproject logic)
+    for (int e = 0; e < num_active_filtered; e++) {
+        int i_source = kk_filtered[e] / M;  // Extract source frame index from kk (matching reproject logic)
         ii_new[e] = i_source - fixedp;     // Adjust source frame index for fixed poses
-        jj_new[e] = m_pg.m_jj[e] - fixedp; // Adjust target frame index for fixed poses
+        jj_new[e] = jj_filtered[e] - fixedp; // Adjust target frame index for fixed poses
         
         // Track edges for debugging (only valid edges)
         if (v[e] >= 0.5f) {
             edges_to_pose_i[i_source].push_back(e);
-            edges_to_pose_j[m_pg.m_jj[e]].push_back(e);
+            edges_to_pose_j[jj_filtered[e]].push_back(e);
         }
     }
     
@@ -837,7 +904,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     if (logger) {
         logger->info("BA: num_active={}, n={} (limited to poses with edges), fixedp={}, n_adjusted={}", 
-                     num_active, n, fixedp, n_adjusted);
+                     num_active_filtered, n, fixedp, n_adjusted);
         
         if (max_pose_with_edges < m_pg.m_n) {
             logger->warn("BA: Limited optimization window from {} to {} poses (only poses with edges are optimized)",
@@ -857,14 +924,14 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // ---------------------------------------------------------
     // Step 6: Reindex structure variables
     // ---------------------------------------------------------
-    std::vector<int> kk_new(num_active);
+    std::vector<int> kk_new(num_active_filtered);
     std::vector<int> kx; // unique structure indices
     std::map<int, int> kk_to_idx; // mapping from original kk to unique index
     
     // Extract unique kk values
     std::set<int> kk_set;
-    for (int e = 0; e < num_active; e++) {
-        kk_set.insert(m_pg.m_kk[e]);
+    for (int e = 0; e < num_active_filtered; e++) {
+        kk_set.insert(kk_filtered[e]);
     }
     
     kx.assign(kk_set.begin(), kk_set.end());
@@ -876,8 +943,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     // Create new kk indices
-    for (int e = 0; e < num_active; e++) {
-        kk_new[e] = kk_to_idx[m_pg.m_kk[e]];
+    for (int e = 0; e < num_active_filtered; e++) {
+        kk_new[e] = kk_to_idx[kk_filtered[e]];
     }
     
     int m = static_cast<int>(kx.size()); // number of structure variables
@@ -904,7 +971,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // so the Hessian blocks Bii/Bij/etc. already have the validity mask incorporated.
     // We should NOT filter by v[e] here - only filter by indices to match Python.
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         int i = ii_new[e];
         int j = jj_new[e];
         
@@ -984,7 +1051,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     std::vector<std::vector<int>> edges_to_E_ik(6 * n_adjusted * m);  // Flattened: [6*n_adjusted*m]
     std::vector<std::vector<int>> edges_to_E_jk(6 * n_adjusted * m);
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         int i = ii_new[e];
         int j = jj_new[e];
         int k = kk_new[e];
@@ -1070,7 +1137,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // C = sum over edges: wJzT @ Jz (scalar per edge)
     Eigen::VectorXf C = Eigen::VectorXf::Zero(m);
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         if (v[e] < 0.5f) continue;
         
         int k = kk_new[e];
@@ -1096,7 +1163,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     Eigen::VectorXf v_grad = Eigen::VectorXf::Zero(6 * n_adjusted);
     Eigen::VectorXf w_grad = Eigen::VectorXf::Zero(m);
     
-    for (int e = 0; e < num_active; e++) {
+    for (int e = 0; e < num_active_filtered; e++) {
         if (v[e] < 0.5f) continue;
         
         int i = ii_new[e];
@@ -1141,15 +1208,15 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (has_nan) {
             logger->warn("BA: Gradient contains NaN/Inf values! Checking individual components...");
             // Log first few problematic gradients
-            for (int e = 0; e < std::min(5, num_active); e++) {
+            for (int e = 0; e < std::min(5, num_active_filtered); e++) {
                 bool vi_has_nan = false, vj_has_nan = false;
                 for (int idx = 0; idx < 6; idx++) {
                     if (!std::isfinite(vi[e](idx, 0))) vi_has_nan = true;
                     if (!std::isfinite(vj[e](idx, 0))) vj_has_nan = true;
                 }
                 if (vi_has_nan || vj_has_nan || !std::isfinite(w_vec[e])) {
-                    float w0 = m_pg.m_weight[e][0];  // Channel 0: weight for x-direction
-                    float w1 = m_pg.m_weight[e][1];  // Channel 1: weight for y-direction
+                    float w0 = weight_filtered[e * 2 + 0];  // Channel 0: weight for x-direction
+                    float w1 = weight_filtered[e * 2 + 1];  // Channel 1: weight for y-direction
                     logger->warn("BA: Edge[{}]: vi_has_nan={}, vj_has_nan={}, w_valid={}, "
                                 "r=({:.4f}, {:.4f}), weight=({:.4f}, {:.4f})",
                                 e, vi_has_nan, vj_has_nan, std::isfinite(w_vec[e]),
@@ -1170,11 +1237,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             logger->warn("BA: WARNING - Both v_grad and w_grad are near zero! This means BA won't update poses.");
             logger->warn("BA: Possible causes: 1) Residuals are zero (poses optimal), 2) Weights are zero, 3) Jacobians are zero");
             // Log sample residuals and weights to diagnose
-            int sample_count = std::min(5, num_active);
+            int sample_count = std::min(5, num_active_filtered);
             for (int e = 0; e < sample_count; e++) {
                 float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
-                float w0 = m_pg.m_weight[e][0];  // Channel 0: weight for x-direction
-                float w1 = m_pg.m_weight[e][1];  // Channel 1: weight for y-direction
+                float w0 = weight_filtered[e * 2 + 0];  // Channel 0: weight for x-direction
+                float w1 = weight_filtered[e * 2 + 1];  // Channel 1: weight for y-direction
                 logger->warn("BA: Sample edge[{}]: residual_norm={:.6f}, weight=({:.6f}, {:.6f}), valid={}", 
                             e, r_norm, w0, w1, v[e] > 0.5f ? 1 : 0);
             }

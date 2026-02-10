@@ -2,7 +2,7 @@
 #include "se.hpp"
 #include <cstdint>
 
-constexpr int BUFFER_SIZE = 8192;
+constexpr int BUFFER_SIZE = 16384;
 constexpr int PATCHES_PER_FRAME = 4;
 constexpr int PATCH_SIZE = 3;
 constexpr int MAX_EDGES = 360;
@@ -50,14 +50,14 @@ public:
     int m_jj[MAX_EDGES];
     int m_kk[MAX_EDGES];
     float m_weight[MAX_EDGES][2];  // [num_edges, 2] - weight channels (w0 for x, w1 for y, matching Python [1, M, 2])
-    float  m_target[MAX_EDGES];
+    float m_target[MAX_EDGES * 2];  // [num_edges * 2] - target (x, y) per edge: target[e*2+0]=x, target[e*2+1]=y
 
     // ---- inactive edges ----
     int m_ii_inac[MAX_EDGES];
     int m_jj_inac[MAX_EDGES];
     int m_kk_inac[MAX_EDGES];
     float m_weight_inac[MAX_EDGES][2];  // [num_edges, 2] - weight channels (w0 for x, w1 for y, matching Python [1, M, 2])
-    float  m_target_inac[MAX_EDGES];
+    float m_target_inac[MAX_EDGES * 2];  // [num_edges * 2] - target (x, y) per edge
 
 public:
     PatchGraph();

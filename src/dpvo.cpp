@@ -239,6 +239,58 @@ void DPVO::setPatchifierModels(Config_S* fnetConfig, Config_S* inetConfig)
     _startThreads();
 }
 
+// -------------------------------------------------------------
+// Recursive mkdir: creates all intermediate directories
+// -------------------------------------------------------------
+static void mkdirp(const std::string& path)
+{
+    struct stat info;
+    if (stat(path.c_str(), &info) == 0) return;  // already exists
+
+    // Find parent and create it first (recursive)
+    size_t pos = path.find_last_of('/');
+    if (pos != std::string::npos && pos > 0) {
+        mkdirp(path.substr(0, pos));
+    }
+    mkdir(path.c_str(), 0755);
+}
+
+// -------------------------------------------------------------
+// Inference Cache: save/load all model outputs to bin files
+// -------------------------------------------------------------
+void DPVO::enableInferenceCache(const std::string& cachePath)
+{
+    auto logger = spdlog::get("dpvo");
+    
+    // Create cache directory tree (including parents like inference_cache/IMG_0492)
+    mkdirp(cachePath);
+    
+    // Set FNet/INet cache on Patchifier
+    m_patchifier.setCachePath(cachePath);
+    
+    // Set Update model cache path
+    std::string updateCachePath = cachePath + "/update";
+    mkdirp(updateCachePath);
+    
+    // AMBA update model
+    if (m_updateModel) {
+        m_updateModel->updateTensorPath(updateCachePath);
+    }
+    
+#ifdef USE_ONNX_RUNTIME
+    // ONNX update model
+    if (m_updateModel_onnx) {
+        m_updateModel_onnx->updateTensorPath(updateCachePath);
+    }
+#endif
+    
+    if (logger) {
+        logger->info("\033[32m[DPVO] Inference cache enabled: {}\033[0m", cachePath);
+        logger->info("[DPVO]   FNet/INet cache: {}/fnet/ and {}/inet/", cachePath, cachePath);
+        logger->info("[DPVO]   Update model cache: {}", updateCachePath);
+    }
+}
+
 void DPVO::setIntrinsics(const float intrinsics[4])
 {
     std::memcpy(m_intrinsics, intrinsics, sizeof(float) * 4);
@@ -733,9 +785,15 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     // -------------------------------------------------
     if (m_is_initialized) {
         update();
+        auto t_kf_start = std::chrono::steady_clock::now();
         int m_n_before_keyframe = m_pg.m_n;
         keyframe();
         int m_n_after_keyframe = m_pg.m_n;
+        auto t_kf_end = std::chrono::steady_clock::now();
+        double kf_ms = std::chrono::duration<double, std::milli>(t_kf_end - t_kf_start).count();
+        if (auto lg = spdlog::get("dpvo")) {
+            lg->info("\033[33m[TIMING] Frame {} | Keyframe: {:.1f} ms\033[0m", m_counter, kf_ms);
+        }
         
         // Update viewer after optimization
         if (m_visualizationEnabled) {
@@ -882,6 +940,7 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     
     // Use tensor-based patchifier.forward() directly (avoids conversion)
     // This will use tensor-based fnet/inet.runInference() which avoids uint8_t* conversion
+    auto t_patchify_start = std::chrono::steady_clock::now();
     m_patchifier.forward(
         imgTensor,      // Use tensor directly
         m_cur_fmap1,
@@ -891,6 +950,9 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
         clr,
         M
     );
+    auto t_patchify_end = std::chrono::steady_clock::now();
+    double patchify_ms = std::chrono::duration<double, std::milli>(t_patchify_end - t_patchify_start).count();
+    if (logger) logger->info("\033[33m[TIMING] Frame {} | Patchify (FNet+INet): {:.1f} ms\033[0m", m_counter, patchify_ms);
     
     // Validate n_use (same as uint8_t* version)
     int n_use = n;
@@ -942,6 +1004,8 @@ void DPVO::update()
         const int M = m_cfg.PATCHES_PER_FRAME;
     const int P = m_P;
 
+    auto t_update_start = std::chrono::steady_clock::now();
+
     // -------------------------------------------------
     // 1. Reprojection
     // -------------------------------------------------
@@ -989,6 +1053,7 @@ void DPVO::update()
     // -------------------------------------------------
     // 2. Correlation
     // -------------------------------------------------
+    auto t_corr_start = std::chrono::steady_clock::now();
     // CRITICAL: Pass full buffers (m_fmap1, m_fmap2), not single-frame pointers (m_cur_fmap1)
     // computeCorrelation needs to access multiple frames based on jj[e] indices
     // Correlation output shape: [num_active, D, D, P, P, 2] where D = 2*R + 2 = 8 (R=3)
@@ -1060,6 +1125,8 @@ void DPVO::update()
                                 corr_8x8_size, P, D);
     }
     
+    auto t_corr_end = std::chrono::steady_clock::now();
+
     // -------------------------------------------------
     // 3. Context slice from imap
     // -------------------------------------------------
@@ -1112,6 +1179,7 @@ void DPVO::update()
     // -------------------------------------------------
     // 4. Network update (DPVO Update Model Inference)
     // -------------------------------------------------
+    auto t_update_model_start = std::chrono::steady_clock::now();
 #ifdef USE_ONNX_RUNTIME
     bool hasUpdateModel = (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) || 
                           (!m_useOnnxUpdateModel && m_updateModel != nullptr);
@@ -1443,6 +1511,8 @@ void DPVO::update()
     // -------------------------------------------------
     // 6. Bundle Adjustment
     // -------------------------------------------------
+    auto t_update_model_end = std::chrono::steady_clock::now();
+    auto t_ba_start = std::chrono::steady_clock::now();
         // Save BA inputs for comparison at a specific frame
     // m_counter is incremented in runAfterPatchify before update() is called
     // So when update() is called, m_counter represents the current frame number (0-indexed)
@@ -1587,6 +1657,8 @@ void DPVO::update()
         if (logger) logger->error("DPVO::update: Bundle adjustment unknown exception");
     }
 
+    auto t_ba_end = std::chrono::steady_clock::now();
+
     // -------------------------------------------------
     // 7. Update point cloud and viewer
     // -------------------------------------------------
@@ -1594,6 +1666,20 @@ void DPVO::update()
     if (m_visualizationEnabled) {
         computePointCloud();
         updateViewer();
+    }
+
+    // -------------------------------------------------
+    // TIMING SUMMARY
+    // -------------------------------------------------
+    auto t_update_end = std::chrono::steady_clock::now();
+    double reproject_ms  = std::chrono::duration<double, std::milli>(t_corr_start - t_update_start).count();
+    double corr_ms       = std::chrono::duration<double, std::milli>(t_corr_end - t_corr_start).count();
+    double update_mdl_ms = std::chrono::duration<double, std::milli>(t_update_model_end - t_update_model_start).count();
+    double ba_ms         = std::chrono::duration<double, std::milli>(t_ba_end - t_ba_start).count();
+    double total_ms      = std::chrono::duration<double, std::milli>(t_update_end - t_update_start).count();
+    if (logger) {
+        logger->info("\033[33m[TIMING] Frame {} | Reproject: {:.1f} ms | Correlation: {:.1f} ms | UpdateModel: {:.1f} ms | BA: {:.1f} ms | Total update(): {:.1f} ms\033[0m",
+                     m_counter, reproject_ms, corr_ms, update_mdl_ms, ba_ms, total_ms);
     }
 }
 
@@ -1693,13 +1779,16 @@ void DPVO::keyframe() {
         bool remove[MAX_EDGES] = {false};
 
         int num_active = m_pg.m_num_edges;
+        // M is already declared above at line 1653
         for (int e = 0; e < num_active; e++) {
-            // Use m_ii[e] directly (stores source frame index, matching Python's active_ii)
-            int i_source = m_pg.m_ii[e];  // Source frame index (from m_index[frame][patch])
-            int j_target = m_pg.m_jj[e];   // Target frame index
+            // CRITICAL FIX: Extract source frame from kk (sliding window index), not from m_ii
+            // m_ii[e] stores the source frame index where patch was originally created (global index)
+            // kk[e] / M gives the current frame index where patch resides (sliding window index)
+            // We need to compare sliding window indices, not global indices
+            int i_source_frame = m_pg.m_kk[e] / M;  // Source frame index in sliding window
+            int j_target = m_pg.m_jj[e];             // Target frame index in sliding window
             
-        
-            if (i_source == k || j_target == k) {
+            if (i_source_frame == k || j_target == k) {
                 remove[e] = true;
             }
         }
@@ -1760,11 +1849,42 @@ void DPVO::keyframe() {
 				m_pg.m_ix[kk_new] = m_pg.m_ix[kk_old] - 1;
 			}
 
-			// ---- ring buffers / lightweight objects ----
-			m_imap[f % m_pmem] = m_imap[(f + 1) % m_pmem];
-			m_gmap[f % m_pmem] = m_gmap[(f + 1) % m_pmem];
-			m_fmap1[f % m_mem] = m_fmap1[(f + 1) % m_mem];
-			m_fmap2[f % m_mem] = m_fmap2[(f + 1) % m_mem];
+			// ---- ring buffers: copy FULL FRAME data (not just a single float!) ----
+			// CRITICAL FIX: m_imap, m_gmap, m_fmap1, m_fmap2 are flat arrays.
+			// m_imap[f % m_pmem] only copies 1 float, but each frame has M*DIM floats.
+			// We must use memcpy with the correct stride to shift entire frame data.
+			{
+				const int D_gmap = 3;  // patchify: radius = P/2 = 1, D = 2*radius + 1 = 3
+				
+				int dst_pm = f % m_pmem;
+				int src_pm = (f + 1) % m_pmem;
+				int dst_mm = f % m_mem;
+				int src_mm = (f + 1) % m_mem;
+				
+				// imap: [m_pmem][M][m_DIM] - one frame = M * m_DIM floats
+				size_t imap_frame_bytes = sizeof(float) * M * m_DIM;
+				std::memcpy(&m_imap[imap_idx(dst_pm, 0, 0)],
+				            &m_imap[imap_idx(src_pm, 0, 0)],
+				            imap_frame_bytes);
+				
+				// gmap: [m_pmem][M][128][D_gmap][D_gmap] - one frame = M * 128 * D_gmap * D_gmap floats
+				size_t gmap_frame_bytes = sizeof(float) * M * 128 * D_gmap * D_gmap;
+				std::memcpy(&m_gmap[gmap_idx(dst_pm, 0, 0, 0, 0)],
+				            &m_gmap[gmap_idx(src_pm, 0, 0, 0, 0)],
+				            gmap_frame_bytes);
+				
+				// fmap1: [1][m_mem][128][fmap1_H][fmap1_W] - one frame = 128 * fmap1_H * fmap1_W floats
+				size_t fmap1_frame_bytes = sizeof(float) * 128 * m_fmap1_H * m_fmap1_W;
+				std::memcpy(&m_fmap1[fmap1_idx(0, dst_mm, 0, 0, 0)],
+				            &m_fmap1[fmap1_idx(0, src_mm, 0, 0, 0)],
+				            fmap1_frame_bytes);
+				
+				// fmap2: [1][m_mem][128][fmap2_H][fmap2_W] - one frame = 128 * fmap2_H * fmap2_W floats
+				size_t fmap2_frame_bytes = sizeof(float) * 128 * m_fmap2_H * m_fmap2_W;
+				std::memcpy(&m_fmap2[fmap2_idx(0, dst_mm, 0, 0, 0)],
+				            &m_fmap2[fmap2_idx(0, src_mm, 0, 0, 0)],
+				            fmap2_frame_bytes);
+			}
 		}
 
         // ---------------------------------------------------------
@@ -1948,7 +2068,8 @@ void DPVO::removeFactors(const bool* mask, bool store) {
             pg.m_kk_inac[w]     = pg.m_kk[i];
             pg.m_weight_inac[w][0] = pg.m_weight[i][0];  // Copy both weight channels
             pg.m_weight_inac[w][1] = pg.m_weight[i][1];
-            pg.m_target_inac[w]= pg.m_target[i];
+            pg.m_target_inac[w * 2 + 0] = pg.m_target[i * 2 + 0];  // Copy both target channels (x, y)
+            pg.m_target_inac[w * 2 + 1] = pg.m_target[i * 2 + 1];
             w++;
         }
         pg.m_num_edges_inac = w;
@@ -1965,7 +2086,8 @@ void DPVO::removeFactors(const bool* mask, bool store) {
             pg.m_kk[write]     = pg.m_kk[read];
             pg.m_weight[write][0] = pg.m_weight[read][0];  // Copy both weight channels
             pg.m_weight[write][1] = pg.m_weight[read][1];
-            pg.m_target[write] = pg.m_target[read];
+            pg.m_target[write * 2 + 0] = pg.m_target[read * 2 + 0];  // Copy both target channels (x, y)
+            pg.m_target[write * 2 + 1] = pg.m_target[read * 2 + 1];
             std::memcpy(pg.m_net[write],
                         pg.m_net[read],
                         sizeof(float) * NET_DIM);
