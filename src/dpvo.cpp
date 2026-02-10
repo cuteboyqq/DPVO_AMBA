@@ -1513,9 +1513,13 @@ void DPVO::update()
     int t0 = m_is_initialized ? (m_pg.m_n - m_cfg.OPTIMIZATION_WINDOW) : 1;
     t0 = std::max(t0, 1);
     
+        if (logger) {
+            logger->info("[BA] PRE-CALL: m_counter={}, m_pg.m_num_edges={}, m_pg.m_n={}, t0={}, m_is_initialized={}",
+                         m_counter, m_pg.m_num_edges, m_pg.m_n, t0, m_is_initialized);
+        }
         try {
-        bundleAdjustment(1e-4f, 100.0f, false, t0);
-        
+            bundleAdjustment(1e-4f, 100.0f, false, t0);
+            
         // Save BA outputs (updated poses) for target frame
         if (save_ba_inputs) {
             save_ba_outputs();

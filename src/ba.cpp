@@ -73,9 +73,9 @@ static void save_ba_step1(const float* r, const float* v, const float* coords,
     
     if (r_file.is_open() && v_file.is_open() && coords_center_file.is_open()) {
         if (logger) {
-            logger->info("BA: Saving STEP 1 residuals (first 3 edges):");
+            logger->info("[BA] Saving STEP 1 residuals (first 3 edges):");
             for (int e = 0; e < std::min(3, num_active); e++) {
-                logger->info("  Edge[{}]: coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f}), validity={:.1f}", 
+                logger->info("[BA]   Edge[{}]: coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f}), validity={:.1f}", 
                             e, coords_center_ba[e * 2 + 0], coords_center_ba[e * 2 + 1],
                             r[e * 2 + 0], r[e * 2 + 1], v[e]);
             }
@@ -87,14 +87,14 @@ static void save_ba_step1(const float* r, const float* v, const float* coords,
         v_file.close();
         coords_center_file.close();
         if (logger) {
-            logger->info("BA: ✅ Successfully saved STEP 1 - residuals, validity mask, and coords at center");
-            logger->info("BA: File sizes - residuals: {} bytes, validity: {} bytes, coords_center: {} bytes",
+            logger->info("[BA] ✅ Successfully saved STEP 1 - residuals, validity mask, and coords at center");
+            logger->info("[BA] File sizes - residuals: {} bytes, validity: {} bytes, coords_center: {} bytes",
                          num_active * 2 * sizeof(float), num_active * sizeof(float), num_active * 2 * sizeof(float));
         }
     } else {
         if (logger) {
-            logger->error("BA: ❌ Failed to open files for STEP 1 saving!");
-            logger->error("BA: r_file.is_open()={}, v_file.is_open()={}, coords_center_file.is_open()={}",
+            logger->error("[BA] ❌ Failed to open files for STEP 1 saving!");
+            logger->error("[BA] r_file.is_open()={}, v_file.is_open()={}, coords_center_file.is_open()={}",
                          r_file.is_open(), v_file.is_open(), coords_center_file.is_open());
         }
     }
@@ -161,10 +161,10 @@ static void save_ba_step2(const std::vector<Eigen::Matrix<float, 6, 2>>& wJiT,
         weights_masked_file.close();
         Ji_center_file.close();
         Jj_center_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 2 - weighted Jacobians");
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 2 - weighted Jacobians");
     } else {
         if (logger) {
-            logger->error("BA: ❌ Failed to open files for STEP 2 saving!");
+            logger->error("[BA] ❌ Failed to open files for STEP 2 saving!");
         }
     }
 }
@@ -235,10 +235,10 @@ static void save_ba_step3(const std::vector<Eigen::Matrix<float, 6, 6>>& Bii,
         Bjj_file.close();
         Eik_file.close();
         Ejk_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 3 - Hessian blocks");
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 3 - Hessian blocks");
     } else {
         if (logger) {
-            logger->error("BA: ❌ Failed to open files for STEP 3 saving!");
+            logger->error("[BA] ❌ Failed to open files for STEP 3 saving!");
         }
     }
 }
@@ -262,10 +262,10 @@ static void save_ba_step4(const std::vector<Eigen::Matrix<float, 6, 1>>& vi,
         vi_file.close();
         vj_file.close();
         w_vec_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 4 - gradients");
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 4 - gradients");
     } else {
         if (logger) {
-            logger->error("BA: ❌ Failed to open files for STEP 4 saving!");
+            logger->error("[BA] ❌ Failed to open files for STEP 4 saving!");
         }
     }
 }
@@ -276,10 +276,10 @@ static void save_ba_step9(const Eigen::MatrixXf& B, int n_adjusted, std::shared_
     if (B_file.is_open()) {
         B_file.write(reinterpret_cast<const char*>(B.data()), sizeof(float) * 6 * n_adjusted * 6 * n_adjusted);
         B_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 9 - assembled Hessian B (size: {}x{})", 
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 9 - assembled Hessian B (size: {}x{})", 
                                  6 * n_adjusted, 6 * n_adjusted);
     } else {
-        if (logger) logger->error("BA: ❌ Failed to open file for STEP 9 saving!");
+        if (logger) logger->error("[BA] ❌ Failed to open file for STEP 9 saving!");
     }
 }
 
@@ -289,10 +289,10 @@ static void save_ba_step10(const Eigen::MatrixXf& E, int n_adjusted, int m, std:
     if (E_file.is_open()) {
         E_file.write(reinterpret_cast<const char*>(E.data()), sizeof(float) * 6 * n_adjusted * m);
         E_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 10 - pose-structure coupling E (size: {}x{})", 
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 10 - pose-structure coupling E (size: {}x{})", 
                                  6 * n_adjusted, m);
     } else {
-        if (logger) logger->error("BA: ❌ Failed to open file for STEP 10 saving!");
+        if (logger) logger->error("[BA] ❌ Failed to open file for STEP 10 saving!");
     }
 }
 
@@ -302,9 +302,9 @@ static void save_ba_step11_C(const Eigen::VectorXf& C, int m, std::shared_ptr<sp
     if (C_file.is_open()) {
         C_file.write(reinterpret_cast<const char*>(C.data()), sizeof(float) * m);
         C_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 11 - structure Hessian C (size: {})", m);
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 11 - structure Hessian C (size: {})", m);
     } else {
-        if (logger) logger->error("BA: ❌ Failed to open file for STEP 11 C saving!");
+        if (logger) logger->error("[BA] ❌ Failed to open file for STEP 11 C saving!");
     }
 }
 
@@ -318,10 +318,10 @@ static void save_ba_step11_gradients(const Eigen::VectorXf& v_grad, const Eigen:
         w_grad_file.write(reinterpret_cast<const char*>(w_grad.data()), sizeof(float) * m);
         v_grad_file.close();
         w_grad_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 11 - assembled gradients v_grad (size: {}) and w_grad (size: {})", 
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 11 - assembled gradients v_grad (size: {}) and w_grad (size: {})", 
                                  6 * n_adjusted, m);
     } else {
-        if (logger) logger->error("BA: ❌ Failed to open files for STEP 11 gradients saving!");
+        if (logger) logger->error("[BA] ❌ Failed to open files for STEP 11 gradients saving!");
     }
 }
 
@@ -331,9 +331,9 @@ static void save_ba_step13(const Eigen::VectorXf& Q, int m, std::shared_ptr<spdl
     if (Q_file.is_open()) {
         Q_file.write(reinterpret_cast<const char*>(Q.data()), sizeof(float) * m);
         Q_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 13 - Q (inverse structure Hessian, size: {})", m);
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 13 - Q (inverse structure Hessian, size: {})", m);
     } else {
-        if (logger) logger->error("BA: ❌ Failed to open file for STEP 13 saving!");
+        if (logger) logger->error("[BA] ❌ Failed to open file for STEP 13 saving!");
     }
 }
 
@@ -347,10 +347,10 @@ static void save_ba_step14(const Eigen::MatrixXf& S, const Eigen::VectorXf& y,
         y_file.write(reinterpret_cast<const char*>(y.data()), sizeof(float) * 6 * n_adjusted);
         S_file.close();
         y_file.close();
-        if (logger) logger->info("BA: ✅ Successfully saved STEP 14 - Schur complement S (size: {}x{}) and RHS y (size: {})", 
+        if (logger) logger->info("[BA] ✅ Successfully saved STEP 14 - Schur complement S (size: {}x{}) and RHS y (size: {})", 
                                   6 * n_adjusted, 6 * n_adjusted, 6 * n_adjusted);
     } else {
-        if (logger) logger->error("BA: ❌ Failed to open files for STEP 14 saving!");
+        if (logger) logger->error("[BA] ❌ Failed to open files for STEP 14 saving!");
     }
 }
 
@@ -365,15 +365,15 @@ static void save_ba_step15_16(const Eigen::VectorXf& dX, const Eigen::VectorXf& 
         dX_file.close();
         dZ_file.close();
         if (logger) {
-            logger->info("BA: ✅ Successfully saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", 
+            logger->info("[BA] ✅ Successfully saved STEP 15-16 - solution dX (size: {}) and dZ (size: {})", 
                          dX.size(), dZ.size());
-            logger->info("BA: File sizes - dX: {} bytes, dZ: {} bytes", 
+            logger->info("[BA] File sizes - dX: {} bytes, dZ: {} bytes", 
                          dX.size() * sizeof(float), dZ.size() * sizeof(float));
         }
     } else {
         if (logger) {
-            logger->error("BA: ❌ Failed to open files for STEP 15-16 saving!");
-            logger->error("BA: dX_file.is_open()={}, dZ_file.is_open()={}", 
+            logger->error("[BA] ❌ Failed to open files for STEP 15-16 saving!");
+            logger->error("[BA] dX_file.is_open()={}, dZ_file.is_open()={}", 
                          dX_file.is_open(), dZ_file.is_open());
         }
     }
@@ -385,23 +385,30 @@ static void save_ba_step15_16(const Eigen::VectorXf& dX, const Eigen::VectorXf& 
 // =================================================================================================
 void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixedp)
 {
+    auto logger = get_ba_logger();
     const int num_active = m_pg.m_num_edges;
-    if (num_active == 0) return;
-
-    auto logger = spdlog::get("dpvo");
-    if (logger) {
-        logger->info("\033[32m========================================\033[0m");
-        logger->info("\033[32mSTEP 3.1: bundleAdjustment() - Bundle Adjustment\033[0m");
-        logger->info("\033[32m========================================\033[0m");
-    }
     
+    if (num_active == 0) {
+        if (logger) {
+            logger->info("[BA][F{}] SKIP: num_active=0, no edges to process", m_counter);
+        }
+        return;
+    }
+
+    if (logger) {
+        logger->info("[BA] \033[32m========================================\033[0m");
+        logger->info("[BA] \033[32mSTEP 3.1: bundleAdjustment() - Bundle Adjustment\033[0m");
+        logger->info("[BA] \033[32m========================================\033[0m");
+    }
     // Save intermediate BA values for step-by-step comparison at a specific frame
     // TARGET_FRAME is now defined in target_frame.hpp (shared across all files)
     // bundleAdjustment() is a member function, so we can access m_counter directly
     bool save_intermediates = (m_counter == TARGET_FRAME);
+    // Enable concise summary logging for all frames
+    bool log_post1000 = true;
     
     if (logger) {
-        logger->info("BA: m_counter={}, TARGET_FRAME={}, save_intermediates={}", 
+        logger->info("[BA] m_counter={}, TARGET_FRAME={}, save_intermediates={}", 
                      m_counter, TARGET_FRAME, save_intermediates);
     }
 
@@ -429,7 +436,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     if (filtered_count > 0 && logger) {
-        logger->warn("BA: Filtered out {} edges that reference frames outside sliding window (n={})",
+        logger->warn("[BA] Filtered out {} edges that reference frames outside sliding window (n={})",
                      filtered_count, m_pg.m_n);
     }
     
@@ -437,7 +444,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     int valid_edge_count = num_active - filtered_count;
     if (valid_edge_count == 0) {
         if (logger) {
-            logger->warn("BA: All edges filtered out, skipping BA");
+            logger->warn("[BA] All edges filtered out, skipping BA");
         }
         return;
     }
@@ -471,12 +478,12 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     int n = std::min(n_max_from_edges, m_pg.m_n);
     
     if (logger && n_max_from_edges > m_pg.m_n) {
-        logger->warn("BA: Limiting n from {} (from edges) to {} (sliding window size) to prevent optimizing unconstrained poses",
+        logger->warn("[BA] Limiting n from {} (from edges) to {} (sliding window size) to prevent optimizing unconstrained poses",
                      n_max_from_edges, m_pg.m_n);
     }
     
     if (logger) {
-        logger->info("BA: fixedp={}, n={} (computed from edges), will optimize poses [{}, {}] (matching Python t0/t1 logic)", 
+        logger->info("[BA] fixedp={}, n={} (computed from edges), will optimize poses [{}, {}] (matching Python t0/t1 logic)", 
                      fixedp, n, fixedp, n - 1);
     }
 
@@ -539,11 +546,11 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     
     // Debug: Log coords from BA's reproject() call for comparison
     if (logger && m_counter == TARGET_FRAME) {
-        logger->info("BA: Coords from second reproject() call (first 3 edges):");
+        logger->info("[BA] Coords from second reproject() call (first 3 edges):");
         for (int e = 0; e < std::min(3, num_active_filtered); e++) {
             float cx = coords[e * 2 * P * P + 0 * P * P + center_idx];
             float cy = coords[e * 2 * P * P + 1 * P * P + center_idx];
-            logger->info("  Edge[{}]: coords=({:.6f}, {:.6f})", e, cx, cy);
+            logger->info("[BA]   Edge[{}]: coords=({:.6f}, {:.6f})", e, cx, cy);
         }
     }
     std::vector<float> r(num_active_filtered * 2); // [num_active_filtered, 2]
@@ -568,7 +575,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (logger && e < 5) {
             float residual_x = target_x - cx;
             float residual_y = target_y - cy;
-            logger->info("BA: Edge[{}] - target=({:.6f}, {:.6f}), coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f})",
+            logger->info("[BA] Edge[{}] - target=({:.6f}, {:.6f}), coords=({:.6f}, {:.6f}), residual=({:.6f}, {:.6f})",
                         e, target_x, target_y, cx, cy, residual_x, residual_y);
         }
         
@@ -580,7 +587,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             v[e] = 0.0f;
             nan_residual_count++;
             if (logger && nan_residual_count <= 5) {
-                logger->warn("BA: Invalid residual[{}]: target=({}, {}), coords=({}, {})", 
+                logger->warn("[BA] Invalid residual[{}]: target=({}, {}), coords=({}, {})", 
                             e, target_x, target_y, cx, cy);
             }
             continue;
@@ -597,7 +604,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             v[e] = 0.0f;
             nan_residual_count++;
             if (logger && nan_residual_count <= 5) {
-                logger->warn("BA: NaN residual[{}]: target=({}, {}), coords=({}, {}), residual=({}, {})", 
+                logger->warn("[BA] NaN residual[{}]: target=({}, {}), coords=({}, {}), residual=({}, {})", 
                             e, target_x, target_y, cx, cy, r[e * 2 + 0], r[e * 2 + 1]);
             }
             continue;
@@ -614,18 +621,18 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     if (logger && nan_residual_count > 0) {
-        logger->warn("BA: {} out of {} edges have NaN/Inf residuals", nan_residual_count, num_active_filtered);
+        logger->warn("[BA] {} out of {} edges have NaN/Inf residuals", nan_residual_count, num_active_filtered);
     }
     
     if (logger) {
-        logger->info("BA: Residual stats - valid={}/{}, mean_residual={:.4f}", 
+        logger->info("[BA] Residual stats - valid={}/{}, mean_residual={:.4f}", 
                      valid_residuals, num_active_filtered, 
                      valid_residuals > 0 ? residual_sum / valid_residuals : 0.0f);
         if (valid_residuals > 0 && valid_residuals < 5) {
             // Log first few residuals for debugging
             for (int e = 0; e < std::min(3, num_active_filtered); e++) {
                 float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
-                logger->info("BA: Residual[{}]: target=({:.2f}, {:.2f}), coords=({:.2f}, {:.2f}), "
+                logger->info("[BA] Residual[{}]: target=({:.2f}, {:.2f}), coords=({:.2f}, {:.2f}), "
                              "residual=({:.4f}, {:.4f}), norm={:.4f}, valid={}",
                              e, target_filtered[e * 2 + 0], target_filtered[e * 2 + 1],
                              coords[e * 2 * P * P + 0 * P * P + center_idx],
@@ -648,8 +655,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     float bounds_xmax = bounds_W - 1.0f;  // bounds[2] = W - 1.0
     float bounds_ymax = bounds_H - 1.0f;  // bounds[3] = H - 1.0
     
-    if (logger && m_counter == TARGET_FRAME) {
-        logger->info("BA: Computed bounds from intrinsics - max_cx={:.2f}, max_cy={:.2f}, W={:.1f}, H={:.1f}, bounds=[0.0, 0.0, {:.1f}, {:.1f}]",
+    if (logger) {
+        logger->info("[BA] Computed bounds from intrinsics - max_cx={:.2f}, max_cy={:.2f}, W={:.1f}, H={:.1f}, bounds=[0.0, 0.0, {:.1f}, {:.1f}]",
                      max_cx, max_cy, bounds_W, bounds_H, bounds_xmax, bounds_ymax);
     }
     
@@ -667,8 +674,8 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (out_of_bounds) {
             v[e] = 0.0f;
             // Debug: Log out-of-bounds edges for comparison with Python
-            if (logger && m_counter == TARGET_FRAME && e < 10) {
-                logger->info("BA: Edge[{}] out-of-bounds - cx={:.2f}, cy={:.2f}, bounds=[0.0, 0.0, {:.1f}, {:.1f}]",
+            if (logger && e < 10) {
+                logger->info("[BA] Edge[{}] out-of-bounds - cx={:.2f}, cy={:.2f}, bounds=[0.0, 0.0, {:.1f}, {:.1f}]",
                             e, cx, cy, bounds_xmax, bounds_ymax);
             }
         }
@@ -678,6 +685,30 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (valid_center < 0.5f) {
             v[e] = 0.0f;
         }
+    }
+
+    // Post-frame-1000 residual summary (after bounds check so v[] is finalized)
+    if (logger && log_post1000) {
+        float max_r_norm = 0.0f;
+        int oob_count = 0;
+        int large_r_count = 0;
+        int invalid_count = 0;
+        for (int e = 0; e < num_active_filtered; e++) {
+            float rn = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
+            if (rn > max_r_norm) max_r_norm = rn;
+            if (v[e] < 0.5f) {
+                float cx_e = coords[e * 2 * P * P + 0 * P * P + center_idx];
+                float cy_e = coords[e * 2 * P * P + 1 * P * P + center_idx];
+                if (cx_e <= 0.0f || cy_e <= 0.0f || cx_e >= bounds_xmax || cy_e >= bounds_ymax)
+                    oob_count++;
+                else
+                    large_r_count++;
+                invalid_count++;
+            }
+        }
+        logger->info("[BA][F{}] residual: edges={}, valid={}, invalid={} (nan={}, oob={}, large_r={}), mean_r={:.4f}, max_r={:.4f}",
+                     m_counter, num_active_filtered, valid_residuals, invalid_count, nan_residual_count, oob_count, large_r_count,
+                     valid_residuals > 0 ? residual_sum / valid_residuals : 0.0f, max_r_norm);
     }
 
     // Apply validity mask to residuals and weights
@@ -699,7 +730,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         save_ba_step1(r.data(), v.data(), coords.data(), num_active_filtered, P, center_idx, logger);
     } else {
         if (logger && m_counter % 10 == 0) {  // Log every 10 frames to avoid spam
-            logger->debug("BA: Skipping STEP 1 save (m_counter={} != TARGET_FRAME={})", m_counter, TARGET_FRAME);
+            logger->debug("[BA] Skipping STEP 1 save (m_counter={} != TARGET_FRAME={})", m_counter, TARGET_FRAME);
         }
     }
     
@@ -807,7 +838,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (Ejk_file.is_open()) {
             Ejk_file.write(reinterpret_cast<const char*>(Ejk.data()), sizeof(float) * num_active_filtered * 6 * 1);
             Ejk_file.close();
-            if (logger) logger->info("BA: Saved STEP 3 - Ejk blocks (size: {}x{}x{})", num_active_filtered, 6, 1);
+            if (logger) logger->info("[BA] Saved STEP 3 - Ejk blocks (size: {}x{}x{})", num_active_filtered, 6, 1);
         }
     }
     
@@ -896,18 +927,18 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // This prevents creating empty matrices and causing assertion failures
     if (n_adjusted <= 0) {
         if (logger) {
-            logger->warn("BA: Early return - n_adjusted={} (n={}, fixedp={}). All poses are fixed, nothing to optimize.",
+            logger->warn("[BA] Early return - n_adjusted={} (n={}, fixedp={}). All poses are fixed, nothing to optimize.",
                         n_adjusted, n, fixedp);
         }
         return;  // No poses to optimize, skip BA
     }
     
     if (logger) {
-        logger->info("BA: num_active={}, n={} (limited to poses with edges), fixedp={}, n_adjusted={}", 
+        logger->info("[BA] num_active={}, n={} (limited to poses with edges), fixedp={}, n_adjusted={}", 
                      num_active_filtered, n, fixedp, n_adjusted);
         
         if (max_pose_with_edges < m_pg.m_n) {
-            logger->warn("BA: Limited optimization window from {} to {} poses (only poses with edges are optimized)",
+            logger->warn("[BA] Limited optimization window from {} to {} poses (only poses with edges are optimized)",
                         m_pg.m_n, max_pose_with_edges);
         }
         
@@ -916,7 +947,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
             int adjusted_idx = pose_idx - fixedp;
             int edges_as_i = edges_to_pose_i[pose_idx].size();
             int edges_as_j = edges_to_pose_j[pose_idx].size();
-            logger->info("BA: Pose[{}] (adjusted_idx={}) - {} edges as source (i), {} edges as target (j)",
+            logger->info("[BA] Pose[{}] (adjusted_idx={}) - {} edges as source (i), {} edges as target (j)",
                         pose_idx, adjusted_idx, edges_as_i, edges_as_j);
         }
     }
@@ -1015,7 +1046,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     if (logger) {
-        logger->info("BA: Edge statistics - both adjustable: {}, to fixed i: {}, to fixed j: {}, total valid: {}",
+        logger->info("[BA] Edge statistics - both adjustable: {}, to fixed i: {}, to fixed j: {}, total valid: {}",
                      edges_both_adjustable, edges_to_fixed_i, edges_to_fixed_j, 
                      edges_both_adjustable + edges_to_fixed_i + edges_to_fixed_j);
     }
@@ -1024,7 +1055,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     if (logger) {
         for (int idx = 0; idx < n_adjusted; idx++) {
             int pose_idx = fixedp + idx;
-            logger->info("BA: Adjusted pose idx={} (global pose_idx={}) has {} edges contributing to Hessian",
+            logger->info("[BA] Adjusted pose idx={} (global pose_idx={}) has {} edges contributing to Hessian",
                          idx, pose_idx, edge_count_per_pose[idx]);
         }
     }
@@ -1086,14 +1117,14 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     }
     
     // Debug: Log edges contributing to E[0, 1] (pose 0, param 0, struct var 1) if this is target frame
-    if (save_intermediates && logger && m_counter == TARGET_FRAME) {
+    if (save_intermediates && logger) {
         int debug_pose = 0;
         int debug_param = 0;
         int debug_struct = 1;
         int debug_flat_idx = (6 * debug_pose + debug_param) * m + debug_struct;
         if (debug_flat_idx < static_cast<int>(edges_to_E_ik.size()) && 
             debug_flat_idx < static_cast<int>(edges_to_E_jk.size())) {
-            logger->info("BA: Edges contributing to E[pose={}, param={}, struct={}]:", 
+            logger->info("[BA] Edges contributing to E[pose={}, param={}, struct={}]:", 
                         debug_pose, debug_param, debug_struct);
             
             // Convert vector<int> to string for logging
@@ -1103,7 +1134,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 eik_edges_str += std::to_string(edges_to_E_ik[debug_flat_idx][i]);
             }
             eik_edges_str += "]";
-            logger->info("  Eik edges: {}", eik_edges_str);
+            logger->info("[BA]   Eik edges: {}", eik_edges_str);
             
             std::string ejk_edges_str = "[";
             for (size_t i = 0; i < edges_to_E_jk[debug_flat_idx].size(); i++) {
@@ -1111,15 +1142,15 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 ejk_edges_str += std::to_string(edges_to_E_jk[debug_flat_idx][i]);
             }
             ejk_edges_str += "]";
-            logger->info("  Ejk edges: {}", ejk_edges_str);
+            logger->info("[BA]   Ejk edges: {}", ejk_edges_str);
             
             for (int e : edges_to_E_ik[debug_flat_idx]) {
-                logger->info("    Edge {}: ii_new={}, kk_new={}, Eik[{}]=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})", 
+                logger->info("[BA]     Edge {}: ii_new={}, kk_new={}, Eik[{}]=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})", 
                             e, ii_new[e], kk_new[e], e,
                             Eik[e](0, 0), Eik[e](1, 0), Eik[e](2, 0), Eik[e](3, 0), Eik[e](4, 0), Eik[e](5, 0));
             }
             for (int e : edges_to_E_jk[debug_flat_idx]) {
-                logger->info("    Edge {}: jj_new={}, kk_new={}, Ejk[{}]=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})", 
+                logger->info("[BA]     Edge {}: jj_new={}, kk_new={}, Ejk[{}]=({:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f}, {:.6f})", 
                             e, jj_new[e], kk_new[e], e,
                             Ejk[e](0, 0), Ejk[e](1, 0), Ejk[e](2, 0), Ejk[e](3, 0), Ejk[e](4, 0), Ejk[e](5, 0));
             }
@@ -1206,7 +1237,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         }
         
         if (has_nan) {
-            logger->warn("BA: Gradient contains NaN/Inf values! Checking individual components...");
+            logger->warn("[BA] Gradient contains NaN/Inf values! Checking individual components...");
             // Log first few problematic gradients
             for (int e = 0; e < std::min(5, num_active_filtered); e++) {
                 bool vi_has_nan = false, vj_has_nan = false;
@@ -1217,7 +1248,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 if (vi_has_nan || vj_has_nan || !std::isfinite(w_vec[e])) {
                     float w0 = weight_filtered[e * 2 + 0];  // Channel 0: weight for x-direction
                     float w1 = weight_filtered[e * 2 + 1];  // Channel 1: weight for y-direction
-                    logger->warn("BA: Edge[{}]: vi_has_nan={}, vj_has_nan={}, w_valid={}, "
+                    logger->warn("[BA] Edge[{}]: vi_has_nan={}, vj_has_nan={}, w_valid={}, "
                                 "r=({:.4f}, {:.4f}), weight=({:.4f}, {:.4f})",
                                 e, vi_has_nan, vj_has_nan, std::isfinite(w_vec[e]),
                                 r[e * 2 + 0], r[e * 2 + 1], w0, w1);
@@ -1229,20 +1260,20 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         float v_grad_max = v_grad.cwiseAbs().maxCoeff();
         float w_grad_norm = w_grad.norm();
         float w_grad_max = w_grad.cwiseAbs().maxCoeff();
-        logger->info("BA: Gradient stats - v_grad_norm={:.6f}, v_grad_max={:.6f}, w_grad_norm={:.6f}, w_grad_max={:.6f}", 
+        logger->info("[BA] Gradient stats - v_grad_norm={:.6f}, v_grad_max={:.6f}, w_grad_norm={:.6f}, w_grad_max={:.6f}", 
                      v_grad_norm, v_grad_max, w_grad_norm, w_grad_max);
         
         // Check if gradients are zero
         if (v_grad_norm < 1e-6f && w_grad_norm < 1e-6f) {
-            logger->warn("BA: WARNING - Both v_grad and w_grad are near zero! This means BA won't update poses.");
-            logger->warn("BA: Possible causes: 1) Residuals are zero (poses optimal), 2) Weights are zero, 3) Jacobians are zero");
+            logger->warn("[BA] WARNING - Both v_grad and w_grad are near zero! This means BA won't update poses.");
+            logger->warn("[BA] Possible causes: 1) Residuals are zero (poses optimal), 2) Weights are zero, 3) Jacobians are zero");
             // Log sample residuals and weights to diagnose
             int sample_count = std::min(5, num_active_filtered);
             for (int e = 0; e < sample_count; e++) {
                 float r_norm = std::sqrt(r[e * 2 + 0] * r[e * 2 + 0] + r[e * 2 + 1] * r[e * 2 + 1]);
                 float w0 = weight_filtered[e * 2 + 0];  // Channel 0: weight for x-direction
                 float w1 = weight_filtered[e * 2 + 1];  // Channel 1: weight for y-direction
-                logger->warn("BA: Sample edge[{}]: residual_norm={:.6f}, weight=({:.6f}, {:.6f}), valid={}", 
+                logger->warn("[BA] Sample edge[{}]: residual_norm={:.6f}, weight=({:.6f}, {:.6f}), valid={}", 
                             e, r_norm, w0, w1, v[e] > 0.5f ? 1 : 0);
             }
         }
@@ -1251,6 +1282,24 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Save STEP 11: Assembled gradients
     if (save_intermediates) {
         save_ba_step11_gradients(v_grad, w_grad, n_adjusted, m, logger);
+    }
+    
+    // Post-frame-1000 Hessian and gradient summary
+    if (logger && log_post1000) {
+        // B matrix stats
+        float B_diag_min = B.diagonal().minCoeff();
+        float B_diag_max = B.diagonal().maxCoeff();
+        float B_norm = B.norm();
+        // E matrix stats
+        float E_norm = E.norm();
+        float E_max = E.cwiseAbs().maxCoeff();
+        // C stats
+        float C_min = C.minCoeff();
+        float C_max = C.maxCoeff();
+        logger->info("[BA][F{}] Hessian: n_adj={}, m={}, B_diag=[{:.4f},{:.4f}], B_norm={:.4f}, E_norm={:.4f}, E_max={:.4f}, C=[{:.4f},{:.4f}]",
+                     m_counter, n_adjusted, m, B_diag_min, B_diag_max, B_norm, E_norm, E_max, C_min, C_max);
+        logger->info("[BA][F{}] gradient: v_grad_norm={:.6f}, v_grad_max={:.6f}, w_grad_norm={:.6f}, w_grad_max={:.6f}",
+                     m_counter, v_grad.norm(), v_grad.cwiseAbs().maxCoeff(), w_grad.norm(), w_grad.cwiseAbs().maxCoeff());
     }
     
     // Levenberg-Marquardt damping
@@ -1277,10 +1326,10 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     if (logger) {
         float y_norm = y.norm();
         float EQ_w_norm = (EQ * w_grad).norm();
-        logger->info("BA: RHS vector y stats - y.norm()={:.6f}, v_grad.norm()={:.6f}, (EQ*w_grad).norm()={:.6f}", 
+        logger->info("[BA] RHS vector y stats - y.norm()={:.6f}, v_grad.norm()={:.6f}, (EQ*w_grad).norm()={:.6f}", 
                      y_norm, v_grad.norm(), EQ_w_norm);
         if (y_norm < 1e-6f) {
-            logger->warn("BA: y vector is near zero - BA will not update poses! Check residuals and weights.");
+            logger->warn("[BA] y vector is near zero - BA will not update poses! Check residuals and weights.");
         }
     }
     
@@ -1311,7 +1360,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (solver.info() != Eigen::Success) {
             // Python: if cholesky fails, return zeros
             if (logger) {
-                logger->warn("BA: Cholesky solver failed with info={}", static_cast<int>(solver.info()));
+                logger->warn("[BA] Cholesky solver failed with info={}", static_cast<int>(solver.info()));
             }
             dX = Eigen::VectorXf::Zero(6 * n_adjusted);
             dZ = Q.asDiagonal() * w_grad; // Still update structure even if pose solve fails
@@ -1323,10 +1372,10 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 float S_diag_min = S_damped.diagonal().minCoeff();
                 float S_diag_max = S_damped.diagonal().maxCoeff();
                 float S_cond = S_diag_max / std::max(S_diag_min, 1e-10f);
-                logger->info("BA: Solver success - y.norm()={:.6f}, dX.norm()={:.6f}, S_diag_range=[{:.6f}, {:.6f}], S_cond={:.2e}, ep={:.2f}, lm={:.2e}",
+                logger->info("[BA] Solver success - y.norm()={:.6f}, dX.norm()={:.6f}, S_diag_range=[{:.6f}, {:.6f}], S_cond={:.2e}, ep={:.2f}, lm={:.2e}",
                              y_norm, dX_norm_before_check, S_diag_min, S_diag_max, S_cond, ep, lm);
                 if (dX_norm_before_check < 0.1f && y_norm > 10.0f) {
-                    logger->warn("BA: WARNING - Large residual (y.norm()={:.2f}) but small update (dX.norm()={:.4f})! "
+                    logger->warn("[BA] WARNING - Large residual (y.norm()={:.2f}) but small update (dX.norm()={:.4f})! "
                                 "This suggests damping might be too high or Hessian is poorly conditioned.",
                                 y_norm, dX_norm_before_check);
                 }
@@ -1342,6 +1391,26 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         }
     }
 
+    // Post-frame-1000 solve result summary
+    if (logger && log_post1000) {
+        float dX_norm = dX.norm();
+        float dX_max = dX.cwiseAbs().maxCoeff();
+        float dZ_norm = dZ.norm();
+        float dZ_max = dZ.cwiseAbs().maxCoeff();
+        float dZ_mean = dZ.mean();
+        logger->info("[BA][F{}] solve: dX_norm={:.6f}, dX_max={:.6f}, dZ_norm={:.6f}, dZ_max={:.6f}, dZ_mean={:.6f}",
+                     m_counter, dX_norm, dX_max, dZ_norm, dZ_max, dZ_mean);
+        // Log per-pose dX breakdown (translation vs rotation magnitudes)
+        for (int idx = 0; idx < std::min(n_adjusted, 5); idx++) {
+            Eigen::Matrix<float, 6, 1> dx_p = dX.segment<6>(6 * idx);
+            float t_mag = std::sqrt(dx_p(0)*dx_p(0) + dx_p(1)*dx_p(1) + dx_p(2)*dx_p(2));
+            float r_mag = std::sqrt(dx_p(3)*dx_p(3) + dx_p(4)*dx_p(4) + dx_p(5)*dx_p(5));
+            logger->info("[BA][F{}] dX pose[{}] (global={}): t_mag={:.6f}, r_mag={:.6f}, dt=({:.6f},{:.6f},{:.6f}), dr=({:.6f},{:.6f},{:.6f})",
+                         m_counter, idx, fixedp + idx, t_mag, r_mag,
+                         dx_p(0), dx_p(1), dx_p(2), dx_p(3), dx_p(4), dx_p(5));
+        }
+    }
+    
     // ---------------------------------------------------------
     // Step 11: Apply updates
     // ---------------------------------------------------------
@@ -1350,7 +1419,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         if (logger) {
             float dX_norm = dX.norm();
             float dX_max = dX.cwiseAbs().maxCoeff();
-            logger->info("BA: dX stats - norm={:.6f}, max={:.6f}, size={}", 
+            logger->info("[BA] dX stats - norm={:.6f}, max={:.6f}, size={}", 
                          dX_norm, dX_max, dX.size());
         }
         
@@ -1361,7 +1430,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 
                 // Debug: Log dX values for first few poses
                 if (logger && idx < 3) {
-                    logger->info("BA: Pose[{}] (idx={}) dX: t=({:.6f}, {:.6f}, {:.6f}), r=({:.6f}, {:.6f}, {:.6f})",
+                    logger->info("[BA] Pose[{}] (idx={}) dX: t=({:.6f}, {:.6f}, {:.6f}), r=({:.6f}, {:.6f}, {:.6f})",
                                 pose_idx, idx,
                                 dx_vec(0), dx_vec(1), dx_vec(2),
                                 dx_vec(3), dx_vec(4), dx_vec(5));
@@ -1387,10 +1456,10 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                     Eigen::Quaternionf q_before = pose_before.q;
                     Eigen::Vector3f t_after = m_pg.m_poses[pose_idx].t;
                     Eigen::Quaternionf q_after = m_pg.m_poses[pose_idx].q;
-                    logger->info("BA: Pose[{}] before: t=({:.6f}, {:.6f}, {:.6f}), q=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
+                    logger->info("[BA] Pose[{}] before: t=({:.6f}, {:.6f}, {:.6f}), q=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
                                 pose_idx, t_before.x(), t_before.y(), t_before.z(),
                                 q_before.x(), q_before.y(), q_before.z(), q_before.w());
-                    logger->info("BA: Pose[{}] after:  t=({:.6f}, {:.6f}, {:.6f}), q=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
+                    logger->info("[BA] Pose[{}] after:  t=({:.6f}, {:.6f}, {:.6f}), q=({:.6f}, {:.6f}, {:.6f}, {:.6f})",
                                 pose_idx, t_after.x(), t_after.y(), t_after.z(),
                                 q_after.x(), q_after.y(), q_after.z(), q_after.w());
                 }
@@ -1398,7 +1467,7 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
         }
     } else {
         if (logger) {
-            logger->warn("BA: Skipping pose updates - structure_only={}, n_adjusted={}", 
+            logger->warn("[BA] Skipping pose updates - structure_only={}, n_adjusted={}", 
                          structure_only, n_adjusted);
         }
     }
@@ -1406,15 +1475,40 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
     // Summary log for BA saving
     if (logger) {
         if (save_intermediates) {
-            logger->info("BA: ========================================");
-            logger->info("BA: ✅ BA intermediate files saved for frame {} (TARGET_FRAME={})", m_counter, TARGET_FRAME);
-            logger->info("BA: Check bin_file/ directory for ba_step*.bin files");
-            logger->info("BA: ========================================");
+            logger->info("[BA] ========================================");
+            logger->info("[BA] ✅ BA intermediate files saved for frame {} (TARGET_FRAME={})", m_counter, TARGET_FRAME);
+            logger->info("[BA] Check bin_file/ directory for ba_step*.bin files");
+            logger->info("[BA] ========================================");
         } else {
             if (m_counter % 50 == 0) {  // Log every 50 frames to avoid spam
-                logger->debug("BA: Skipping BA intermediate file saving (m_counter={} != TARGET_FRAME={})", 
+                logger->debug("[BA] Skipping BA intermediate file saving (m_counter={} != TARGET_FRAME={})", 
                              m_counter, TARGET_FRAME);
             }
+        }
+    }
+    
+    // Post-frame-1000: Log pose changes summary
+    if (logger && log_post1000 && !structure_only && n_adjusted > 0) {
+        float max_t_change = 0.0f;
+        float max_r_change = 0.0f;
+        int max_t_pose = -1, max_r_pose = -1;
+        for (int idx = 0; idx < n_adjusted; idx++) {
+            Eigen::Matrix<float, 6, 1> dx_p = dX.segment<6>(6 * idx);
+            float t_change = std::sqrt(dx_p(0)*dx_p(0) + dx_p(1)*dx_p(1) + dx_p(2)*dx_p(2));
+            float r_change = std::sqrt(dx_p(3)*dx_p(3) + dx_p(4)*dx_p(4) + dx_p(5)*dx_p(5));
+            if (t_change > max_t_change) { max_t_change = t_change; max_t_pose = fixedp + idx; }
+            if (r_change > max_r_change) { max_r_change = r_change; max_r_pose = fixedp + idx; }
+        }
+        // Log latest pose (last optimized pose) position
+        int last_pose_idx = fixedp + n_adjusted - 1;
+        if (last_pose_idx >= 0 && last_pose_idx < n) {
+            Eigen::Vector3f t_last = m_pg.m_poses[last_pose_idx].t;
+            Eigen::Quaternionf q_last = m_pg.m_poses[last_pose_idx].q;
+            logger->info("[BA][F{}] pose update: max_t_change={:.6f} (pose {}), max_r_change={:.6f} (pose {}), "
+                         "latest_pose[{}] t=({:.4f},{:.4f},{:.4f}), q=({:.4f},{:.4f},{:.4f},{:.4f})",
+                         m_counter, max_t_change, max_t_pose, max_r_change, max_r_pose,
+                         last_pose_idx, t_last.x(), t_last.y(), t_last.z(),
+                         q_last.x(), q_last.y(), q_last.z(), q_last.w());
         }
     }
     
@@ -1443,6 +1537,16 @@ void DPVO::bundleAdjustment(float lmbda, float ep, bool structure_only, int fixe
                 disp = std::max(MIN_PD, std::min(MAX_PD, disp + dZ_val));
             }
         }
+    }
+    
+    // Post-frame-1000: Final one-line BA summary
+    if (logger && log_post1000) {
+        float mean_residual = valid_residuals > 0 ? residual_sum / valid_residuals : 0.0f;
+        float dX_norm_final = dX.norm();
+        float dZ_norm_final = dZ.norm();
+        logger->info("[BA][F{}] DONE: edges={}, valid={}, n_adj={}, m={}, mean_r={:.4f}, dX={:.6f}, dZ={:.6f}, fixedp={}",
+                     m_counter, num_active_filtered, valid_residuals, n_adjusted, m,
+                     mean_residual, dX_norm_final, dZ_norm_final, fixedp);
     }
 }
 

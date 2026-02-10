@@ -37,7 +37,7 @@ struct DPVOConfig {
 
     DPVOConfig()
         : PATCHES_PER_FRAME(4),
-          BUFFER_SIZE(16384),
+          BUFFER_SIZE(4096),
           PATCH_SIZE(3),
           MIXED_PRECISION(0),
           LOOP_CLOSURE(0),
