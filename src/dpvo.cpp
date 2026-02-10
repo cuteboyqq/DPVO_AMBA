@@ -268,26 +268,9 @@ void DPVO::enableInferenceCache(const std::string& cachePath)
     // Set FNet/INet cache on Patchifier
     m_patchifier.setCachePath(cachePath);
     
-    // Set Update model cache path
-    std::string updateCachePath = cachePath + "/update";
-    mkdirp(updateCachePath);
-    
-    // AMBA update model
-    if (m_updateModel) {
-        m_updateModel->updateTensorPath(updateCachePath);
-    }
-    
-#ifdef USE_ONNX_RUNTIME
-    // ONNX update model
-    if (m_updateModel_onnx) {
-        m_updateModel_onnx->updateTensorPath(updateCachePath);
-    }
-#endif
-    
     if (logger) {
         logger->info("\033[32m[DPVO] Inference cache enabled: {}\033[0m", cachePath);
         logger->info("[DPVO]   FNet/INet cache: {}/fnet/ and {}/inet/", cachePath, cachePath);
-        logger->info("[DPVO]   Update model cache: {}", updateCachePath);
     }
 }
 

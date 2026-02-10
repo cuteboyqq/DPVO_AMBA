@@ -22,9 +22,6 @@ public:
                       float* iiData, float* jjData, float* kkData, 
                       int frameIdx, DPVOUpdate_Prediction& pred);
     
-    // Inference cache: set path to save/load update model outputs
-    void updateTensorPath(const std::string& path) { m_tensorPath = path; }
-    
     // Reshape inputs (same interface as DPVOUpdate)
     int reshapeInput(
         int num_active,
@@ -52,10 +49,6 @@ private:
                     float* iiData, float* jjData, float* kkData,
                     std::vector<std::vector<float>>& input_data);
     
-    // Inference cache helpers
-    bool _checkSavedTensor(int frameIdx, DPVOUpdate_Prediction& pred);
-    void _saveOutputTensor(int frameIdx, const DPVOUpdate_Prediction& pred);
-    
     std::string m_modelPath;
     int m_maxEdge = 360;
     
@@ -73,8 +66,5 @@ private:
     size_t m_netOutBufferSize = 0;
     size_t m_dOutBufferSize = 0;
     size_t m_wOutBufferSize = 0;
-    
-    // Inference cache path (empty = disabled)
-    std::string m_tensorPath;
 };
 

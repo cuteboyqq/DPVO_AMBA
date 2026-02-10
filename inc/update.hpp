@@ -58,7 +58,6 @@ public:
     // Utility Functions
     bool isInputBufferEmpty() const;
     bool isPredictionBufferEmpty() const;
-    void updateTensorPath(const std::string& path);
     bool createDirectory(const std::string& path);
     bool directoryExists(const std::string& path);
 
@@ -102,7 +101,6 @@ public:
 private:
 
 #if defined(CV28) || defined(CV28_SIMULATOR)
-    bool _checkSavedTensor(int frameIdx);
     bool _loadInput(float* netData, float* inpData, float* corrData, 
                     float* iiData, float* jjData, float* kkData);
     bool _run(float* netData, float* inpData, float* corrData, 
@@ -113,10 +111,6 @@ private:
     bool _releaseInputTensors();
     bool _releaseOutputTensors();
     bool _releaseTensorBuffers();
-#endif
-
-#if defined(SAVE_OUTPUT_TENSOR)
-    bool _saveOutputTensor(int frameIdx);
 #endif
 
     // === Thread Management === //
@@ -199,9 +193,6 @@ private:
     std::deque<std::pair<int, DPVOUpdate_Prediction>> m_predictionBuffer;
     std::deque<std::pair<int, InputData>> m_inputFrameBuffer;
     DPVOUpdate_Prediction m_pred;
-
-    // Read Saved Tensor
-    std::string m_tensorPath;
 
     // Debug
     float m_inferenceTime = 0.0f;

@@ -197,81 +197,6 @@ void DPVOUpdate::_initModelIO()
     return;
 }
 
-// =================================================================================================
-// Ambarella CV28 Tensor Functions
-// =================================================================================================
-#if defined(CV28) || defined(CV28_SIMULATOR)
-bool DPVOUpdate::_checkSavedTensor(int frameIdx)
-{
-    auto time_0 = std::chrono::high_resolution_clock::now();
-
-    // Define file paths for each tensor
-    std::string netOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor0.bin";
-    std::string dOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor1.bin";
-    std::string wOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor2.bin";
-
-    // Function to load tensor data from a binary file
-    auto loadTensorFromBinaryFile = [](const std::string &filePath, float *buffer, size_t size)
-    {
-        std::ifstream inFile(filePath, std::ios::binary);
-        if (inFile.is_open())
-        {
-            inFile.read(reinterpret_cast<char *>(buffer), size * sizeof(float));
-            inFile.close();
-            return true;
-        }
-        else
-        {
-            std::cerr << "Failed to open file: " << filePath << std::endl;
-            return false;
-        }
-    };
-
-    // Check if tensor files exist and load them if they do
-    std::ifstream netOutFile(netOutFilePath, std::ios::binary);
-    std::ifstream dOutFile(dOutFilePath, std::ios::binary);
-    std::ifstream wOutFile(wOutFilePath, std::ios::binary);
-
-    if (netOutFile && loadTensorFromBinaryFile(netOutFilePath, m_netOutBuff, m_netOutBufferSize) &&
-        dOutFile && loadTensorFromBinaryFile(dOutFilePath, m_dOutBuff, m_dOutBufferSize) &&
-        wOutFile && loadTensorFromBinaryFile(wOutFilePath, m_wOutBuff, m_wOutBufferSize))
-    {
-        return true; // true means the tensors are already saved in the specific path
-    }
-
-    return false;
-}
-
-#if defined(SAVE_OUTPUT_TENSOR)
-bool DPVOUpdate::_saveOutputTensor(int frameIdx)
-{
-    std::string netOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor0.bin";
-    std::string dOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor1.bin";
-    std::string wOutFilePath = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor2.bin";
-
-    // Save tensors to binary files
-    auto saveTensorToBinaryFile = [](const std::string &filePath, float *buffer, size_t size)
-    {
-        std::ofstream outFile(filePath, std::ios::binary);
-        if (outFile.is_open())
-        {
-            outFile.write(reinterpret_cast<char *>(buffer), size * sizeof(float));
-            outFile.close();
-        }
-        else
-        {
-            std::cerr << "Failed to open file: " << filePath << std::endl;
-        }
-    };
-
-    // Save each tensor to its corresponding binary file
-    saveTensorToBinaryFile(netOutFilePath, m_pred.netOutBuff, m_netOutBufferSize);
-    saveTensorToBinaryFile(dOutFilePath, m_pred.dOutBuff, m_dOutBufferSize);
-    saveTensorToBinaryFile(wOutFilePath, m_pred.wOutBuff, m_wOutBufferSize);
-
-    return true;
-}
-#endif
 
 bool DPVOUpdate::_releaseInputTensors()
 {
@@ -342,7 +267,7 @@ bool DPVOUpdate::_releaseTensorBuffers()
 
     return true;
 }
-#endif
+
 // =================================================================================================
 
 // =================================================================================================
@@ -406,23 +331,8 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
         return false;
     }
 
-    // STEP 2: inference
-    // STEP 2-1: check if the tensors are already saved, pass the inference
-    if (_checkSavedTensor(frameIdx))
+    // STEP 2: run inference using Ambarella's eazyai library
     {
-        // Allocate memory for all output tensors
-        m_pred.netOutBuff = new float[m_netOutBufferSize];
-        m_pred.dOutBuff = new float[m_dOutBufferSize];
-        m_pred.wOutBuff = new float[m_wOutBufferSize];
-
-        // Copy output tensors to prediction buffers
-        std::memcpy(m_pred.netOutBuff, (float *)m_netOutBuff, m_netOutBufferSize * sizeof(float));
-        std::memcpy(m_pred.dOutBuff, (float *)m_dOutBuff, m_dOutBufferSize * sizeof(float));
-        std::memcpy(m_pred.wOutBuff, (float *)m_wOutBuff, m_wOutBufferSize * sizeof(float));
-    }
-    else
-    {
-        // STEP 2-2: run inference using Ambarella's eazyai library
         if (m_estimateTime)
             time_1 = std::chrono::high_resolution_clock::now();
 
@@ -631,9 +541,6 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
             }
         }
 
-#if defined(SAVE_OUTPUT_TENSOR)
-        _saveOutputTensor(frameIdx);
-#endif
     }
 
     m_bProcessed = true;
@@ -807,11 +714,6 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     }
 
     return true;
-}
-
-void DPVOUpdate::updateTensorPath(const std::string &path)
-{
-    m_tensorPath = path;
 }
 
 // Stub implementations for optional methods

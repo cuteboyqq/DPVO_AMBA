@@ -45,7 +45,7 @@ public:
     // Returns 0,0 if models are not set
     int getInputHeight() const;
     int getInputWidth() const;
-    
+
     // Inference cache support: save/load FNet/INet outputs to avoid re-running inference
     // Call setCachePath() before first forward() to enable caching.
     // First run: inference runs normally and outputs are saved to cache.

@@ -154,12 +154,6 @@ bool DPVOUpdateONNX::runInference(float* netData, float* inpData, float* corrDat
 {
     auto logger = spdlog::get("dpvo");
     
-    // ---- Check inference cache first ----
-    if (_checkSavedTensor(frameIdx, pred)) {
-        if (logger) logger->info("\033[32mDPVOUpdateONNX: Loaded from cache: frame {}\033[0m", frameIdx);
-        return true;
-    }
-    
 #ifdef USE_ONNX_RUNTIME
     if (!m_session) {
         if (logger) logger->error("DPVOUpdateONNX: Session not initialized");
@@ -324,9 +318,6 @@ bool DPVOUpdateONNX::runInference(float* netData, float* inpData, float* corrDat
         
         pred.isProcessed = true;
         
-        // ---- Save to inference cache ----
-        _saveOutputTensor(frameIdx, pred);
-        
         if (logger) {
             logger->info("\033[33mDPVOUpdateONNX: Inference successful. Frame: {}\033[0m", frameIdx);
         }
@@ -462,65 +453,3 @@ int DPVOUpdateONNX::reshapeInput(
     return num_active;
 }
 
-// =====================================================================
-// Inference Cache: save / load Update model outputs to binary files
-// =====================================================================
-bool DPVOUpdateONNX::_checkSavedTensor(int frameIdx, DPVOUpdate_Prediction& pred)
-{
-    if (m_tensorPath.empty()) return false;
-    
-    // Use same naming convention as AMBA DPVOUpdate (frameIdx - 1 for compatibility)
-    std::string netOutFile = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor0.bin";
-    std::string dOutFile   = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor1.bin";
-    std::string wOutFile   = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor2.bin";
-    
-    std::ifstream netIn(netOutFile, std::ios::binary);
-    std::ifstream dIn(dOutFile, std::ios::binary);
-    std::ifstream wIn(wOutFile, std::ios::binary);
-    
-    if (!netIn.good() || !dIn.good() || !wIn.good()) {
-        return false;  // Cache miss
-    }
-    
-    // Allocate output buffers
-    pred.netOutBuff = new float[m_netOutBufferSize];
-    pred.dOutBuff   = new float[m_dOutBufferSize];
-    pred.wOutBuff   = new float[m_wOutBufferSize];
-    
-    netIn.read(reinterpret_cast<char*>(pred.netOutBuff), m_netOutBufferSize * sizeof(float));
-    dIn.read(reinterpret_cast<char*>(pred.dOutBuff), m_dOutBufferSize * sizeof(float));
-    wIn.read(reinterpret_cast<char*>(pred.wOutBuff), m_wOutBufferSize * sizeof(float));
-    
-    netIn.close();
-    dIn.close();
-    wIn.close();
-    
-    pred.isProcessed = true;
-    return true;
-}
-
-void DPVOUpdateONNX::_saveOutputTensor(int frameIdx, const DPVOUpdate_Prediction& pred)
-{
-    if (m_tensorPath.empty()) return;
-    
-    std::string netOutFile = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor0.bin";
-    std::string dOutFile   = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor1.bin";
-    std::string wOutFile   = m_tensorPath + "/frame_" + std::to_string(frameIdx - 1) + "_tensor2.bin";
-    
-    auto saveBin = [](const std::string& path, const float* data, size_t count) {
-        std::ofstream out(path, std::ios::binary);
-        if (out.good()) {
-            out.write(reinterpret_cast<const char*>(data), count * sizeof(float));
-            out.close();
-        }
-    };
-    
-    if (pred.netOutBuff) saveBin(netOutFile, pred.netOutBuff, m_netOutBufferSize);
-    if (pred.dOutBuff)   saveBin(dOutFile, pred.dOutBuff, m_dOutBufferSize);
-    if (pred.wOutBuff)   saveBin(wOutFile, pred.wOutBuff, m_wOutBufferSize);
-    
-    auto logger = spdlog::get("dpvo");
-    if (logger) {
-        logger->info("\033[36mDPVOUpdateONNX: Saved outputs to cache: frame {}\033[0m", frameIdx);
-    }
-}
