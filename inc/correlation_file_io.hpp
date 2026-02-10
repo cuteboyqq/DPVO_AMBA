@@ -3,6 +3,8 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <set>
+#include <map>
 #include <cstring>  // For std::memcpy
 #include "logger.hpp"
 
@@ -152,44 +154,104 @@ inline void save_correlation_data(
     std::string gmap_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_gmap.bin";
     save_float_array(gmap_file, gmap_slices.data(), num_active * feature_dim * D_gmap * D_gmap, logger);
     
-    // Save fmap1 slices - extract frames based on jj indices
-    // fmap1 shape: [1][num_frames][128][fmap1_H][fmap1_W]
-    // We need to extract the full feature map for each jj[e] frame
-    // Mapping: jj1 = jj[e] % num_frames
-    std::vector<float> fmap1_slices(num_active * feature_dim * fmap1_H * fmap1_W);
-    const int fmap1_frame_stride = feature_dim * fmap1_H * fmap1_W;  // Size of one frame in fmap1 [128][H][W]
-    for (int e = 0; e < num_active; e++) {
-        int jj_idx = jj[e];
-        // Map jj to fmap1 index: jj1 = jj_idx % num_frames
-        int jj1 = jj_idx % num_frames;
-        if (jj1 >= 0 && jj1 < num_frames) {
-            // Access: fmap1[0][jj1][c][y][x] - batch dimension is always 0
-            const float* src = fmap1 + jj1 * fmap1_frame_stride;
-            float* dst = fmap1_slices.data() + e * fmap1_frame_stride;
-            std::memcpy(dst, src, sizeof(float) * fmap1_frame_stride);
+    // Save fmap1 slices - extract only UNIQUE frames referenced by jj indices
+    // Old code saved one full feature map per edge (336 × 128 × H × W = ~5.4 GB!).
+    // New code: find unique jj frame indices, save only those (typically ~10-15 frames).
+    // Also save a jj1 mapping file so Python knows which edge maps to which saved frame slot.
+    const int fmap1_frame_stride = feature_dim * fmap1_H * fmap1_W;  // [128][H][W]
+    {
+        // Find unique jj1 values (frame indices in ring buffer)
+        std::vector<int> jj1_all(num_active);
+        std::set<int> unique_jj1_set;
+        for (int e = 0; e < num_active; e++) {
+            jj1_all[e] = jj[e] % num_frames;
+            unique_jj1_set.insert(jj1_all[e]);
+        }
+        std::vector<int> unique_jj1(unique_jj1_set.begin(), unique_jj1_set.end());
+        int num_unique = static_cast<int>(unique_jj1.size());
+        
+        // Build mapping: for each edge, which slot (0..num_unique-1) does its jj1 map to?
+        std::map<int, int> jj1_to_slot;
+        for (int s = 0; s < num_unique; s++) {
+            jj1_to_slot[unique_jj1[s]] = s;
+        }
+        
+        // Save only unique frames: [num_unique, 128, fmap1_H, fmap1_W]
+        std::vector<float> fmap1_unique(static_cast<size_t>(num_unique) * fmap1_frame_stride);
+        for (int s = 0; s < num_unique; s++) {
+            int jj1 = unique_jj1[s];
+            if (jj1 >= 0 && jj1 < num_frames) {
+                const float* src = fmap1 + jj1 * fmap1_frame_stride;
+                float* dst = fmap1_unique.data() + static_cast<size_t>(s) * fmap1_frame_stride;
+                std::memcpy(dst, src, sizeof(float) * fmap1_frame_stride);
+            }
+        }
+        std::string fmap1_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap1.bin";
+        save_float_array(fmap1_file, fmap1_unique.data(), 
+                        static_cast<size_t>(num_unique) * fmap1_frame_stride, logger);
+        
+        // Save jj1 mapping: [num_active] int32 - the ring buffer index for each edge
+        std::vector<int32_t> jj1_int32(num_active);
+        for (int e = 0; e < num_active; e++) {
+            jj1_int32[e] = static_cast<int32_t>(jj1_all[e]);
+        }
+        std::string jj1_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_jj1.bin";
+        save_int32_array(jj1_file, jj1_int32.data(), num_active, logger);
+        
+        // Save unique frame indices: [num_unique] int32 - so Python knows the mapping
+        std::vector<int32_t> unique_jj1_int32(num_unique);
+        for (int s = 0; s < num_unique; s++) {
+            unique_jj1_int32[s] = static_cast<int32_t>(unique_jj1[s]);
+        }
+        std::string unique_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap1_unique_frames.bin";
+        save_int32_array(unique_file, unique_jj1_int32.data(), num_unique, logger);
+        
+        if (logger) {
+            logger->info("fmap1: saved {} unique frames instead of {} per-edge copies (saved {:.1f} MB vs {:.1f} MB)",
+                        num_unique, num_active,
+                        static_cast<double>(num_unique) * fmap1_frame_stride * 4 / (1024.0 * 1024.0),
+                        static_cast<double>(num_active) * fmap1_frame_stride * 4 / (1024.0 * 1024.0));
         }
     }
-    std::string fmap1_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap1.bin";
-    save_float_array(fmap1_file, fmap1_slices.data(), num_active * feature_dim * fmap1_H * fmap1_W, logger);
     
-    // Save fmap2 slices - extract frames based on jj indices
-    // fmap2 shape: [1][num_frames][128][fmap2_H][fmap2_W]
-    // Mapping: jj1 = jj[e] % num_frames
-    std::vector<float> fmap2_slices(num_active * feature_dim * fmap2_H * fmap2_W);
-    const int fmap2_frame_stride = feature_dim * fmap2_H * fmap2_W;  // Size of one frame in fmap2 [128][H][W]
-    for (int e = 0; e < num_active; e++) {
-        int jj_idx = jj[e];
-        // Map jj to fmap2 index: jj1 = jj_idx % num_frames
-        int jj1 = jj_idx % num_frames;
-        if (jj1 >= 0 && jj1 < num_frames) {
-            // Access: fmap2[0][jj1][c][y][x] - batch dimension is always 0
-            const float* src = fmap2 + jj1 * fmap2_frame_stride;
-            float* dst = fmap2_slices.data() + e * fmap2_frame_stride;
-            std::memcpy(dst, src, sizeof(float) * fmap2_frame_stride);
+    // Save fmap2 slices - extract only UNIQUE frames (same deduplication as fmap1)
+    const int fmap2_frame_stride = feature_dim * fmap2_H * fmap2_W;  // [128][H][W]
+    {
+        std::set<int> unique_jj1_set;
+        for (int e = 0; e < num_active; e++) {
+            unique_jj1_set.insert(jj[e] % num_frames);
+        }
+        std::vector<int> unique_jj1(unique_jj1_set.begin(), unique_jj1_set.end());
+        int num_unique = static_cast<int>(unique_jj1.size());
+        
+        std::vector<float> fmap2_unique(static_cast<size_t>(num_unique) * fmap2_frame_stride);
+        for (int s = 0; s < num_unique; s++) {
+            int jj1 = unique_jj1[s];
+            if (jj1 >= 0 && jj1 < num_frames) {
+                const float* src = fmap2 + jj1 * fmap2_frame_stride;
+                float* dst = fmap2_unique.data() + static_cast<size_t>(s) * fmap2_frame_stride;
+                std::memcpy(dst, src, sizeof(float) * fmap2_frame_stride);
+            }
+        }
+        std::string fmap2_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap2.bin";
+        save_float_array(fmap2_file, fmap2_unique.data(), 
+                        static_cast<size_t>(num_unique) * fmap2_frame_stride, logger);
+        
+        // Save unique frame indices for fmap2
+        std::vector<int32_t> unique_jj1_int32(num_unique);
+        for (int s = 0; s < num_unique; s++) {
+            unique_jj1_int32[s] = static_cast<int32_t>(unique_jj1[s]);
+        }
+        std::string unique_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap2_unique_frames.bin";
+        save_int32_array(unique_file, unique_jj1_int32.data(), num_unique, logger);
+        
+        if (logger) {
+            logger->info("fmap2: saved {} unique frames instead of {} per-edge copies (saved {:.1f} MB vs {:.1f} MB)",
+                        num_unique, num_active,
+                        static_cast<double>(num_unique) * fmap2_frame_stride * 4 / (1024.0 * 1024.0),
+                        static_cast<double>(num_active) * fmap2_frame_stride * 4 / (1024.0 * 1024.0));
         }
     }
-    std::string fmap2_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_fmap2.bin";
-    save_float_array(fmap2_file, fmap2_slices.data(), num_active * feature_dim * fmap2_H * fmap2_W, logger);
     
     // Save correlation output [num_active, D, D, P, P, 2]
     std::string corr_file = "bin_file/corr_frame" + std::to_string(frame_num) + "_corr.bin";

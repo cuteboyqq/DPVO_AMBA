@@ -4,6 +4,8 @@
 #include "patch_graph.hpp"  // For PatchGraph::N
 #include <algorithm>
 #include <cmath>
+#include <future>
+#include <mutex>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <sys/stat.h>  // For mkdir
@@ -11,6 +13,66 @@
 #ifdef SPDLOG_USE_SYSLOG
 #include <spdlog/sinks/syslog_sink.h>
 #endif
+
+// =====================================================================
+// Async debug file writer — buffers data during processing, then writes
+// all files in a background thread so the main loop doesn't stall.
+// =====================================================================
+static std::future<void> g_asyncWriteFuture;
+static std::mutex        g_asyncWriteMutex;
+
+// Wait for any previous async write to finish (call before starting a new batch)
+static void waitForPreviousAsyncWrite() {
+    std::lock_guard<std::mutex> lock(g_asyncWriteMutex);
+    if (g_asyncWriteFuture.valid()) {
+        g_asyncWriteFuture.get();
+    }
+}
+
+// Represents a single file-write task
+struct DebugWriteTask {
+    enum Type { SE3_SAVE, EIGEN_2x6, EIGEN_2x1, FLOAT_ARRAY, COORDS };
+    Type type;
+    std::string filename;
+    // For SE3: 7 floats [tx, ty, tz, qx, qy, qz, qw]
+    // For Eigen_2x6: 12 floats (row-major)
+    // For Eigen_2x1: 2 floats (row-major)
+    std::vector<float> data;
+    size_t count = 0;  // for FLOAT_ARRAY: number of floats
+};
+
+// Execute a batch of write tasks (runs in background thread)
+static void executeWriteTasks(std::vector<DebugWriteTask> tasks) {
+    auto logger = spdlog::get("dpvo");
+    for (auto& task : tasks) {
+        std::ofstream file(task.filename, std::ios::binary);
+        if (!file.is_open()) {
+            if (logger) logger->error("Async save: Failed to open {}", task.filename);
+            continue;
+        }
+        file.write(reinterpret_cast<const char*>(task.data.data()), task.data.size() * sizeof(float));
+        file.close();
+        if (logger) {
+            switch (task.type) {
+                case DebugWriteTask::SE3_SAVE:
+                    logger->info("Saved SE3 object to {}", task.filename);
+                    break;
+                case DebugWriteTask::EIGEN_2x6:
+                    logger->info("Saved Eigen matrix (2x6) to {}", task.filename);
+                    break;
+                case DebugWriteTask::EIGEN_2x1:
+                    logger->info("Saved Eigen matrix (2x1) to {}", task.filename);
+                    break;
+                case DebugWriteTask::FLOAT_ARRAY:
+                    logger->info("Saved {} floats to {}", task.count, task.filename);
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+    if (logger) logger->info("Async debug write: {} files written in background", tasks.size());
+}
 
 namespace pops {
 
@@ -34,7 +96,10 @@ static std::string get_bin_file_path(const std::string& filename) {
     return bin_dir + "/" + filename;
 }
 
-// Helper function to save Jacobians for debugging/comparison
+// NOTE: save_jacobians() is no longer used — Jacobian saves are now buffered
+// in transformWithJacobians() and written asynchronously via DebugWriteTask.
+// Kept here for reference only.
+#if 0
 static void save_jacobians(int frame_num, int edge_idx, 
                            const Eigen::Matrix<float, 2, 6>& Ji,
                            const Eigen::Matrix<float, 2, 6>& Jj,
@@ -56,6 +121,7 @@ static void save_jacobians(int frame_num, int edge_idx,
     ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jj, logger);
     ba_file_io::save_eigen_matrix(get_bin_file_path("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Jz, logger);
 }
+#endif
 
 // ------------------------------------------------------------
 // iproj(): inverse projection
@@ -279,6 +345,18 @@ void transformWithJacobians(
     bool save_intermediates) // Optional: whether to save Ti, Tj, Gij, Jacobians
 {
     // ========================================================================
+    // Async debug file buffer: collect all per-edge saves here, flush after loop
+    // ========================================================================
+    bool do_save = save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME;
+    std::vector<DebugWriteTask> writeTasks;
+    if (do_save) {
+        // Wait for any previous async write to complete before we start a new batch
+        waitForPreviousAsyncWrite();
+        // Reserve space: 3 SE3 + 3 Jacobians per edge + 1 coords at end
+        writeTasks.reserve(num_edges * 6 + 2);
+    }
+
+    // ========================================================================
     // MAIN LOOP: Process each edge (connection between patch and frame)
     // ========================================================================
     for (int e = 0; e < num_edges; e++) {
@@ -319,22 +397,22 @@ void transformWithJacobians(
         const SE3& Tj = poses[j];
         SE3 Gij = Tj * Ti.inverse();  // Transform from frame i to frame j
 
-        // Save intermediate SE3 values if requested
-        if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
-            auto logger = spdlog::get("dpvo");
-            if (!logger) {
-#ifdef SPDLOG_USE_SYSLOG
-                logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
-#else
-                logger = spdlog::stdout_color_mt("dpvo");
-                logger->set_pattern("[%n] [%^%l%$] %v");
-#endif
-            }
+        // Buffer SE3 saves for async write (no disk I/O during main loop)
+        if (do_save) {
             std::string frame_suffix = std::to_string(frame_num);
             std::string edge_suffix = std::to_string(e);
-            ba_file_io::save_se3_object(get_bin_file_path("reproject_Ti_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Ti, logger);
-            ba_file_io::save_se3_object(get_bin_file_path("reproject_Tj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Tj, logger);
-            ba_file_io::save_se3_object(get_bin_file_path("reproject_Gij_frame" + frame_suffix + "_edge" + edge_suffix + ".bin"), Gij, logger);
+            auto makeSE3Task = [&](const std::string& prefix, const SE3& se3_obj) {
+                DebugWriteTask task;
+                task.type = DebugWriteTask::SE3_SAVE;
+                task.filename = get_bin_file_path(prefix + frame_suffix + "_edge" + edge_suffix + ".bin");
+                Eigen::Vector3f t = se3_obj.t;
+                Eigen::Quaternionf q = se3_obj.q;
+                task.data = {t.x(), t.y(), t.z(), q.x(), q.y(), q.z(), q.w()};
+                return task;
+            };
+            writeTasks.push_back(makeSE3Task("reproject_Ti_frame", Ti));
+            writeTasks.push_back(makeSE3Task("reproject_Tj_frame", Tj));
+            writeTasks.push_back(makeSE3Task("reproject_Gij_frame", Gij));
         }
 
         // ====================================================================
@@ -812,9 +890,40 @@ void transformWithJacobians(
         Eigen::Vector4f t_col = Gij_mat.col(3);  // Translation column [tx, ty, tz, 1]
         Eigen::Matrix<float, 2, 1> Jz = Jp * t_col;
 
-        // Save intermediate Jacobians if requested
-        if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
-            save_jacobians(frame_num, e, Ji, Jj, Jz);
+        // Buffer Jacobian saves for async write (no disk I/O during main loop)
+        if (do_save) {
+            std::string frame_suffix = std::to_string(frame_num);
+            std::string edge_suffix = std::to_string(e);
+            // Ji [2x6] -> 12 floats row-major
+            {
+                DebugWriteTask task;
+                task.type = DebugWriteTask::EIGEN_2x6;
+                task.filename = get_bin_file_path("reproject_Ji_frame" + frame_suffix + "_edge" + edge_suffix + ".bin");
+                task.data.resize(12);
+                for (int r = 0; r < 2; r++)
+                    for (int c = 0; c < 6; c++)
+                        task.data[r * 6 + c] = Ji(r, c);
+                writeTasks.push_back(std::move(task));
+            }
+            // Jj [2x6] -> 12 floats row-major
+            {
+                DebugWriteTask task;
+                task.type = DebugWriteTask::EIGEN_2x6;
+                task.filename = get_bin_file_path("reproject_Jj_frame" + frame_suffix + "_edge" + edge_suffix + ".bin");
+                task.data.resize(12);
+                for (int r = 0; r < 2; r++)
+                    for (int c = 0; c < 6; c++)
+                        task.data[r * 6 + c] = Jj(r, c);
+                writeTasks.push_back(std::move(task));
+            }
+            // Jz [2x1] -> 2 floats row-major
+            {
+                DebugWriteTask task;
+                task.type = DebugWriteTask::EIGEN_2x1;
+                task.filename = get_bin_file_path("reproject_Jz_frame" + frame_suffix + "_edge" + edge_suffix + ".bin");
+                task.data = {Jz(0, 0), Jz(1, 0)};
+                writeTasks.push_back(std::move(task));
+            }
         }
 
         // ====================================================================
@@ -868,21 +977,27 @@ void transformWithJacobians(
         }
     }
     
-    // Save reprojected coordinates if requested
-    if (save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME) {
-        auto logger = spdlog::get("dpvo");
-        if (!logger) {
-#ifdef SPDLOG_USE_SYSLOG
-            logger = spdlog::syslog_logger_mt("dpvo", "ai-main", LOG_CONS | LOG_NDELAY, LOG_SYSLOG);
-#else
-            logger = spdlog::stdout_color_mt("dpvo");
-            logger->set_pattern("[%n] [%^%l%$] %v");
-#endif
-        }
+    // Buffer reprojected coordinates save, then launch all writes in background
+    if (do_save) {
         std::string frame_suffix = std::to_string(frame_num);
-        // Save all coordinates: [num_edges, 2, P, P] flattened
         size_t total_size = static_cast<size_t>(num_edges) * 2 * P * P;
-        ba_file_io::save_float_array(get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin"), coords_out, total_size, logger);
+        DebugWriteTask task;
+        task.type = DebugWriteTask::FLOAT_ARRAY;
+        task.filename = get_bin_file_path("reproject_coords_frame" + frame_suffix + ".bin");
+        task.data.assign(coords_out, coords_out + total_size);
+        task.count = total_size;
+        writeTasks.push_back(std::move(task));
+
+        // Launch all buffered writes in a background thread
+        auto logger = spdlog::get("dpvo");
+        if (logger) {
+            logger->info("Launching async debug write: {} files for frame {} (non-blocking)",
+                        writeTasks.size(), frame_num);
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_asyncWriteMutex);
+            g_asyncWriteFuture = std::async(std::launch::async, executeWriteTasks, std::move(writeTasks));
+        }
     }
 }
 
