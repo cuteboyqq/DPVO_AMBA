@@ -775,7 +775,8 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
         auto t_kf_end = std::chrono::steady_clock::now();
         double kf_ms = std::chrono::duration<double, std::milli>(t_kf_end - t_kf_start).count();
         if (auto lg = spdlog::get("dpvo")) {
-            lg->info("\033[33m[TIMING] Frame {} | Keyframe: {:.1f} ms\033[0m", m_counter, kf_ms);
+            lg->info("\033[33m[TIMING] Frame {} | Keyframe: {:.1f} ms | Sliding window: {} → {} (edges: {})\033[0m", 
+                     m_counter, kf_ms, m_n_before_keyframe, m_n_after_keyframe, m_pg.m_num_edges);
         }
         
         // Update viewer after optimization
@@ -854,23 +855,14 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
         n = m_pg.m_n;
     }
     
-    // SAFETY CHECK: If buffer is getting full, proactively call keyframe() to remove frames
-    // This prevents buffer overflow when motion is consistently high
-    // CRITICAL: Cap sliding window size to reasonable value (36-50 frames) regardless of BUFFER_SIZE
-    // BUFFER_SIZE is for ring buffers (m_imap, m_gmap), not sliding window size
-    // const int MAX_SLIDING_WINDOW_SIZE = 50;  // Maximum reasonable sliding window size
-    // const int PROACTIVE_THRESHOLD = MAX_SLIDING_WINDOW_SIZE - 3;  // Start removing when n >= 47
-    // if (n >= PROACTIVE_THRESHOLD && m_is_initialized) {
-    //     auto logger = spdlog::get("dpvo");
-    //     if (logger) {
-    //         logger->warn("DPVO::run: Buffer nearly full (n={} >= {}), proactively calling keyframe() to remove frames", 
-    //                      n, PROACTIVE_THRESHOLD);
-    //     }
-    //     // Call keyframe() to remove frames before adding a new one
-    //     keyframe();
-    //     // Update n after keyframe removal
-    //     n = m_pg.m_n;
-    // }
+    // Monitor sliding window size — log warning if it's growing too large
+    // The ring buffers (m_imap, m_gmap, m_fmap1, m_fmap2) only have m_pmem=36 slots.
+    // If keyframe() is working correctly, m_pg.m_n should stay bounded at ~8-15.
+    if (n >= m_pmem - 2 && logger) {
+        logger->warn("DPVO::run: Sliding window size n={} is approaching ring buffer capacity m_pmem={}! "
+                     "This may cause feature map corruption. Check if keyframe() is removing frames.",
+                     n, m_pmem);
+    }
     
     if (n + 1 >= PatchGraph::N) {
         auto logger = spdlog::get("dpvo");
@@ -939,7 +931,7 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     
     // Validate n_use (same as uint8_t* version)
     int n_use = n;
-    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 1000) {
+    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 3000) {
         if (logger) logger->warn("DPVO::run (tensor): n={} is corrupted! Using n_use=0 instead.", n);
         n_use = 0;
     }
