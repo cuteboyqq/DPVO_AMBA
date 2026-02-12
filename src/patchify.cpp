@@ -717,7 +717,15 @@ void Patchifier::setCachePath(const std::string& cachePath)
 
 bool Patchifier::_loadFromCache(int fmap_H, int fmap_W, int inet_C)
 {
-    if (!m_cacheEnabled) return false;
+    auto logger = spdlog::get("dpvo");
+    if (!logger) logger = spdlog::get("fnet");
+    
+    if (!m_cacheEnabled) {
+        if (logger && m_cacheFrameCounter == 0) {
+            logger->info("[Patchifier] Cache disabled (m_cacheEnabled=false)");
+        }
+        return false;
+    }
     
     std::string fnet_file = m_cachePath + "/fnet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
     std::string inet_file = m_cachePath + "/inet/frame_" + std::to_string(m_cacheFrameCounter) + ".bin";
@@ -726,6 +734,12 @@ bool Patchifier::_loadFromCache(int fmap_H, int fmap_W, int inet_C)
     std::ifstream inet_in(inet_file, std::ios::binary);
     
     if (!fnet_in.good() || !inet_in.good()) {
+        if (logger && m_cacheFrameCounter < 3) {
+            logger->info("[Patchifier] Cache MISS for frame {}: fnet={} ({}), inet={} ({})",
+                         m_cacheFrameCounter,
+                         fnet_file, fnet_in.good() ? "exists" : "NOT FOUND",
+                         inet_file, inet_in.good() ? "exists" : "NOT FOUND");
+        }
         return false;  // Cache miss
     }
     
@@ -762,8 +776,6 @@ bool Patchifier::_loadFromCache(int fmap_H, int fmap_W, int inet_C)
     fnet_in.close();
     inet_in.close();
     
-    auto logger = spdlog::get("dpvo");
-    if (!logger) logger = spdlog::get("fnet");
     if (logger) {
         logger->info("\033[32mFNet: Loaded from cache: frame {}\033[0m", m_cacheFrameCounter);
         logger->info("\033[32mINet: Loaded from cache: frame {}\033[0m", m_cacheFrameCounter);
@@ -781,23 +793,33 @@ void Patchifier::_saveToCache(int fmap_H, int fmap_W, int inet_C)
     size_t fmap_size = 128 * fmap_H * fmap_W;
     size_t imap_size = inet_C * fmap_H * fmap_W;
     
+    auto logger = spdlog::get("dpvo");
+    if (!logger) logger = spdlog::get("fnet");
+    
     std::ofstream fnet_out(fnet_file, std::ios::binary);
     if (fnet_out.good()) {
         fnet_out.write(reinterpret_cast<const char*>(m_fmap_buffer.data()), fmap_size * sizeof(float));
         fnet_out.close();
+    } else {
+        if (logger) logger->error("[Patchifier] Failed to write cache file: {}", fnet_file);
     }
     
     std::ofstream inet_out(inet_file, std::ios::binary);
     if (inet_out.good()) {
         inet_out.write(reinterpret_cast<const char*>(m_imap_buffer.data()), imap_size * sizeof(float));
         inet_out.close();
+    } else {
+        if (logger) logger->error("[Patchifier] Failed to write cache file: {}", inet_file);
     }
     
-    auto logger = spdlog::get("dpvo");
-    if (!logger) logger = spdlog::get("fnet");
     if (logger) {
-        logger->info("\033[36mFNet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
-        logger->info("\033[36mINet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+        if (m_cacheFrameCounter < 3) {
+            logger->info("\033[36mFNet: Saved to cache: {} ({} bytes)\033[0m", fnet_file, fmap_size * sizeof(float));
+            logger->info("\033[36mINet: Saved to cache: {} ({} bytes)\033[0m", inet_file, imap_size * sizeof(float));
+        } else {
+            logger->info("\033[36mFNet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+            logger->info("\033[36mINet: Saved to cache: frame {}\033[0m", m_cacheFrameCounter);
+        }
     }
 }
 

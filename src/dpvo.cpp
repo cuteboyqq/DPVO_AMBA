@@ -1291,7 +1291,7 @@ void DPVO::update()
         // Save calibration data for multiple frames (for AMBA DRA calibration)
         // Collects 50 samples: frames 10, 20, 30, ..., 500
         // Set CALIBRATION_MAX_FRAME to 0 to disable.
-        constexpr int CALIBRATION_MAX_FRAME = 600;  // Set to 0 to disable
+        constexpr int CALIBRATION_MAX_FRAME = 800;  // Set to 0 to disable
         constexpr int CALIBRATION_INTERVAL = 20;    // Save every N-th frame
         constexpr int CALIBRATION_MIN_FRAME = 0;   // Start saving from this frame
         if (CALIBRATION_MAX_FRAME > 0 && 
