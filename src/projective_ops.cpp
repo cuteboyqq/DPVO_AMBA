@@ -350,8 +350,6 @@ void transformWithJacobians(
     bool do_save = save_intermediates && frame_num >= 0 && frame_num == TARGET_FRAME;
     std::vector<DebugWriteTask> writeTasks;
     if (do_save) {
-        // Wait for any previous async write to complete before we start a new batch
-        waitForPreviousAsyncWrite();
         // Reserve space: 3 SE3 + 3 Jacobians per edge + 1 coords at end
         writeTasks.reserve(num_edges * 6 + 2);
     }
@@ -988,16 +986,13 @@ void transformWithJacobians(
         task.count = total_size;
         writeTasks.push_back(std::move(task));
 
-        // Launch all buffered writes in a background thread
+        // Write all buffered debug files synchronously so logs appear in the correct frame
         auto logger = spdlog::get("dpvo");
         if (logger) {
-            logger->info("Launching async debug write: {} files for frame {} (non-blocking)",
+            logger->info("Writing {} debug files for frame {} (synchronous)",
                         writeTasks.size(), frame_num);
         }
-        {
-            std::lock_guard<std::mutex> lock(g_asyncWriteMutex);
-            g_asyncWriteFuture = std::async(std::launch::async, executeWriteTasks, std::move(writeTasks));
-        }
+        executeWriteTasks(std::move(writeTasks));
     }
 }
 

@@ -466,37 +466,55 @@ void Patchifier::forward(
     } else {
         // Use AMBA EazyAI models
         if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+        bool amba_fnet_ok = false;
         if (m_fnet && !m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
             if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
             std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
         } else {
+            amba_fnet_ok = true;
             if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
         }
         
         if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+        bool amba_inet_ok = false;
         if (m_inet && !m_inet->runInference(imgTensor, m_imap_buffer.data())) {
             if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
             std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
         } else {
+            amba_inet_ok = true;
             if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+        }
+
+        // Save AMBA model outputs at TARGET_FRAME for comparison with Python
+        if (amba_fnet_ok && amba_inet_ok) {
+            _saveAmbaOutputsForComparison(imgTensor, fmap_H, fmap_W, inet_output_channels, logger_patch);
         }
     }
 #else
     // ONNX Runtime not available, use AMBA models
     if (logger_patch) logger_patch->info("[Patchifier] About to call fnet->runInference (tensor)");
+    bool amba_fnet_ok2 = false;
     if (!m_fnet->runInference(imgTensor, m_fmap_buffer.data())) {
         if (logger_patch) logger_patch->error("[Patchifier] fnet->runInference (tensor) failed");
         std::fill(m_fmap_buffer.begin(), m_fmap_buffer.end(), 0.0f);
     } else {
+        amba_fnet_ok2 = true;
         if (logger_patch) logger_patch->info("[Patchifier] fnet->runInference (tensor) successful");
     }
     
     if (logger_patch) logger_patch->info("[Patchifier] About to call inet->runInference (tensor)");
+    bool amba_inet_ok2 = false;
     if (!m_inet->runInference(imgTensor, m_imap_buffer.data())) {
         if (logger_patch) logger_patch->error("[Patchifier] inet->runInference (tensor) failed");
         std::fill(m_imap_buffer.begin(), m_imap_buffer.end(), 0.0f);
     } else {
+        amba_inet_ok2 = true;
         if (logger_patch) logger_patch->info("[Patchifier] inet->runInference (tensor) successful");
+    }
+
+    // Save AMBA model outputs at TARGET_FRAME for comparison with Python
+    if (amba_fnet_ok2 && amba_inet_ok2) {
+        _saveAmbaOutputsForComparison(imgTensor, fmap_H, fmap_W, inet_output_channels, logger_patch);
     }
 #endif
         // ---- Save to cache after inference (only when not loaded from cache) ----
@@ -579,6 +597,82 @@ int Patchifier::getInputWidth() const
         return m_fnet->getInputWidth();
     }
     return 0;
+}
+
+// =====================================================================
+// Save AMBA FNet/INet outputs + input image + metadata at TARGET_FRAME
+// for comparison with Python ONNX inference
+// =====================================================================
+void Patchifier::_saveAmbaOutputsForComparison(
+    ea_tensor_t* imgTensor, int fmap_H, int fmap_W,
+    int inet_output_channels,
+    std::shared_ptr<spdlog::logger> logger)
+{
+    if (TARGET_FRAME < 0 || m_cacheFrameCounter != TARGET_FRAME) {
+        return;
+    }
+
+    const std::string frame_suffix = std::to_string(TARGET_FRAME);
+    const int fnet_C = 128;
+    const int fnet_H = fmap_H;
+    const int fnet_W = fmap_W;
+    const int inet_C = inet_output_channels;
+    const int inet_H = fmap_H;
+    const int inet_W = fmap_W;
+
+    // 1. Save FNet output [128, H, W]
+    std::string fnet_fn = get_bin_file_path("amba_fnet_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_model_output(fnet_fn, m_fmap_buffer.data(),
+                                        fnet_C, fnet_H, fnet_W, logger, "amba_fnet");
+
+    // 2. Save INet output [384, H, W]
+    std::string inet_fn = get_bin_file_path("amba_inet_frame" + frame_suffix + ".bin");
+    patchify_file_io::save_model_output(inet_fn, m_imap_buffer.data(),
+                                        inet_C, inet_H, inet_W, logger, "amba_inet");
+
+    // 3. Save raw input image from tensor for Python to use the same input
+    const size_t* img_shape = ea_tensor_shape(imgTensor);
+    void* raw_data = ea_tensor_data(imgTensor);
+    if (raw_data && img_shape) {
+        int img_H = static_cast<int>(img_shape[EA_H]);
+        int img_W = static_cast<int>(img_shape[EA_W]);
+        int img_C = static_cast<int>(img_shape[EA_C]);
+        size_t img_size = static_cast<size_t>(img_H) * img_W * img_C;
+        std::string img_fn = get_bin_file_path("amba_input_image_frame" + frame_suffix + ".bin");
+        std::ofstream img_file(img_fn, std::ios::binary);
+        if (img_file.is_open()) {
+            img_file.write(reinterpret_cast<const char*>(raw_data), img_size * sizeof(uint8_t));
+            img_file.close();
+            if (logger) logger->info("[Patchifier] Saved AMBA input image to {}: {}x{}x{}",
+                                     img_fn, img_H, img_W, img_C);
+        }
+    }
+
+    // 4. Save metadata text file for Python comparison script
+    int img_H2 = img_shape ? static_cast<int>(img_shape[EA_H]) : 0;
+    int img_W2 = img_shape ? static_cast<int>(img_shape[EA_W]) : 0;
+    std::string meta_fn = get_bin_file_path("amba_model_metadata_frame" + frame_suffix + ".txt");
+    std::ofstream meta_file(meta_fn);
+    if (meta_file.is_open()) {
+        meta_file << "frame="          << TARGET_FRAME    << "\n";
+        meta_file << "input_image_H="  << img_H2          << "\n";
+        meta_file << "input_image_W="  << img_W2          << "\n";
+        meta_file << "model_input_H="  << getInputHeight() << "\n";
+        meta_file << "model_input_W="  << getInputWidth()  << "\n";
+        meta_file << "fnet_output_C="  << fnet_C           << "\n";
+        meta_file << "fnet_output_H="  << fnet_H           << "\n";
+        meta_file << "fnet_output_W="  << fnet_W           << "\n";
+        meta_file << "inet_output_C="  << inet_C           << "\n";
+        meta_file << "inet_output_H="  << inet_H           << "\n";
+        meta_file << "inet_output_W="  << inet_W           << "\n";
+        meta_file.close();
+        if (logger) logger->info("[Patchifier] Saved AMBA metadata to {}", meta_fn);
+    }
+
+    if (logger) {
+        logger->info("[Patchifier] Saved AMBA outputs for frame {}: {} and {}",
+                     m_cacheFrameCounter, fnet_fn, inet_fn);
+    }
 }
 
 // =====================================================================

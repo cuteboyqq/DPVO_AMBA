@@ -1288,6 +1288,19 @@ void DPVO::update()
             save_update_model_inputs(num_active);
         }
         
+        // Save calibration data for multiple frames (for AMBA DRA calibration)
+        // Collects 50 samples: frames 10, 20, 30, ..., 500
+        // Set CALIBRATION_MAX_FRAME to 0 to disable.
+        constexpr int CALIBRATION_MAX_FRAME = 600;  // Set to 0 to disable
+        constexpr int CALIBRATION_INTERVAL = 20;    // Save every N-th frame
+        constexpr int CALIBRATION_MIN_FRAME = 0;   // Start saving from this frame
+        if (CALIBRATION_MAX_FRAME > 0 && 
+            m_counter >= CALIBRATION_MIN_FRAME && 
+            m_counter <= CALIBRATION_MAX_FRAME && 
+            m_counter % CALIBRATION_INTERVAL == 0) {
+            save_update_model_inputs(num_active, m_counter);
+        }
+        
         bool inference_success = false;
 #ifdef USE_ONNX_RUNTIME
         if (m_useOnnxUpdateModel && m_updateModel_onnx != nullptr) {
@@ -1375,9 +1388,25 @@ void DPVO::update()
                     }
                 }
                 
-                // Log zero weight count (but don't replace with random values)
-                // BA will naturally skip zero-weight edges, which is the correct behavior
-                if (logger && zero_weight_count > 0) {
+                // Monitor w_out and d_out ranges periodically
+                if (logger && m_counter % 50 == 0) {
+                    float w_min = std::numeric_limits<float>::max();
+                    float w_max = std::numeric_limits<float>::lowest();
+                    float d_min = std::numeric_limits<float>::max();
+                    float d_max = std::numeric_limits<float>::lowest();
+                    for (int e = 0; e < num_edges_to_process; e++) {
+                        float w0 = weight[e * 2 + 0];
+                        float w1 = weight[e * 2 + 1];
+                        float d0 = delta[e * 2 + 0];
+                        float d1 = delta[e * 2 + 1];
+                        w_min = std::min({w_min, w0, w1});
+                        w_max = std::max({w_max, w0, w1});
+                        d_min = std::min({d_min, d0, d1});
+                        d_max = std::max({d_max, d0, d1});
+                    }
+                    logger->info("DPVO::update [Frame {}]: w_out range [{:.4f}, {:.4f}], "
+                                "d_out range [{:.2f}, {:.2f}]",
+                                m_counter, w_min, w_max, d_min, d_max);
                 }
                 
                 // Update m_pg.m_net with net_out if available
@@ -1395,6 +1424,17 @@ void DPVO::update()
                             if (val < net_out_min) net_out_min = val;
                             if (val > net_out_max) net_out_max = val;
                         }
+                    }
+                    
+                    // Monitor net value range drift — log every 50 frames or when exceeding calibration range
+                    // Calibration range was approx [-16, 14]. Values beyond this may be clipped by AMBA model.
+                    if (logger && (m_counter % 50 == 0 || net_out_min < -16.0f || net_out_max > 14.0f)) {
+                        logger->info("DPVO::update [Frame {}]: net_out range [{:.2f}, {:.2f}], "
+                                    "num_active={}, num_edges_to_process={}{}",
+                                    m_counter, net_out_min, net_out_max,
+                                    num_active, num_edges_to_process,
+                                    (net_out_min < -16.0f || net_out_max > 14.0f) ? 
+                                    " ⚠️ EXCEEDS CALIBRATION RANGE [-16, 14]" : "");
                     }
                 } else {
                     if (logger) logger->warn("DPVO::update: pred.netOutBuff is null - m_pg.m_net will not be updated");
@@ -2359,7 +2399,7 @@ void DPVO::save_correlation_outputs(int num_active, const float* coords, const f
 // -------------------------------------------------------------
 // Save update model inputs for debugging/comparison
 // -------------------------------------------------------------
-void DPVO::save_update_model_inputs(int num_active)
+void DPVO::save_update_model_inputs(int num_active, int frame_override)
 {
     auto logger = spdlog::get("dpvo");
     if (!logger) {
@@ -2371,13 +2411,21 @@ void DPVO::save_update_model_inputs(int num_active)
 #endif
     }
     
-    if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
-        return;
+    // If frame_override >= 0, save for that frame (calibration mode).
+    // Otherwise, only save when m_counter == TARGET_FRAME (debug mode).
+    int save_frame;
+    if (frame_override >= 0) {
+        save_frame = frame_override;
+    } else {
+        if (TARGET_FRAME < 0 || m_counter != TARGET_FRAME) {
+            return;
+        }
+        save_frame = TARGET_FRAME;
     }
     
     const int CORR_DIM = 882;
     const int DIM = 384;
-    std::string frame_suffix = std::to_string(TARGET_FRAME);
+    std::string frame_suffix = std::to_string(save_frame);
     
     // Save metadata
     std::string metadata_filename = get_bin_file_path("update_metadata_frame" + frame_suffix + ".txt");

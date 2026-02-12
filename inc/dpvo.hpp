@@ -149,7 +149,7 @@ private:
                                   size_t corr_8x8_size, int P, int D);
     
     // Helper function to save update model inputs for debugging/comparison
-    void save_update_model_inputs(int num_active);
+    void save_update_model_inputs(int num_active, int frame_override = -1);
     
     // Helper function to save update model outputs for debugging/comparison
     void save_update_model_outputs(const DPVOUpdate_Prediction& pred);

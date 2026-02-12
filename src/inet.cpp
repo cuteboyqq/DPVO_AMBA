@@ -1,12 +1,16 @@
 #include "inet.hpp"
 #include "dla_config.hpp"
 #include "logger.hpp"
+#include "target_frame.hpp"
 #include <cstdio>
 #include <cstring>
 #include <vector>
 #include <algorithm>
 #include <limits>
 #include <sstream>
+#include <fstream>
+#include <sys/stat.h>
+#include <opencv2/opencv.hpp>
 
 // =================================================================================================
 // INet Inference Implementation
@@ -115,7 +119,10 @@ bool INetInference::_releaseModel()
 }
 
 #if defined(CV28) || defined(CV28_SIMULATOR)
-// Tensor-based _loadInput - uses tensor directly, avoids conversion
+// Tensor-based _loadInput — uses OpenCV for preprocessing to match inet_onnx.cpp exactly.
+// CRITICAL: ea_cvt_color_resize (AMBA hardware) produces different pixels than OpenCV,
+// causing wrong DPVO poses. Using OpenCV here ensures identical preprocessing to the
+// ONNX path, which is proven to give correct poses.
 bool INetInference::_loadInput(ea_tensor_t* imgTensor)
 {
     if (imgTensor == nullptr) {
@@ -132,22 +139,125 @@ bool INetInference::_loadInput(ea_tensor_t* imgTensor)
     
     auto logger = spdlog::get("inet");
     
-    // Use ea_cvt_color_resize directly on the input tensor
-    // The input tensor from ea_img_resource is typically in RGB format
-    // Use EA_COLOR_BGR2RGB (same as uint8_t* path) for consistency
-    int rval = EA_SUCCESS;
+    // ── Step 1: Read source image from ea_tensor → cv::Mat ──
+    // (Same approach as inet_onnx.cpp)
 #if defined(CV28)
-    rval = ea_cvt_color_resize(imgTensor, m_inputTensor, EA_COLOR_BGR2RGB, EA_VP);
-#elif defined(CV28_SIMULATOR)
-    rval = ea_cvt_color_resize(imgTensor, m_inputTensor, EA_COLOR_BGR2RGB, EA_CPU);
+    ea_tensor_sync_cache(imgTensor, EA_VP, EA_CPU);
 #endif
+    const size_t* src_shape = ea_tensor_shape(imgTensor);
+    int srcH = static_cast<int>(src_shape[EA_H]);
+    int srcW = static_cast<int>(src_shape[EA_W]);
+    size_t src_pitch = ea_tensor_pitch(imgTensor);
+    const uint8_t* src_data = static_cast<const uint8_t*>(ea_tensor_data(imgTensor));
     
-    if (rval != EA_SUCCESS) {
-        if (logger) logger->error("INet: ea_cvt_color_resize (tensor) failed with error: {}", rval);
+    if (!src_data) {
+        if (logger) logger->error("INet: ea_tensor_data returned nullptr for imgTensor");
         return false;
     }
     
-    if (logger) logger->info("INet: _loadInput (tensor) successful using ea_cvt_color_resize");
+    // Convert NCHW tensor → HWC cv::Mat (BGR), handling pitch
+    cv::Mat img_bgr(srcH, srcW, CV_8UC3);
+    size_t src_pitch_elem = src_pitch / sizeof(uint8_t);  // pitch in uint8 elements
+    for (int c = 0; c < 3; c++) {
+        for (int y = 0; y < srcH; y++) {
+            const uint8_t* row = src_data + (c * srcH + y) * src_pitch_elem;
+            for (int x = 0; x < srcW; x++) {
+                img_bgr.at<cv::Vec3b>(y, x)[c] = row[x];
+            }
+        }
+    }
+    
+    // ── Step 2: Resize with OpenCV (matches Python DPVO / inet_onnx.cpp) ──
+    int dstH = m_inputHeight;
+    int dstW = m_inputWidth;
+    cv::Mat img_resized;
+    if (srcH == dstH && srcW == dstW) {
+        img_resized = img_bgr;
+    } else {
+        cv::resize(img_bgr, img_resized, cv::Size(dstW, dstH), 0, 0, cv::INTER_LINEAR);
+    }
+    
+    // ── Step 3: BGR → RGB (matches inet_onnx.cpp) ──
+    cv::Mat img_rgb;
+    cv::cvtColor(img_resized, img_rgb, cv::COLOR_BGR2RGB);
+    
+    // ── Step 4: Write uint8 RGB pixels into m_inputTensor (NCHW, pitch-aware) ──
+    // The AMBA model has normalization baked in (mean=63.75, std=127.5),
+    // so we write uint8 [0,255] values — the model handles normalization internally.
+    uint8_t* dst_data = static_cast<uint8_t*>(ea_tensor_data(m_inputTensor));
+    size_t dst_pitch = ea_tensor_pitch(m_inputTensor);
+    size_t dst_pitch_elem = dst_pitch / sizeof(uint8_t);
+    
+    if (!dst_data) {
+        if (logger) logger->error("INet: ea_tensor_data returned nullptr for m_inputTensor");
+        return false;
+    }
+    
+    for (int c = 0; c < 3; c++) {
+        for (int y = 0; y < dstH; y++) {
+            uint8_t* dst_row = dst_data + (c * dstH + y) * dst_pitch_elem;
+            for (int x = 0; x < dstW; x++) {
+                dst_row[x] = img_rgb.at<cv::Vec3b>(y, x)[c];
+            }
+        }
+    }
+    
+    // Sync cache: CPU → VP (we wrote on CPU, model runs on VP)
+#if defined(CV28)
+    ea_tensor_sync_cache(m_inputTensor, EA_CPU, EA_VP);
+#endif
+    
+    if (logger) logger->info("INet: _loadInput successful using OpenCV preprocessing (resize + BGR→RGB)");
+    
+    // ── Save preprocessed input tensor at TARGET_FRAME for debugging ──
+    {
+        static int s_inet_load_frame = 0;
+        if (TARGET_FRAME >= 0 && s_inet_load_frame == TARGET_FRAME) {
+            const size_t* in_shape = ea_tensor_shape(m_inputTensor);
+            size_t in_C = in_shape[EA_C], in_H = in_shape[EA_H], in_W = in_shape[EA_W];
+            
+            if (logger) {
+                logger->info("INet: Preprocessed input tensor info:");
+                logger->info("  Shape: C={}, H={}, W={}", in_C, in_H, in_W);
+                logger->info("  Pitch: {} bytes", dst_pitch);
+            }
+            
+            struct stat st;
+            if (stat("bin_file", &st) != 0) {
+                mkdir("bin_file", 0755);
+            }
+            
+            // Save dense CHW tensor (strip pitch padding for clean comparison)
+            std::string fn = "bin_file/amba_inet_preprocessed_frame"
+                             + std::to_string(TARGET_FRAME) + ".bin";
+            std::ofstream f(fn, std::ios::binary);
+            if (f.is_open()) {
+                for (size_t c = 0; c < in_C; c++) {
+                    for (size_t y = 0; y < in_H; y++) {
+                        const uint8_t* row = dst_data + (c * in_H + y) * dst_pitch_elem;
+                        f.write(reinterpret_cast<const char*>(row), in_W * sizeof(uint8_t));
+                    }
+                }
+                f.close();
+                if (logger) logger->info("  Saved dense {} bytes to {}", in_C * in_H * in_W, fn);
+            }
+            
+            std::string mfn = "bin_file/amba_inet_preprocessed_meta_frame"
+                              + std::to_string(TARGET_FRAME) + ".txt";
+            std::ofstream mf(mfn);
+            if (mf.is_open()) {
+                mf << "C=" << in_C << "\n";
+                mf << "H=" << in_H << "\n";
+                mf << "W=" << in_W << "\n";
+                mf << "pitch_bytes=" << dst_pitch << "\n";
+                mf << "total_bytes=" << in_C * in_H * in_W << "\n";
+                mf.close();
+                if (logger) logger->info("  Saved metadata to {}", mfn);
+            }
+        }
+        s_inet_load_frame++;
+    }
+    
     return true;
 }
 
@@ -205,9 +315,7 @@ bool INetInference::runInference(ea_tensor_t* imgTensor, float* imap_out)
                      tensor_N, tensor_C, tensor_H, tensor_W);
     }
     
-    // Copy output
-    // Assumes standard NCHW format: [N=1, C, H, W]
-    // If AMBA CV28 uses serialized format like YOLOv8, this would need to be changed
+    // Copy output using pitch-aware NCHW reading
     const int outH = m_outputHeight;
     const int outW = m_outputWidth;
     const int outC = m_outputChannel;
@@ -218,20 +326,35 @@ bool INetInference::runInference(ea_tensor_t* imgTensor, float* imap_out)
         return false;
     }
     
+    // CRITICAL: Get tensor pitch to handle row padding on CV28 hardware.
+    // ea_tensor_pitch returns the row stride in BYTES. On the simulator it equals W * sizeof(float),
+    // but on real CV28 hardware it may be larger due to memory alignment requirements.
+    // Without using pitch, every row after the first is read from the wrong offset,
+    // causing progressive data corruption across channels.
+    size_t pitch_bytes = ea_tensor_pitch(m_outputTensor);
+    size_t pitch_floats = pitch_bytes / sizeof(float);
+    
     if (logger) {
         logger->info("INet: Tensor shape from ea_tensor_shape: N={}, C={}, H={}, W={}", 
                       tensor_N, tensor_C, tensor_H, tensor_W);
+        logger->info("INet: Output tensor pitch: {} bytes ({} floats), W={}", 
+                      pitch_bytes, pitch_floats, outW);
+        if (pitch_floats != static_cast<size_t>(outW)) {
+            logger->warn("INet: ⚠️  Pitch ({}) != W ({})! Row padding detected. Using pitch-aware copy.",
+                         pitch_floats, outW);
+        }
         logger->info("INet: First 5 tensor values (raw): [{}, {}, {}, {}, {}]",
                      tensor_data[0], tensor_data[1], tensor_data[2], tensor_data[3], tensor_data[4]);
     }
     
-    // Copy assuming standard NCHW format: [N=0, C, H, W]
+    // Pitch-aware NCHW copy: each row has pitch_floats stride (>= outW) in memory
     for (int c = 0; c < outC; c++) {
         for (int y = 0; y < outH; y++) {
             for (int x = 0; x < outW; x++) {
-                // Standard NCHW indexing: [N=0, C, H, W]
-                int tensor_idx = 0 * outC * outH * outW + c * outH * outW + y * outW + x;
-                // Output layout: [C, H, W] (removing batch dimension)
+                // Pitch-aware NCHW indexing: row stride = pitch_floats, channel stride = outH * pitch_floats
+                size_t tensor_idx = static_cast<size_t>(c) * outH * pitch_floats 
+                                  + static_cast<size_t>(y) * pitch_floats + x;
+                // Output layout: [C, H, W] dense (no padding)
                 int dst_idx = c * outH * outW + y * outW + x;
                 imap_out[dst_idx] = tensor_data[tensor_idx];
             }

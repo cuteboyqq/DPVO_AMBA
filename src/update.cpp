@@ -425,44 +425,102 @@ bool DPVOUpdate::_run(float *netData, float *inpData, float *corrData,
                          shape1[EA_N], shape1[EA_C], shape1[EA_H], shape1[EA_W],
                          shape2[EA_N], shape2[EA_C], shape2[EA_H], shape2[EA_W]);
             
-            // Check raw weight tensor data (tensor2) before copying
-            float* raw_wOut = (float*)tensor2_data;
-            float raw_w_min = std::numeric_limits<float>::max();
-            float raw_w_max = std::numeric_limits<float>::lowest();
-            size_t raw_w_zero_count = 0;
-            size_t raw_w_nonzero_count = 0;
-            for (size_t i = 0; i < m_wOutBufferSize; i++) {
-                float val = raw_wOut[i];
-                if (val < raw_w_min) raw_w_min = val;
-                if (val > raw_w_max) raw_w_max = val;
-                if (val == 0.0f) raw_w_zero_count++;
-                else raw_w_nonzero_count++;
-            }
-            logger->info("\033[35mDPVOUpdate::_run: Raw weight tensor (tensor2) BEFORE copy - size={}, range=[{}, {}], zero_count={}, nonzero_count={}\033[0m",
-                         m_wOutBufferSize, raw_w_min, raw_w_max, raw_w_zero_count, raw_w_nonzero_count);
-            logger->info("\033[35mDPVOUpdate::_run: Raw weight tensor first 10 values: [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]\033[0m",
-                         (m_wOutBufferSize > 0 ? raw_wOut[0] : 0.0f),
-                         (m_wOutBufferSize > 1 ? raw_wOut[1] : 0.0f),
-                         (m_wOutBufferSize > 2 ? raw_wOut[2] : 0.0f),
-                         (m_wOutBufferSize > 3 ? raw_wOut[3] : 0.0f),
-                         (m_wOutBufferSize > 4 ? raw_wOut[4] : 0.0f),
-                         (m_wOutBufferSize > 5 ? raw_wOut[5] : 0.0f),
-                         (m_wOutBufferSize > 6 ? raw_wOut[6] : 0.0f),
-                         (m_wOutBufferSize > 7 ? raw_wOut[7] : 0.0f),
-                         (m_wOutBufferSize > 8 ? raw_wOut[8] : 0.0f),
-                         (m_wOutBufferSize > 9 ? raw_wOut[9] : 0.0f));
-            
-            // WARNING: Model is outputting all zeros for weights
-            if (raw_w_nonzero_count == 0) {
-                logger->warn("\033[33mDPVOUpdate::_run: WARNING - Model is outputting all zeros for weights (tensor2). This is a MODEL issue, not a code issue.\033[0m");
-                logger->warn("\033[33mDPVOUpdate::_run: Possible causes: 1) Model weights not trained properly, 2) ONNX/AMBA conversion issue, 3) Model architecture issue\033[0m");
+            // Check raw weight tensor data (tensor2) using pitch-aware indexing
+            {
+                size_t w_pitch_bytes = ea_tensor_pitch(m_outputTensors[2]);
+                size_t w_pitch_floats = w_pitch_bytes / sizeof(float);
+                int w_C = static_cast<int>(shape2[EA_C]);
+                int w_H = static_cast<int>(shape2[EA_H]);
+                int w_W = static_cast<int>(shape2[EA_W]);
+                const float* raw_wOut = static_cast<const float*>(tensor2_data);
+                
+                logger->info("\033[35mDPVOUpdate::_run: Weight tensor pitch={} bytes ({} floats), W={}\033[0m",
+                             w_pitch_bytes, w_pitch_floats, w_W);
+                
+                float raw_w_min = std::numeric_limits<float>::max();
+                float raw_w_max = std::numeric_limits<float>::lowest();
+                size_t raw_w_zero_count = 0;
+                size_t raw_w_nonzero_count = 0;
+                for (int c = 0; c < w_C; c++) {
+                    for (int h = 0; h < w_H; h++) {
+                        for (int w = 0; w < w_W; w++) {
+                            size_t idx = static_cast<size_t>(c) * w_H * w_pitch_floats
+                                       + static_cast<size_t>(h) * w_pitch_floats + w;
+                            float val = raw_wOut[idx];
+                            if (val < raw_w_min) raw_w_min = val;
+                            if (val > raw_w_max) raw_w_max = val;
+                            if (val == 0.0f) raw_w_zero_count++;
+                            else raw_w_nonzero_count++;
+                        }
+                    }
+                }
+                logger->info("\033[35mDPVOUpdate::_run: Raw weight tensor (tensor2) BEFORE copy - elements={}, range=[{}, {}], zero_count={}, nonzero_count={}\033[0m",
+                             w_C * w_H * w_W, raw_w_min, raw_w_max, raw_w_zero_count, raw_w_nonzero_count);
+                
+                // Show first 10 actual values (pitch-aware)
+                int shown = 0;
+                std::vector<float> first_vals;
+                for (int c = 0; c < w_C && shown < 10; c++) {
+                    for (int h = 0; h < w_H && shown < 10; h++) {
+                        for (int w = 0; w < w_W && shown < 10; w++) {
+                            size_t idx = static_cast<size_t>(c) * w_H * w_pitch_floats
+                                       + static_cast<size_t>(h) * w_pitch_floats + w;
+                            first_vals.push_back(raw_wOut[idx]);
+                            shown++;
+                        }
+                    }
+                }
+                while (first_vals.size() < 10) first_vals.push_back(0.0f);
+                logger->info("\033[35mDPVOUpdate::_run: Raw weight tensor first 10 values (pitch-aware): [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}]\033[0m",
+                             first_vals[0], first_vals[1], first_vals[2], first_vals[3], first_vals[4],
+                             first_vals[5], first_vals[6], first_vals[7], first_vals[8], first_vals[9]);
+                
+                if (raw_w_nonzero_count == 0) {
+                    logger->warn("\033[33mDPVOUpdate::_run: WARNING - Model is outputting all zeros for weights (tensor2).\033[0m");
+                }
             }
         }
 
-        // Copy output tensors to prediction buffers
-        std::memcpy(m_pred.netOutBuff, (float *)tensor0_data, m_netOutBufferSize * sizeof(float));
-        std::memcpy(m_pred.dOutBuff, (float *)tensor1_data, m_dOutBufferSize * sizeof(float));
-        std::memcpy(m_pred.wOutBuff, (float *)tensor2_data, m_wOutBufferSize * sizeof(float));
+        // CRITICAL: Use pitch-aware copying for ALL output tensors.
+        // Same pitch issue as inputs — W=1 tensors have padded rows on CV28.
+        {
+            // Helper lambda: pitch-aware copy from ea_tensor (NCHW) → dense buffer
+            auto pitchAwareCopyFromTensor = [&logger](ea_tensor_t* tensor, const void* raw_data, float* dst, size_t expected_size, const char* name) {
+                const size_t* shape = ea_tensor_shape(tensor);
+                int C = static_cast<int>(shape[EA_C]);
+                int H = static_cast<int>(shape[EA_H]);
+                int W = static_cast<int>(shape[EA_W]);
+                size_t pitch_bytes = ea_tensor_pitch(tensor);
+                size_t pitch_floats = pitch_bytes / sizeof(float);
+                const float* src = static_cast<const float*>(raw_data);
+                
+                if (logger) {
+                    logger->info("DPVOUpdate::_run: {} output tensor shape=[{},{},{}], pitch={} bytes ({} floats), W={}",
+                                 name, C, H, W, pitch_bytes, pitch_floats, W);
+                }
+                
+                if (pitch_floats == static_cast<size_t>(W)) {
+                    // No padding — fast path: direct memcpy
+                    std::memcpy(dst, src, expected_size * sizeof(float));
+                } else {
+                    // Pitch-aware copy: read W elements per row, skip padding
+                    for (int c = 0; c < C; c++) {
+                        for (int h = 0; h < H; h++) {
+                            size_t tensor_row = static_cast<size_t>(c) * H * pitch_floats
+                                              + static_cast<size_t>(h) * pitch_floats;
+                            int dst_row = c * H * W + h * W;
+                            for (int w = 0; w < W; w++) {
+                                dst[dst_row + w] = src[tensor_row + w];
+                            }
+                        }
+                    }
+                }
+            };
+            
+            pitchAwareCopyFromTensor(m_outputTensors[0], tensor0_data, m_pred.netOutBuff, m_netOutBufferSize, "net_out");
+            pitchAwareCopyFromTensor(m_outputTensors[1], tensor1_data, m_pred.dOutBuff,   m_dOutBufferSize,   "d_out");
+            pitchAwareCopyFromTensor(m_outputTensors[2], tensor2_data, m_pred.wOutBuff,   m_wOutBufferSize,   "w_out");
+        }
 
         // Log delta and weight output values with blue text
         if (logger) {
@@ -689,13 +747,51 @@ bool DPVOUpdate::_loadInput(float *netData, float *inpData, float *corrData,
     }
     
 
-    // Copy float tensors (all inputs are now float)
-    std::memcpy(net_data, m_netBuff, m_netBufferSize * sizeof(float));
-    std::memcpy(inp_data, m_inpBuff, m_inpBufferSize * sizeof(float));
-    std::memcpy(corr_data, m_corrBuff, m_corrBufferSize * sizeof(float));
-    std::memcpy(ii_data, m_iiBuff, m_iiBufferSize * sizeof(float));
-    std::memcpy(jj_data, m_jjBuff, m_jjBufferSize * sizeof(float));
-    std::memcpy(kk_data, m_kkBuff, m_kkBufferSize * sizeof(float));
+    // CRITICAL: Use pitch-aware copying for ALL input tensors.
+    // AMBA CV28 pads tensor rows to 32-byte alignment. For W=1 tensors (like [1,384,360,1]),
+    // ea_tensor_pitch returns 32 bytes (8 floats) instead of 4 bytes (1 float).
+    // Using raw memcpy would write data into padding bytes, corrupting the input.
+    {
+        // Helper lambda: pitch-aware copy from dense buffer → ea_tensor (NCHW)
+        auto pitchAwareCopyToTensor = [&logger](ea_tensor_t* tensor, const float* src, size_t expected_size, const char* name) {
+            const size_t* shape = ea_tensor_shape(tensor);
+            int C = static_cast<int>(shape[EA_C]);
+            int H = static_cast<int>(shape[EA_H]);
+            int W = static_cast<int>(shape[EA_W]);
+            size_t pitch_bytes = ea_tensor_pitch(tensor);
+            size_t pitch_floats = pitch_bytes / sizeof(float);
+            float* dst = static_cast<float*>(ea_tensor_data(tensor));
+            
+            if (logger) {
+                logger->info("DPVOUpdate::_loadInput: {} tensor shape=[{},{},{}], pitch={} bytes ({} floats), W={}",
+                             name, C, H, W, pitch_bytes, pitch_floats, W);
+            }
+            
+            if (pitch_floats == static_cast<size_t>(W)) {
+                // No padding — fast path: direct memcpy
+                std::memcpy(dst, src, expected_size * sizeof(float));
+            } else {
+                // Pitch-aware copy: write W elements per row, skip padding
+                for (int c = 0; c < C; c++) {
+                    for (int h = 0; h < H; h++) {
+                        size_t tensor_row = static_cast<size_t>(c) * H * pitch_floats
+                                          + static_cast<size_t>(h) * pitch_floats;
+                        int src_row = c * H * W + h * W;
+                        for (int w = 0; w < W; w++) {
+                            dst[tensor_row + w] = src[src_row + w];
+                        }
+                    }
+                }
+            }
+        };
+        
+        pitchAwareCopyToTensor(m_inputNetTensor,  m_netBuff,  m_netBufferSize,  "net");
+        pitchAwareCopyToTensor(m_inputInpTensor,  m_inpBuff,  m_inpBufferSize,  "inp");
+        pitchAwareCopyToTensor(m_inputCorrTensor, m_corrBuff, m_corrBufferSize, "corr");
+        pitchAwareCopyToTensor(m_inputIiTensor,   m_iiBuff,   m_iiBufferSize,   "ii");
+        pitchAwareCopyToTensor(m_inputJjTensor,   m_jjBuff,   m_jjBufferSize,   "jj");
+        pitchAwareCopyToTensor(m_inputKkTensor,   m_kkBuff,   m_kkBufferSize,   "kk");
+    }
     
     // Sync input tensors from CPU to VP (required when using ea_tensor_data instead of ea_tensor_data_for_write)
 #if defined(CV28)
@@ -736,6 +832,20 @@ bool DPVOUpdate::_runInferenceFunc() { return false; }
 // Reshape inputs for DPVO update model (Member function)
 // =================================================================================================
 // Uses pre-allocated buffers to avoid memory allocation overhead
+
+// ----------What is float (*m_net)[384] means ??----------------
+// Row 0:  [0][0] [0][1] ... [0][383]
+// Row 1:  [1][0] [1][1] ... [1][383]
+// Row 2:  [2][0] [2][1] ... [2][383]
+// ...
+// address = base + (i * 384 + j) * sizeof(float)
+// The compiler needs that 384 to compute offsets correctly.
+// That is exactly why the function must declare:
+// float (*m_net)[384] means:
+// ✅ Pointer to array of 384 floats
+// ✅ Used for 2D contiguous arrays
+// ✅ Required so compiler knows row size
+// ✅ Matches float m_net[MAX_EDGES][384]
 int DPVOUpdate::reshapeInput(
     int num_active,
     float (*m_net)[384],
@@ -759,37 +869,26 @@ int DPVOUpdate::reshapeInput(
     // Prepare input data - pad or truncate to MODEL_EDGE_COUNT
     const int num_edges_to_process = std::min(num_active, MODEL_EDGE_COUNT);
     
-    // Resize buffers if needed (they should be pre-allocated, but resize is safe)
-    net_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
-    inp_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1, 0.0f);
-    corr_input.resize(1 * CORR_DIM * MODEL_EDGE_COUNT * 1, 0.0f);
-    ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
-    jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
-    kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1, 0.0f);
+    // Resize buffers to match model input size [1, DIM, H, 1]
+    // Total size: 1 * DIM * MODEL_EDGE_COUNT * 1 = DIM * MODEL_EDGE_COUNT
+    net_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1);
+    inp_input.resize(1 * 384 * MODEL_EDGE_COUNT * 1);
+    corr_input.resize(1 * CORR_DIM * MODEL_EDGE_COUNT * 1);
+    ii_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1);
+    jj_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1);
+    kk_input.resize(1 * 1 * MODEL_EDGE_COUNT * 1);
     
-    // NOTE: Do NOT zero-fill active edges - they will be copied from m_net, ctx, corr below
-    // Python: active_net = self.pg.net[:, :num_active] reuses existing values
-    // Only zero-fill inactive edges (beyond num_edges_to_process) if needed
-    if (num_edges_to_process < MODEL_EDGE_COUNT) {
-        // Zero-fill only the inactive portion (edges >= num_edges_to_process)
-        size_t inactive_start = 1 * 384 * num_edges_to_process * 1;
-        size_t inactive_size = 1 * 384 * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
-        std::fill(net_input.begin() + inactive_start, net_input.begin() + inactive_start + inactive_size, 0.0f);
-        
-        inactive_start = 1 * 384 * num_edges_to_process * 1;
-        inactive_size = 1 * 384 * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
-        std::fill(inp_input.begin() + inactive_start, inp_input.begin() + inactive_start + inactive_size, 0.0f);
-        
-        inactive_start = 1 * CORR_DIM * num_edges_to_process * 1;
-        inactive_size = 1 * CORR_DIM * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
-        std::fill(corr_input.begin() + inactive_start, corr_input.begin() + inactive_start + inactive_size, 0.0f);
-        
-        inactive_start = 1 * 1 * num_edges_to_process * 1;
-        inactive_size = 1 * 1 * (MODEL_EDGE_COUNT - num_edges_to_process) * 1;
-        std::fill(ii_input.begin() + inactive_start, ii_input.begin() + inactive_start + inactive_size, 0.0f);
-        std::fill(jj_input.begin() + inactive_start, jj_input.begin() + inactive_start + inactive_size, 0.0f);
-        std::fill(kk_input.begin() + inactive_start, kk_input.begin() + inactive_start + inactive_size, 0.0f);
-    }
+    // Zero-fill ALL buffers — matching ONNX path exactly (update_onnx.cpp lines 407-413).
+    // CRITICAL: The previous code only zeroed an incorrect contiguous range using NCHW offsets
+    // (384 * num_edges_to_process) which doesn't correspond to inactive edge positions in the
+    // channel-first layout. The ONNX path zeros EVERYTHING first, then overwrites active edges.
+    // Inactive edges must be zero (the model was trained with zero-padded inactive edges).
+    std::fill(net_input.begin(), net_input.end(), 0.0f);
+    std::fill(inp_input.begin(), inp_input.end(), 0.0f);
+    std::fill(corr_input.begin(), corr_input.end(), 0.0f);
+    std::fill(ii_input.begin(), ii_input.end(), 0.0f);
+    std::fill(jj_input.begin(), jj_input.end(), 0.0f);
+    std::fill(kk_input.begin(), kk_input.end(), 0.0f);
     
     // Check net state before copying
     int net_zero_count = 0;
@@ -806,23 +905,10 @@ int DPVOUpdate::reshapeInput(
         }
     }
     
-    // WORKAROUND: If net is all zeros, initialize it from context (inp) to break the cycle
-    bool net_all_zero = (net_nonzero_count == 0);
-    if (net_all_zero) {
-        // Initialize net from context (inp) - this gives the model some initial state
-        // This happens on first call when m_pg.m_net is all zeros
-        printf("[DPVOUpdate::reshapeInput] WARNING: m_net is all zeros (first call). Initializing from context (ctx * 0.1)\n");
-        fflush(stdout);
-        for (int e = 0; e < num_edges_to_process; e++) {
-            if (e < 0 || e >= num_active) continue;
-            for (int d = 0; d < 384; d++) {
-                // Use context as initial net state (scaled down to avoid large values)
-                m_net[e][d] = ctx[e * 384 + d] * 0.1f;
-            }
-        }
-        printf("[DPVOUpdate::reshapeInput] Initialized m_net for %d edges from context\n", num_edges_to_process);
-        fflush(stdout);
-    }
+    // NOTE: Do NOT modify m_net when it's all zeros. Python starts with self.pg.net = torch.zeros(...)
+    // and passes zeros on the first iteration. The ONNX path (update_onnx.cpp) does the same.
+    // Previously there was a workaround here that corrupted the initial hidden state by setting
+    // m_net = ctx * 0.1, which caused diverging behavior vs the ONNX model.
     
     // Reshape net and inp data: [num_active, 384] -> [1, 384, 360, 1] (384=NET_DIM, 360=MAX_EDGES)
     for (int e = 0; e < num_edges_to_process; e++) {
@@ -848,10 +934,11 @@ int DPVOUpdate::reshapeInput(
     float corr_input_min = *std::min_element(corr_input.begin(), corr_input.end());
     float corr_input_max = *std::max_element(corr_input.begin(), corr_input.end());
     
-    // Reshape correlation: [num_active, D, D, P, P, 2] -> [1, 882, 360, 1]
-    const int target_corr_dim = CORR_DIM; // 882
-    const int D_target = 7;  // Target window size for model (7×7 instead of 8×8)
-    const int offset = (D - D_target) / 2;  // Center offset: (8-7)/2 = 0 (integer division)
+    // Reshape correlation: [num_active, CORR_DIM] -> [1, CORR_DIM, MODEL_EDGE_COUNT, 1]
+    // CRITICAL: Use simple flat copy matching the ONNX reshapeInput (update_onnx.cpp line 432).
+    // computeCorrelation outputs correlation data with 882 elements per edge (D_output=7, P=3, 2 levels).
+    // The flat layout already matches what the model expects — DO NOT decompose and reorder!
+    // Previous code had a 5-nested loop that permuted features into the wrong order.
     
     // Check correlation data before reshaping
     float corr_min = *std::min_element(corr.begin(), corr.end());
@@ -866,164 +953,46 @@ int DPVOUpdate::reshapeInput(
     int corr_copied_count = 0;
     int corr_skipped_count = 0;
     for (int e = 0; e < num_edges_to_process; e++) {
-        // Validate edge index
         if (e < 0 || e >= num_active) {
             continue;
         }
-        // Source layout: corr[e][dj][di][pi][pj][c] = [num_active, D, D, P, P, 2]
-        // Match Python's permute(0,1,3,2,4,5): correlation is stored as [e, corr_x, corr_y, pi, pj, c]
-        // where corr_x = dj (horizontal offset) and corr_y = di (vertical offset)
-        // We need to extract center 7×7 region from 8×8 window
-        for (int c = 0; c < 2; c++) {
-            for (int di = 0; di < D_target && (di + offset) < D; di++) {  // corr_y (vertical offset)
-                for (int dj = 0; dj < D_target && (dj + offset) < D; dj++) {  // corr_x (horizontal offset)
-                    for (int pi = 0; pi < P; pi++) {
-                        for (int pj = 0; pj < P; pj++) {
-                            // Source: corr[e][dj+offset][di+offset][pi][pj][c] = [e, corr_x, corr_y, pi, pj, c]
-                            // Layout: [num_active, D, D, P, P, 2] where first D is corr_x, second D is corr_y
-                            int src_idx = e * D * D * P * P * 2 +
-                                         (dj + offset) * D * P * P * 2 +  // corr_x dimension (swapped)
-                                         (di + offset) * P * P * 2 +      // corr_y dimension (swapped)
-                                         pi * P * 2 +
-                                         pj * 2 +
-                                         c;  // Channel last
-                            
-                            // Validate source index
-                            if (src_idx < 0 || src_idx >= static_cast<int>(corr.size())) {
-                                corr_skipped_count++;
-                                continue;
-                            }
-                            
-                            // YAML layout: [N, C, H, W] = [1, 882, 360, 1]
-                            // Model expects: [1, 882, 360, 1] where 882 = 2 * 7 * 7 * 3 * 3, 360 = MAX_EDGES
-                            // Index calculation: n * C * H * W + c * H * W + h * W + w
-                            // Where: n=0, c=dst_corr_idx (feature index), h=e (edge index), w=0
-                            int dst_corr_idx = c * D_target * D_target * P * P +
-                                              di * D_target * P * P +
-                                              dj * P * P +
-                                              pi * P + pj;
-                            
-                            if (dst_corr_idx < target_corr_dim) {
-                                // [N, C, H, W] = [1, 882, 360, 1]
-                                int idx = 0 * CORR_DIM * MODEL_EDGE_COUNT * 1 + 
-                                         dst_corr_idx * MODEL_EDGE_COUNT * 1 + 
-                                         e * 1 + 
-                                         0;
-                                
-                                    // Validate destination index
-                                    if (idx >= 0 && idx < static_cast<int>(corr_input.size())) {
-                                        corr_input[idx] = corr[src_idx];
-                                        corr_copied_count++;
-                                    } else {
-                                        corr_skipped_count++;
-                                    }
-                            } else {
-                                corr_skipped_count++;
-                            }
-                        }
-                    }
-                }
+        // Flat copy: corr[e * CORR_DIM + c] → corr_input[c * MODEL_EDGE_COUNT + e]
+        // This matches update_onnx.cpp: corr_input[idx] = corr[e * CORR_DIM + c]
+        for (int c = 0; c < CORR_DIM; c++) {
+            int src_idx = e * CORR_DIM + c;
+            if (src_idx < 0 || src_idx >= static_cast<int>(corr.size())) {
+                corr_skipped_count++;
+                continue;
             }
-        }
-        // Rest of CORR_DIM is zero-padded (already initialized to 0)
-    }
-    
-    // Copy indices: [num_active] -> [1, 1, 360, 1] (YAML now specifies 4D shape)
-    // AMBA tensor shape: [N, C, H, W] = [1, 1, 360, 1]
-    // CRITICAL: For zero-padded edges, we need to set valid indices to prevent
-    // neighbors_tensor from producing invalid gather indices that cause AMBA CV28 to fail.
-    // Strategy: Duplicate the last valid edge's indices for all zero-padded edges.
-    
-    // Get last valid indices for padding (if we have valid edges)
-    // CRITICAL: Ensure all indices are non-negative, especially kk which can become negative
-    // after keyframe removal (m_kk[e] -= PatchGraph::M)
-    float last_ii = 0.0f, last_jj = 0.0f, last_kk = 0.0f;
-    if (num_edges_to_process > 0 && num_active > 0) {
-        // Find the last valid edge with non-negative kk
-        int last_valid_e = -1;
-        for (int e = std::min(num_edges_to_process - 1, num_active - 1); e >= 0; e--) {
-            if (m_kk[e] >= 0) {
-                last_valid_e = e;
-                break;
-            }
-        }
-        
-        if (last_valid_e >= 0) {
-            float raw_ii = static_cast<float>(m_ii[last_valid_e]);
-            float raw_jj = static_cast<float>(m_jj[last_valid_e]);
-            float raw_kk = static_cast<float>(m_kk[last_valid_e]);
-            
-            // Clamp to valid ranges before using as padding values
-            const int M = 4;  // PATCHES_PER_FRAME
-            const int MAX_FRAMES = 36;  // BUFFER_SIZE
-            last_ii = (raw_ii < 0.0f) ? 0.0f : ((raw_ii >= M) ? static_cast<float>(M - 1) : raw_ii);
-            last_jj = (raw_jj < 0.0f) ? 0.0f : ((raw_jj >= MAX_FRAMES) ? static_cast<float>(MAX_FRAMES - 1) : raw_jj);
-            last_kk = (raw_kk < 0.0f) ? 0.0f : raw_kk;
-        } else {
-            // Fallback: use first edge if all have negative kk (shouldn't happen, but be safe)
-            if (num_active > 0) {
-                const int M = 4;
-                const int MAX_FRAMES = 36;
-                float raw_ii = static_cast<float>(m_ii[0]);
-                float raw_jj = static_cast<float>(m_jj[0]);
-                last_ii = (raw_ii < 0.0f) ? 0.0f : ((raw_ii >= M) ? static_cast<float>(M - 1) : raw_ii);
-                last_jj = (raw_jj < 0.0f) ? 0.0f : ((raw_jj >= MAX_FRAMES) ? static_cast<float>(MAX_FRAMES - 1) : raw_jj);
-                last_kk = 0.0f;  // Force to 0 if all kk are negative
+            // [1, CORR_DIM, MODEL_EDGE_COUNT, 1] layout
+            int idx = c * MODEL_EDGE_COUNT + e;
+            if (idx >= 0 && idx < static_cast<int>(corr_input.size())) {
+                corr_input[idx] = corr[src_idx];
+                corr_copied_count++;
+            } else {
+                corr_skipped_count++;
             }
         }
     }
     
-    for (int e = 0; e < MODEL_EDGE_COUNT; e++) {
-        // AMBA 4D tensor layout: [N, C, H, W] = [1, 1, 360, 1]
-        // Index formula: idx = n * C * H * W + c * H * W + h * W + w
-        // Where: n=0, c=0, h=e (edge index), w=0
-        // idx = 0 * 1 * 360 * 1 + 0 * 360 * 1 + e * 1 + 0 = e
-        int idx = 0 * 1 * MODEL_EDGE_COUNT * 1 + 0 * MODEL_EDGE_COUNT * 1 + e * 1 + 0;
+    // Copy indices: matching ONNX path exactly (update_onnx.cpp lines 440-451)
+    // Layout: [1, 1, MODEL_EDGE_COUNT, 1] → index = e
+    // CRITICAL: Pass raw indices WITHOUT clamping — the ONNX model expects raw values.
+    // Previously this code clamped ii to [0,3], jj to [0,35], kk to [0,∞) and padded
+    // inactive edges with non-zero last-valid indices. This caused divergence because:
+    //   1. The model was trained with zero-padded inactive edges (Python uses zero padding)
+    //   2. Non-zero indices in inactive edges cause Gather to pull different data
+    //   3. Index clamping changes values the model was designed to receive
+    // Inactive edges remain zero from the std::fill above (matching ONNX path).
+    for (int e = 0; e < num_edges_to_process; e++) {
+        if (e >= num_active) continue;
         
-        if (e < num_edges_to_process && e < num_active) {
-            // Valid edge: copy actual indices, but clamp to valid ranges
-            // CRITICAL: AMBA CV28 requires valid indices for gather operations
-            // ii should be patch index in [0, M-1] where M=4 (patches per frame)
-            // jj should be frame index in [0, n-1] where n is number of frames
-            // kk can become negative after keyframe removal (m_kk[e] -= PatchGraph::M)
-            const int M = 4;  // PATCHES_PER_FRAME
-            const int MAX_FRAMES = 36;  // BUFFER_SIZE, but we use actual n from context
-            
-            float ii_val = static_cast<float>(m_ii[e]);
-            float jj_val = static_cast<float>(m_jj[e]);
-            float kk_val = static_cast<float>(m_kk[e]);
-            
-            // Clamp ii to valid patch index range [0, M-1] = [0, 3]
-            // CRITICAL: ii values > M-1 will cause neighbors_tensor to compute invalid Gather indices
-            if (ii_val < 0.0f) {
-                ii_val = 0.0f;
-            } else if (ii_val >= M) {
-                ii_val = static_cast<float>(M - 1);  // Clamp to max valid patch index
-            }
-            
-            // Clamp jj to valid frame index range [0, MAX_FRAMES-1]
-            // Note: We use MAX_FRAMES as upper bound, actual n might be smaller
-            if (jj_val < 0.0f) {
-                jj_val = 0.0f;
-            } else if (jj_val >= MAX_FRAMES) {
-                jj_val = static_cast<float>(MAX_FRAMES - 1);
-            }
-            
-            // Clamp kk to non-negative (AMBA CV28 Gather requirement)
-            if (kk_val < 0.0f) {
-                kk_val = 0.0f;  // Clamp to 0 to prevent AMBA CV28 gather failures
-            }
-            
-            ii_input[idx] = ii_val;
-            jj_input[idx] = jj_val;
-            kk_input[idx] = kk_val;
-        } else {
-            // Zero-padded edge: use last valid indices (already clamped to valid ranges)
-            // This ensures neighbors_tensor produces valid gather indices (prevents AMBA CV28 gather failures)
-            ii_input[idx] = last_ii;  // Already clamped to [0, M-1]
-            jj_input[idx] = last_jj;  // Already clamped to [0, MAX_FRAMES-1]
-            kk_input[idx] = last_kk;  // Already clamped to >= 0
-        }
+        // [1, 1, MODEL_EDGE_COUNT, 1] layout: idx = e
+        int idx = e;
+        
+        ii_input[idx] = static_cast<float>(m_ii[e]);
+        jj_input[idx] = static_cast<float>(m_jj[e]);
+        kk_input[idx] = static_cast<float>(m_kk[e]);
     }
     
     return num_edges_to_process;

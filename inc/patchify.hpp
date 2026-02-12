@@ -2,7 +2,9 @@
 #include <vector>
 #include <memory>
 #include <cstdint>
+#include <string>
 #include "dla_config.hpp"
+#include <spdlog/spdlog.h>
 
 // Ambarella CV28
 #if defined(CV28) || defined(CV28_SIMULATOR)
@@ -88,5 +90,9 @@ private:
     bool _loadFromCache(int fmap_H, int fmap_W, int inet_C);
     // Helper: save FNet/INet to cache after inference
     void _saveToCache(int fmap_H, int fmap_W, int inet_C);
+    // Helper: save AMBA FNet/INet outputs + input image + metadata at TARGET_FRAME
+    void _saveAmbaOutputsForComparison(ea_tensor_t* imgTensor, int fmap_H, int fmap_W,
+                                       int inet_output_channels,
+                                       std::shared_ptr<spdlog::logger> logger);
 };
 
