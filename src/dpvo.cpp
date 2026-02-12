@@ -931,7 +931,7 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
     
     // Validate n_use (same as uint8_t* version)
     int n_use = n;
-    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 3000) {
+    if (n_use < 0 || n_use >= PatchGraph::N || n_use > 99999) {
         if (logger) logger->warn("DPVO::run (tensor): n={} is corrupted! Using n_use=0 instead.", n);
         n_use = 0;
     }
