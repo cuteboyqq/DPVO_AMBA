@@ -110,6 +110,7 @@ public:
     
     // Visualization
     void enableVisualization(bool enable = true);
+    void enableFrameSaving(const std::string& output_dir);  // Save viewer frames to disk
     void updateViewer();  // Update viewer with current state
 
 private:

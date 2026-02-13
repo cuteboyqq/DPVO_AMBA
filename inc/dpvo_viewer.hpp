@@ -16,6 +16,7 @@
 #include "se.hpp"
 #include "patch_graph.hpp"
 #include <vector>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <atomic>
@@ -82,6 +83,18 @@ public:
     void updatePoints(const Vec3* points, const uint8_t* colors, int num_points);
     
     /**
+     * @brief Enable saving rendered frames to image files
+     * @param output_dir Directory to save frames (will be created if needed)
+     * 
+     * Saves the Pangolin window contents as PNG images after each new frame
+     * is rendered. Files are named frame_XXXXX.png (e.g., frame_00015.png).
+     * This is useful when AMBA model inference is slow and screen recording
+     * would take too long. The saved images can be combined into a video with:
+     *   ffmpeg -framerate 30 -i frame_%05d.png -c:v libx264 output.mp4
+     */
+    void enableFrameSaving(const std::string& output_dir);
+    
+    /**
      * @brief Close viewer and stop thread
      */
     void close();
@@ -132,6 +145,13 @@ private:
     int m_numPoints{0};
     std::vector<Vec3> m_points;
     std::vector<uint8_t> m_colors;
+    
+    // Frame saving
+    bool m_frameSavingEnabled{false};
+    std::string m_frameSavePath;
+    std::atomic<int> m_frameCounter{0};          // DPVO frame number (from updatePoses)
+    std::atomic<bool> m_newDataReceived{false};   // Flag: new data arrived since last save
+    int m_lastSavedFrame{-1};                     // Last frame number saved to disk
     
 #ifdef ENABLE_PANGOLIN_VIEWER
     // OpenGL/Pangolin state

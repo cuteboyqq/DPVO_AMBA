@@ -18,6 +18,15 @@
 #include <thread>
 #include <chrono>
 #include <random>
+#include <sys/stat.h>
+
+#ifdef ENABLE_PANGOLIN_VIEWER
+// Only include what we need — full opencv2/opencv.hpp pulls in stitching.hpp
+// which has an `enum Status` that conflicts with X11's `Status` macro
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#endif
 /*
 Visual flow
 ---------------------------------------------------------------------------
@@ -140,6 +149,10 @@ void DPVOViewer::updatePoses(const SE3* poses, int num_frames)
     
     // Convert to matrices for OpenGL
     convertPosesToMatrices();
+    
+    // Track frame counter for frame saving (num_frames = total historical frames processed)
+    m_frameCounter = num_frames;
+    m_newDataReceived = true;
 }
 
 void DPVOViewer::updatePoints(const Vec3* points, const uint8_t* colors, int num_points)
@@ -1201,6 +1214,49 @@ void DPVOViewer::run()
         glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
         m_texture->RenderToViewportFlipY();
         
+        // Save rendered frame to disk BEFORE FinishFrame (content is in GL_BACK)
+        if (m_frameSavingEnabled && m_newDataReceived.exchange(false)) {
+            int frame_num = m_frameCounter.load();
+            // Only save if this is a new frame (avoid duplicates)
+            if (frame_num > m_lastSavedFrame) {
+                // Get the FULL Pangolin window size
+                auto& base = pangolin::DisplayBase();
+                int win_w = static_cast<int>(base.v.w);
+                int win_h = static_cast<int>(base.v.h);
+                
+                // Read from BACK buffer (where we just rendered)
+                glReadBuffer(GL_BACK);
+                glPixelStorei(GL_PACK_ALIGNMENT, 1);
+                
+                // Reset viewport to full window before reading
+                glViewport(0, 0, win_w, win_h);
+                
+                // Read the entire window framebuffer (includes 3D poses/points + video)
+                std::vector<uint8_t> pixels(win_w * win_h * 3);
+                glReadPixels(0, 0, win_w, win_h, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+                
+                // OpenGL reads bottom-up, OpenCV expects top-down → flip vertically
+                cv::Mat img(win_h, win_w, CV_8UC3, pixels.data());
+                cv::flip(img, img, 0);
+                // Convert RGB → BGR for OpenCV imwrite
+                cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
+                
+                // Save as PNG with frame number in filename
+                char filename[512];
+                snprintf(filename, sizeof(filename), "%s/frame_%05d.png", 
+                         m_frameSavePath.c_str(), frame_num);
+                cv::imwrite(filename, img);
+                
+                m_lastSavedFrame = frame_num;
+                
+                // Log progress periodically
+                if (frame_num <= 5 || frame_num % 100 == 0) {
+                    printf("[DPVOViewer] Saved %s (%dx%d)\n", filename, win_w, win_h);
+                    fflush(stdout);
+                }
+            }
+        }
+        
         pangolin::FinishFrame();
     }
     
@@ -1220,6 +1276,22 @@ void DPVOViewer::run()
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 #endif
+}
+
+void DPVOViewer::enableFrameSaving(const std::string& output_dir)
+{
+    m_frameSavePath = output_dir;
+    m_frameSavingEnabled = true;
+    
+    // Create output directory (and parents) if it doesn't exist
+    // Use mkdir -p equivalent
+    std::string cmd = "mkdir -p " + output_dir;
+    (void)system(cmd.c_str());
+    
+    printf("[DPVOViewer] Frame saving ENABLED → %s/frame_XXXXX.png\n", output_dir.c_str());
+    printf("[DPVOViewer] Tip: Convert to video with:\n");
+    printf("  ffmpeg -framerate 30 -i %s/frame_%%05d.png -c:v libx264 -pix_fmt yuv420p output.mp4\n", output_dir.c_str());
+    fflush(stdout);
 }
 
 void DPVOViewer::close()

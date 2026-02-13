@@ -415,8 +415,8 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     //   - Scale intrinsics: (model_W / W) / RES for x, (model_H / H) / RES for y
     //   - This matches Python if images are already resized to match model input size
     const float RES = 4.0f;
-    float scale_x = 0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
-    float scale_y = 0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
+    float scale_x = 0.26666f; // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
+    float scale_y = 0.26666f; // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
     
     float scaled_intrinsics[4];
     scaled_intrinsics[0] = intrinsics_to_use[0] * scale_x / RES;  // fx: scale to model input, then to feature map
@@ -1281,11 +1281,11 @@ void DPVO::update()
         }
         
         // Save calibration data for multiple frames (for AMBA DRA calibration)
-        // Collects 50 samples: frames 10, 20, 30, ..., 500
+        // Collects 85 samples: frames 0, 20, 40, ..., 1700
         // Set CALIBRATION_MAX_FRAME to 0 to disable.
-        constexpr int CALIBRATION_MAX_FRAME = 800;  // Set to 0 to disable
-        constexpr int CALIBRATION_INTERVAL = 20;    // Save every N-th frame
-        constexpr int CALIBRATION_MIN_FRAME = 0;   // Start saving from this frame
+        constexpr int CALIBRATION_MAX_FRAME = 1700;  // Set to 0 to disable
+        constexpr int CALIBRATION_INTERVAL = 20;     // Save every N-th frame
+        constexpr int CALIBRATION_MIN_FRAME = 0;     // Start saving from this frame
         if (CALIBRATION_MAX_FRAME > 0 && 
             m_counter >= CALIBRATION_MIN_FRAME && 
             m_counter <= CALIBRATION_MAX_FRAME && 
@@ -3309,6 +3309,22 @@ void DPVO::enableVisualization(bool enable)
                                  "Compile with -DENABLE_PANGOLIN_VIEWER and link against Pangolin to enable.");
     }
     m_visualizationEnabled = false;
+#endif
+}
+
+void DPVO::enableFrameSaving(const std::string& output_dir)
+{
+#ifdef ENABLE_PANGOLIN_VIEWER
+    if (m_viewer != nullptr) {
+        m_viewer->enableFrameSaving(output_dir);
+    } else {
+        auto logger = spdlog::get("dpvo");
+        if (logger) logger->warn("DPVO::enableFrameSaving: Viewer not initialized yet. "
+                                 "Call enableVisualization(true) first.");
+    }
+#else
+    auto logger = spdlog::get("dpvo");
+    if (logger) logger->warn("DPVO::enableFrameSaving: Pangolin viewer not compiled in.");
 #endif
 }
 

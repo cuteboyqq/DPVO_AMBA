@@ -1701,6 +1701,16 @@ void processDPVOApp(
 		// NOTE: Requires Pangolin library to be installed and linked
 		// Visualization displays 3D point cloud, camera trajectory, and current video frame
 		dpvo->enableVisualization(true);
+		
+		// Enable frame saving: saves each viewer frame as PNG for later video creation
+		// This avoids needing to screen-record for hours when AMBA model inference is slow
+		// Output: viewer_frames/<video_name>/frame_00001.png, frame_00002.png, ...
+		// Convert to video: ffmpeg -framerate 30 -i frame_%05d.png -c:v libx264 -pix_fmt yuv420p output.mp4
+		{
+			std::string baseName = PathUtils::extractBaseName(inputPath);
+			std::string frameSavePath = "viewer_frames/" + baseName;
+			dpvo->enableFrameSaving(frameSavePath);
+		}
 
 		// Set up frame processed synchronization (similar to WNC_APP pattern)
 		std::mutex frameProcessedMutex;
