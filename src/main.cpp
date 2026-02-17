@@ -1706,10 +1706,14 @@ void processDPVOApp(
 		// This avoids needing to screen-record for hours when AMBA model inference is slow
 		// Output: viewer_frames/<video_name>/frame_00001.png, frame_00002.png, ...
 		// Convert to video: ffmpeg -framerate 30 -i frame_%05d.png -c:v libx264 -pix_fmt yuv420p output.mp4
-		{
+		// Controlled by SaveViewerFrames in app_config.txt (0=disabled, 1=enabled)
+		if (config->saveViewerFrames) {
 			std::string baseName = PathUtils::extractBaseName(inputPath);
 			std::string frameSavePath = "viewer_frames/" + baseName;
 			dpvo->enableFrameSaving(frameSavePath);
+			logger->info("Viewer frame saving ENABLED, path: {}", frameSavePath);
+		} else {
+			logger->info("Viewer frame saving DISABLED (set SaveViewerFrames = 1 in app_config.txt to enable)");
 		}
 
 		// Set up frame processed synchronization (similar to WNC_APP pattern)

@@ -122,6 +122,20 @@ typedef struct
     // DPVO Inference Cache
     bool enableInferenceCache;      // If true, save/load FNet/INet/Update model outputs to bin files
                                     // First run saves outputs, subsequent runs load from cache (skips inference)
+    
+    // Viewer Frame Saving
+    bool saveViewerFrames;          // If true, save each viewer frame as PNG to viewer_frames/<video_name>/
+                                    // Useful for creating videos without screen recording
+
+    // Hidden State Reset
+    int netResetInterval;           // Reset m_net hidden state every N frames (0 = disabled)
+                                    // Helps prevent FP16 accumulation drift on long sequences
+
+    // Update Model Max Edges
+    int maxEdges;                   // Maximum edges for Update model input (default: 360)
+                                    // Must match the Update model's compiled input shape
+                                    // Lower values = faster inference but fewer edge constraints for BA
+                                    // If you change this, you must recompile the Update model to match
 
     // Model Input Size
     int modelWidth;

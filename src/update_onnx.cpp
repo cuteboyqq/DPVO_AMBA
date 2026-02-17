@@ -36,10 +36,15 @@ DPVOUpdateONNX::DPVOUpdateONNX(Config_S* config)
         return;
     }
     
+    // Read maxEdges from config (default 360)
+    if (config != nullptr && config->maxEdges > 0) {
+        m_maxEdge = config->maxEdges;
+    }
+    
     // Buffer sizes (same as DPVOUpdate)
-    m_netOutBufferSize = 1 * 384 * m_maxEdge * 1;  // [1, 384, 360, 1]
-    m_dOutBufferSize = 1 * 2 * m_maxEdge * 1;      // [1, 2, 360, 1]
-    m_wOutBufferSize = 1 * 2 * m_maxEdge * 1;      // [1, 2, 360, 1]
+    m_netOutBufferSize = 1 * 384 * m_maxEdge * 1;  // [1, 384, m_maxEdge, 1]
+    m_dOutBufferSize = 1 * 2 * m_maxEdge * 1;      // [1, 2, m_maxEdge, 1]
+    m_wOutBufferSize = 1 * 2 * m_maxEdge * 1;      // [1, 2, m_maxEdge, 1]
     
     _initModel();
 #else

@@ -186,6 +186,22 @@ void AppConfigReader::read(std::string configPath)
             enableInferenceCache = true;
         }
 
+        // Viewer Frame Saving
+        bool saveViewerFrames = false;
+        string saveViewerFramesStr = "";
+        configReader->getValue("SaveViewerFrames", saveViewerFramesStr);
+        if (!saveViewerFramesStr.empty() && (saveViewerFramesStr == "true" || saveViewerFramesStr == "1" || saveViewerFramesStr == "True")) {
+            saveViewerFrames = true;
+        }
+
+        // Hidden State Reset Interval
+        int netResetInterval = 0;
+        configReader->getValue("NetResetInterval", netResetInterval);
+
+        // Update Model Max Edges
+        int maxEdges = 360;  // default: match current model
+        configReader->getValue("MaxEdges", maxEdges);
+
         configReader->getValue("ModelWidth", modelWidth);
         configReader->getValue("ModelHeight", modelHeight);
 
@@ -274,6 +290,10 @@ void AppConfigReader::read(std::string configPath)
             logger->info("UseOnnxRuntime \t\t= {} (auto-detected: {})", useOnnxRuntime, 
                         (useOnnxRuntimeStr.empty() ? "yes" : "no"));
             logger->info("EnableInferenceCache \t= {}", enableInferenceCache);
+            logger->info("SaveViewerFrames \t= {}", saveViewerFrames);
+            logger->info("NetResetInterval \t= {} {}", netResetInterval,
+                        (netResetInterval > 0 ? "(reset m_net every N frames)" : "(disabled)"));
+            logger->info("MaxEdges \t\t= {} (update model input edge dimension)", maxEdges);
             logger->info("ModelWidth \t\t= {}",     modelWidth);
             logger->info("ModelHeight \t\t= {}",    modelHeight);
             
@@ -379,6 +399,9 @@ void AppConfigReader::read(std::string configPath)
         m_config->updateModelPath = updateModelPath;
         m_config->useOnnxRuntime = useOnnxRuntime;
         m_config->enableInferenceCache = enableInferenceCache;
+        m_config->saveViewerFrames = saveViewerFrames;
+        m_config->netResetInterval = netResetInterval;
+        m_config->maxEdges       = maxEdges;
         m_config->modelWidth     = modelWidth;
         m_config->modelHeight    = modelHeight;
 

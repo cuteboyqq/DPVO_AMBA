@@ -16,7 +16,7 @@
 // =================================================================================================
 
 DPVOUpdate::DPVOUpdate(Config_S *config, WakeCallback wakeFunc)
-    : m_maxEdge(360),  // Initialize max edge count (matches MAX_EDGES = 360)
+    : m_maxEdge(config != nullptr && config->maxEdges > 0 ? config->maxEdges : 360),  // From config (default 360)
       m_netBufferSize(1 * 384 * m_maxEdge * 1),
       m_inpBufferSize(1 * 384 * m_maxEdge * 1),
       m_corrBufferSize(1 * 882 * m_maxEdge * 1),

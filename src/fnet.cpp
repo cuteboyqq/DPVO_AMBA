@@ -142,7 +142,44 @@ bool FNetInference::_loadInput(ea_tensor_t* imgTensor)
     }
     
     auto logger = spdlog::get("fnet");
-    
+    //     🧠 Why pitch exists
+    // On hardware accelerators (like CV28 VP), memory is usually aligned to:
+    // 16 bytes
+    // 32 bytes
+    // 64 bytes
+    // 128 bytes
+    // to improve DMA / cache performance.
+    // So even if your image width is:
+    // W = 640 pixels
+    // Memory may be aligned to:
+    // pitch = 672 bytes
+    // |<---- 640 valid pixels ---->|<-- 32 padding -->|
+//     Width = 5 pixels
+// Height = 3
+// Channels = 1
+// But hardware aligns to 8 bytes.
+
+// Memory layout becomes:
+// Row 0: [ P0 P1 P2 P3 P4 X X X ]
+// Row 1: [ P5 P6 P7 P8 P9 X X X ]
+// Row 2: [ P10 P11 P12 P13 P14 X X X ]
+
+
+// 🧠 Summary
+// ea_tensor_pitch(imgTensor)
+//     = number of bytes per row in memory
+//     = width + alignment padding
+
+
+// It ensures:
+
+// ✔ correct row stepping
+// ✔ correct DMA alignment
+// ✔ correct CV28 hardware access
+
+// Without it → corrupted tensor.
+
+
     // ── Step 1: Read source image from ea_tensor → cv::Mat ──
     // (Same approach as fnet_onnx.cpp lines 209-234)
 #if defined(CV28)

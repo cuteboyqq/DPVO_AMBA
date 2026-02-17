@@ -157,11 +157,36 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
         m_intrinsics[3] = static_cast<float>(ht) * 0.5f;  // cy
     }
     
-    // Initialize max edge count for model input
-    // To change this value, simply modify the number below (e.g., 256, 360, 384, 512, 768)
-    // Note: You must also update your ONNX model and AMBA conversion YAML to match this value
-    // This should match MAX_EDGES in patch_graph.hpp
-    m_maxEdge = 360;
+    // Initialize max edge count for model input (from config, default 360)
+    // Must match the Update model's compiled input shape (H dimension)
+    // If you change this, you must recompile the AMBA Update model YAML with the new value
+    // Must be <= MAX_EDGES in patch_graph.hpp (compile-time array size limit)
+    if (config != nullptr && config->maxEdges > 0) {
+        m_maxEdge = config->maxEdges;
+        if (m_maxEdge > MAX_EDGES) {
+            auto init_logger = spdlog::get("dpvo");
+            if (init_logger) {
+                init_logger->warn("DPVO: MaxEdges={} exceeds MAX_EDGES={} (compile-time limit). Clamping to {}.",
+                                 m_maxEdge, MAX_EDGES, MAX_EDGES);
+            }
+            m_maxEdge = MAX_EDGES;
+        }
+    } else {
+        m_maxEdge = 360;  // default
+    }
+    
+    // Hidden state reset interval (from config)
+    if (config != nullptr) {
+        m_netResetInterval = config->netResetInterval;
+    }
+    
+    {
+        auto init_logger = spdlog::get("dpvo");
+        if (init_logger) {
+            init_logger->info("DPVO: MaxEdges={} (model input edge dimension, MAX_EDGES compile limit={})",
+                             m_maxEdge, MAX_EDGES);
+        }
+    }
     
     // Pre-allocate buffers for reshapeInput to avoid memory allocation overhead
     const int CORR_DIM = 882;
@@ -1437,6 +1462,25 @@ void DPVO::update()
             if (pred.netOutBuff) delete[] pred.netOutBuff;
             if (pred.dOutBuff) delete[] pred.dOutBuff;
             if (pred.wOutBuff) delete[] pred.wOutBuff;
+            
+            // ── Periodic hidden state reset ──
+            // Zero out m_net every N frames to prevent FP16 accumulation drift.
+            // The Update model uses m_net as a feedback loop (net_out → next net_input).
+            // On AMBA CV28 with FP16, tiny rounding errors accumulate over hundreds of frames,
+            // potentially causing pose divergence on long sequences (e.g., >1500 frames).
+            // Resetting to zero is safe because new edges always start at zero (see addFactors),
+            // and the model is designed to recover from a zero hidden state.
+            if (m_netResetInterval > 0 && m_counter > 0 && (m_counter % m_netResetInterval == 0)) {
+                for (int e = 0; e < num_active; e++) {
+                    for (int d = 0; d < NET_DIM; d++) {
+                        m_pg.m_net[e][d] = 0.0f;
+                    }
+                }
+                if (logger) {
+                    logger->warn("DPVO::update [Frame {}]: 🔄 Reset m_net hidden state for {} active edges "
+                                "(interval={})", m_counter, num_active, m_netResetInterval);
+                }
+            }
         } else {
             if (logger) {
                 logger->warn("DPVO::update: runInference returned false - using zero delta/weight fallback");

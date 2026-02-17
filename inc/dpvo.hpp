@@ -243,6 +243,9 @@ private:
     std::unique_ptr<DPVOUpdate> m_updateModel;
     int m_updateFrameCounter = 0;
     
+    // Hidden state reset: reset m_net every N frames to prevent FP16 drift
+    int m_netResetInterval = 0;  // 0 = disabled
+    
     // Pre-allocated buffers for reshapeInput (reused to avoid memory allocation overhead)
     std::vector<float> m_reshape_net_input;
     std::vector<float> m_reshape_inp_input;
