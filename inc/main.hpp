@@ -30,6 +30,8 @@
 
 #include <queue>
 #include <mutex>
+#include <chrono>
+#include <unordered_map>
 #include "config_reader.hpp"
 #include "dpvo.hpp"
 #include "fnet.hpp"  // FNetInference
@@ -139,6 +141,15 @@ std::deque<std::pair<ea_tensor_t*, int>> frameQueue;
 std::mutex queueMutex;
 std::condition_variable frameCondVar;
 std::atomic<bool> terminateThreads(false);
+
+// Per-frame DPVO timing information (measured in DPVO worker thread)
+struct DPVOTimingInfo {
+	std::chrono::steady_clock::time_point dpvo_start;
+	std::chrono::steady_clock::time_point dpvo_end;
+};
+
+extern std::mutex g_dpvoTimingMutex;
+extern std::unordered_map<unsigned int, DPVOTimingInfo> g_dpvoTimingMap;
 
 
 //

@@ -23,6 +23,10 @@
  * @param void No input parameters
  * @return void No return value
  */
+// Definitions for DPVO timing globals declared in main.hpp
+std::mutex g_dpvoTimingMutex;
+std::unordered_map<unsigned int, DPVOTimingInfo> g_dpvoTimingMap;
+
 static void usage(void)
 {
 	int i = 0;
@@ -862,9 +866,20 @@ void appDPVOthreadFunction(DPVO& dpvo)
 			if (hasFrame && framePair.first != NULL)
 			{
 				auto logger = spdlog::get("MAIN");
-				if (logger) logger->debug("appDPVOthreadFunction: Calling dpvo.addFrame");
+				const unsigned int frame_index = static_cast<unsigned int>(framePair.second);
+
+				if (logger) logger->debug("appDPVOthreadFunction: Calling dpvo.addFrame for frame {}", frame_index);
+
+				const auto dpvo_start = std::chrono::steady_clock::now();
 				dpvo.addFrame(framePair.first);
-				if (logger) logger->debug("appDPVOthreadFunction: dpvo.addFrame completed");
+				const auto dpvo_end = std::chrono::steady_clock::now();
+
+				{
+					std::lock_guard<std::mutex> timing_lock(g_dpvoTimingMutex);
+					g_dpvoTimingMap[frame_index] = DPVOTimingInfo{dpvo_start, dpvo_end};
+				}
+
+				if (logger) logger->debug("appDPVOthreadFunction: dpvo.addFrame completed for frame {}", frame_index);
 			} 
 			else
 			{
@@ -1500,10 +1515,14 @@ void processDPVOInput(
 			}
 		}
 
+		// Measure per-frame wall-clock time for DPVO pipeline (ingest → DPVO done)
+		const auto frame_start = std::chrono::steady_clock::now();
+		const unsigned int frame_index = count;
+
 		{
 			std::lock_guard<std::mutex> lock(queueMutex);
 			logger->info("Input Source Frame Index = {}", count++);
-			frameQueue.emplace_back(std::pair<ea_tensor_t*, int>(imgTensor, 0));
+			frameQueue.emplace_back(std::pair<ea_tensor_t*, int>(imgTensor, static_cast<int>(frame_index)));
 			logger->info("frameQueue.emplace_back imgTensor finished");
 		}
 
@@ -1523,6 +1542,18 @@ void processDPVOInput(
 		logger->info("Start ea_img_resource_drop_data (after processing complete)");
 		RVAL_OK(ea_img_resource_drop_data(G_param->img_resource, &data));
 		logger->info("ea_img_resource_drop_data finished");
+
+		// Per-frame timing and FPS (yellow text for visibility)
+		const auto frame_end = std::chrono::steady_clock::now();
+		const double frame_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(frame_end - frame_start).count();
+		const double frame_fps = frame_seconds > 0.0 ? 1.0 / frame_seconds : 0.0;
+
+		logger->info(
+			"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS)\033[0m",
+			frame_index,
+			frame_seconds,
+			frame_fps
+		);
 	}
 }
 
@@ -1562,6 +1593,8 @@ void processDPVOApp(
 
 	// Process with DPVO App
 	[&]() {
+		const auto pipeline_start = std::chrono::steady_clock::now();
+
 		// Read config file
 		AppConfigReader appConfigReader;
 		appConfigReader.read(configPath);
@@ -1762,6 +1795,19 @@ void processDPVOApp(
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			logger->info("Waiting for DPVO thread to finish...");
 		}
+
+		// Total pipeline timing (ingest + DPVO processing for all frames)
+		const auto pipeline_end = std::chrono::steady_clock::now();
+		const double pipeline_seconds =
+			std::chrono::duration_cast<std::chrono::duration<double>>(pipeline_end - pipeline_start).count();
+		const double avg_fps = pipeline_seconds > 0.0 ? static_cast<double>(count) / pipeline_seconds : 0.0;
+
+		logger->info(
+			"\033[93m[DPVO] Total pipeline time: {:.3f} s, frames: {}, average FPS: {:.2f}\033[0m",
+			pipeline_seconds,
+			count,
+			avg_fps
+		);
 	}();
 
 	return;
