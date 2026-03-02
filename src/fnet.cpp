@@ -90,15 +90,23 @@ void FNetInference::_initModelIO()
     {
         logger->error("FNet model file does not exist at path: {}", m_ptrModelPath);
         return;
-    }else{
-        logger->error("FNet model file exist at path: {}", m_ptrModelPath);
     }
     fclose(file);
 
     rval = ea_net_load(m_model, EA_NET_LOAD_FILE, (void *)m_ptrModelPath, 1);
+    if (rval != EA_SUCCESS)
+    {
+        logger->error("FNet model load failed: ea_net_load returned {} (path: {}). Ensure model is AMBA JSON format, not raw ONNX.", rval, m_ptrModelPath);
+        return;
+    }
 
     // Get input tensor
     m_inputTensor = ea_net_input(m_model, m_inputTensorName.c_str());
+    if (m_inputTensor == nullptr)
+    {
+        logger->error("FNet: ea_net_input returned nullptr. Model may be in wrong format (AMBA expects .json, not .onnx).");
+        return;
+    }
     m_inputHeight = ea_tensor_shape(m_inputTensor)[EA_H];
     m_inputWidth = ea_tensor_shape(m_inputTensor)[EA_W];
     m_inputChannel = ea_tensor_shape(m_inputTensor)[EA_C];
@@ -106,6 +114,11 @@ void FNetInference::_initModelIO()
 
     // Get output tensor
     m_outputTensor = ea_net_output_by_index(m_model, 0);
+    if (m_outputTensor == nullptr)
+    {
+        logger->error("FNet: ea_net_output_by_index returned nullptr.");
+        return;
+    }
     m_outputHeight = ea_tensor_shape(m_outputTensor)[EA_H];
     m_outputWidth = ea_tensor_shape(m_outputTensor)[EA_W];
     m_outputChannel = ea_tensor_shape(m_outputTensor)[EA_C];

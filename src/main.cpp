@@ -1545,14 +1545,32 @@ void processDPVOInput(
 
 		// Per-frame timing and FPS (yellow text for visibility)
 		const auto frame_end = std::chrono::steady_clock::now();
-		const double frame_seconds = std::chrono::duration_cast<std::chrono::duration<double>>(frame_end - frame_start).count();
+		const double frame_seconds =
+			std::chrono::duration_cast<std::chrono::duration<double>>(frame_end - frame_start).count();
 		const double frame_fps = frame_seconds > 0.0 ? 1.0 / frame_seconds : 0.0;
 
+		// DPVO-thread timing (from appDPVOthreadFunction)
+		double dpvo_ms = 0.0;
+		{
+			std::lock_guard<std::mutex> timing_lock(g_dpvoTimingMutex);
+			auto it = g_dpvoTimingMap.find(frame_index);
+			if (it != g_dpvoTimingMap.end()) {
+				dpvo_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+					it->second.dpvo_end - it->second.dpvo_start).count();
+				g_dpvoTimingMap.erase(it);
+			}
+		}
+
+		const double frame_ms = frame_seconds * 1000.0;
+		const double image_ms = std::max(0.0, frame_ms - dpvo_ms);
+
 		logger->info(
-			"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS)\033[0m",
+			"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS) [image thread: {:.1f} ms, DPVO thread: {:.1f} ms]\033[0m",
 			frame_index,
 			frame_seconds,
-			frame_fps
+			frame_fps,
+			image_ms,
+			dpvo_ms
 		);
 	}
 }
@@ -1682,6 +1700,7 @@ void processDPVOApp(
 		// Validate dimensions to prevent bad_array_new_length
 		if (ht < 16 || wd < 16) {
 			logger->error("Invalid model input dimensions: {}x{}. Minimum size is 16x16", ht, wd);
+			logger->error("Hint: If using FnetModelPath=.../fnet.onnx, build with -DUSE_ONNX_RUNTIME and link ONNX Runtime. Otherwise use AMBA .json model paths.");
 			throw std::runtime_error("Invalid model input dimensions for DPVO");
 		}
 		

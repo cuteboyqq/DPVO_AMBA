@@ -4,9 +4,34 @@ project(wnc-app)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Release build by default for performance-critical correlation kernel
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+
 # Add compile definitions
 add_definitions(-DCV28_SIMULATOR)
 add_definitions(-DSAVE_OUTPUT_TENSOR)
+
+# Optional: ONNX Runtime (for .onnx model inference; requires ONNXRUNTIME_ROOT or system install)
+# When ONNX Runtime is not available, the build uses AMBA models (expects .json paths).
+set(USE_ONNX FALSE)
+set(ONNXRUNTIME_ROOT "$ENV{ONNXRUNTIME_ROOT}" CACHE PATH "Path to ONNX Runtime (e.g. /tmp/onnxruntime-linux-x64-1.16.3)")
+if(ONNXRUNTIME_ROOT)
+    message(STATUS "ONNX Runtime: ${ONNXRUNTIME_ROOT}")
+    set(USE_ONNX TRUE)
+    add_definitions(-DUSE_ONNX_RUNTIME)
+    include_directories(${ONNXRUNTIME_ROOT}/include)
+    link_directories(${ONNXRUNTIME_ROOT}/lib)
+else()
+    find_library(ONNXRUNTIME_LIB onnxruntime PATHS /usr/local/lib /usr/lib)
+    if(ONNXRUNTIME_LIB)
+        message(STATUS "ONNX Runtime: found ${ONNXRUNTIME_LIB}")
+        set(USE_ONNX TRUE)
+        add_definitions(-DUSE_ONNX_RUNTIME)
+    endif()
+endif()
 
 # Include directories
 include_directories(
@@ -57,6 +82,11 @@ target_link_libraries(${PROJECT_NAME}
 # Link EazyAI library (if available)
 target_link_directories(${PROJECT_NAME} PRIVATE ./lib/libeazyai/build)
 target_link_libraries(${PROJECT_NAME} eazyai)
+
+# Link ONNX Runtime if enabled
+if(USE_ONNX)
+    target_link_libraries(${PROJECT_NAME} onnxruntime)
+endif()
 
 # Set output directory
 set_target_properties(${PROJECT_NAME} PROPERTIES
