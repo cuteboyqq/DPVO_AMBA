@@ -14,6 +14,7 @@
 #include "dpvo_viewer.hpp"
 #include <iostream>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 #include <thread>
 #include <chrono>
@@ -100,8 +101,157 @@ void DPVOViewer::updateImage(const uint8_t* image_data, int width, int height)
     size_t image_size = static_cast<size_t>(width) * height * 3;
     if (m_imageBuffer.size() >= image_size) {
         std::memcpy(m_imageBuffer.data(), image_data, image_size);
+#if defined(CV28) || defined(CV28_SIMULATOR)
+        if (m_yolov8Boxes != nullptr && !m_yolov8Boxes->empty()) {
+            cv::Mat img(height, width, CV_8UC3, m_imageBuffer.data());
+            const float sx = static_cast<float>(width) / static_cast<float>(m_yolov8ModelW);
+            const float sy = static_cast<float>(height) / static_cast<float>(m_yolov8ModelH);
+            for (const auto& class_boxes : *m_yolov8Boxes) {
+                for (const auto& b : class_boxes) {
+                    int x1 = static_cast<int>(b.x1 * sx);
+                    int y1 = static_cast<int>(b.y1 * sy);
+                    int x2 = static_cast<int>(b.x2 * sx);
+                    int y2 = static_cast<int>(b.y2 * sy);
+                    cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
+                }
+            }
+        }
+#endif
         m_imageUpdated = true;
     }
+}
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+void DPVOViewer::setYOLOv8Boxes(const std::vector<std::vector<v8xyxy>>* boxes)
+{
+    std::lock_guard<std::mutex> lock(m_dataMutex);
+    m_yolov8Boxes = boxes;
+}
+
+void DPVOViewer::setYOLOv8ModelSize(int model_w, int model_h)
+{
+    std::lock_guard<std::mutex> lock(m_dataMutex);
+    m_yolov8ModelW = model_w > 0 ? model_w : 512;
+    m_yolov8ModelH = model_h > 0 ? model_h : 288;
+}
+#endif
+
+void DPVOViewer::setDetections3D(const std::vector<Detection3D>& detections)
+{
+    std::lock_guard<std::mutex> lock(m_dataMutex);
+    m_detections3D = detections;
+}
+
+void DPVOViewer::drawDetections3D()
+{
+#ifdef ENABLE_PANGOLIN_VIEWER
+    std::lock_guard<std::mutex> lock(m_dataMutex);
+    if (m_detections3D.empty()) {
+        return;
+    }
+    glLineWidth(2.5f);  // Thicker for vehicle/other wireframes
+    const float det_scale = 0.12f;
+    for (const auto& det : m_detections3D) {
+        float x = det.position.x, y = det.position.y, z = det.position.z;
+        if (det.classId == 0) {
+            // Pedestrian: clear person model — 1 head, 1 body, 2 legs, 2 arms (Z-up). Scale 8x for visibility.
+            const float s = det_scale * 16.0f;
+            const float z_foot    = z;
+            const float z_hip     = z + 0.40f * s;
+            const float z_shoulder= z + 0.72f * s;
+            const float z_neck    = z + 0.88f * s;
+            const float z_head    = z + 1.00f * s;
+            const float leg_spread = 0.05f * s;   // feet spread in X
+            const float arm_side   = 0.14f * s;   // hand position in X
+            const float arm_low    = 0.10f * s;   // hands slightly below shoulder in Z
+            const float head_r    = 0.06f * s;    // head radius
+            const float thick    = 0.035f * s;    // limb/body thickness (in Y for visibility)
+            const int head_seg   = 12;
+
+            glColor3f(0.35f, 0.55f, 0.78f);
+
+            // Helper: draw a thick segment from (x1,y,z1) to (x2,y,z2) as a quad (thickness in Y)
+            auto drawSegment = [&](float x1, float z1, float x2, float z2) {
+                glVertex3f(x1, y - thick, z1);  glVertex3f(x1, y + thick, z1);
+                glVertex3f(x2, y + thick, z2);  glVertex3f(x2, y - thick, z2);
+            };
+
+            // ---- 1) Body (torso): hip to shoulder ----
+            glBegin(GL_QUADS);
+            drawSegment(x, z_hip, x, z_shoulder);
+            glEnd();
+
+            // ---- 2) Left leg: hip to left foot ----
+            glBegin(GL_QUADS);
+            drawSegment(x, z_hip, x - leg_spread, z_foot);
+            glEnd();
+            // ---- 3) Right leg: hip to right foot ----
+            glBegin(GL_QUADS);
+            drawSegment(x, z_hip, x + leg_spread, z_foot);
+            glEnd();
+
+            // ---- 4) Left arm: shoulder to left hand ----
+            glBegin(GL_QUADS);
+            drawSegment(x, z_shoulder, x - arm_side, z_shoulder - arm_low);
+            glEnd();
+            // ---- 5) Right arm: shoulder to right hand ----
+            glBegin(GL_QUADS);
+            drawSegment(x, z_shoulder, x + arm_side, z_shoulder - arm_low);
+            glEnd();
+
+            // ---- Neck: shoulder to head ----
+            glBegin(GL_QUADS);
+            drawSegment(x, z_shoulder, x, z_neck);
+            glEnd();
+
+            // ---- 6) One head: filled circle on top ----
+            glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(x, y, z_head);
+            for (int i = 0; i <= head_seg; i++) {
+                float a = static_cast<float>(i) * (2.0f * 3.14159265f / static_cast<float>(head_seg));
+                glVertex3f(x + head_r * std::cos(a), y + head_r * std::sin(a), z_head);
+            }
+            glEnd();
+
+            // Outline so head and limbs read clearly
+            glColor3f(0.2f, 0.35f, 0.55f);
+            glBegin(GL_LINE_LOOP);
+            for (int i = 0; i < head_seg; i++) {
+                float a = static_cast<float>(i) * (2.0f * 3.14159265f / static_cast<float>(head_seg));
+                glVertex3f(x + head_r * std::cos(a), y + head_r * std::sin(a), z_head);
+            }
+            glEnd();
+        } else {
+            // Vehicle or other: wireframe box, Z-up (bottom at z, top at z + 2*ht)
+            float hw, hh, ht;
+            if (det.classId == 1 || det.classId == 2) {
+                glColor3f(0.0f, 0.0f, 0.9f);  // Blue
+                hw = 0.6f * det_scale; hh = 0.25f * det_scale; ht = 0.25f * det_scale;
+            } else {
+                glColor3f(0.9f, 0.9f, 0.0f);  // Yellow
+                hw = 0.2f * det_scale; hh = 0.2f * det_scale; ht = 0.2f * det_scale;
+            }
+            float x0 = x - hw, x1 = x + hw;
+            float y0 = y - hh, y1 = y + hh;
+            float z0 = z,       z1 = z + 2.0f * ht;
+            glBegin(GL_LINES);
+            glVertex3f(x0, y0, z0); glVertex3f(x1, y0, z0);
+            glVertex3f(x1, y0, z0); glVertex3f(x1, y1, z0);
+            glVertex3f(x1, y1, z0); glVertex3f(x0, y1, z0);
+            glVertex3f(x0, y1, z0); glVertex3f(x0, y0, z0);
+            glVertex3f(x0, y0, z1); glVertex3f(x1, y0, z1);
+            glVertex3f(x1, y0, z1); glVertex3f(x1, y1, z1);
+            glVertex3f(x1, y1, z1); glVertex3f(x0, y1, z1);
+            glVertex3f(x0, y1, z1); glVertex3f(x0, y0, z1);
+            glVertex3f(x0, y0, z0); glVertex3f(x0, y0, z1);
+            glVertex3f(x1, y0, z0); glVertex3f(x1, y0, z1);
+            glVertex3f(x1, y1, z0); glVertex3f(x1, y1, z1);
+            glVertex3f(x0, y1, z0); glVertex3f(x0, y1, z1);
+            glEnd();
+        }
+    }
+    glLineWidth(1.0f);
+#endif
 }
 
 void DPVOViewer::updatePoses(const SE3* poses, int num_frames)
@@ -1188,7 +1338,8 @@ void DPVOViewer::run()
         
         drawPoints();
         drawPoses();  // Draw real poses from m_poseMatrices
-        
+        drawDetections3D();  // Draw 3D detections (pedestrians, vehicles)
+
         // Update and draw image
         if (m_textureSizeChanged) {
             std::lock_guard<std::mutex> lock(m_dataMutex);

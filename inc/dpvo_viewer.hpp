@@ -15,6 +15,7 @@
 
 #include "se.hpp"
 #include "patch_graph.hpp"
+#include "detection_3d.hpp"
 #include <vector>
 #include <string>
 #include <thread>
@@ -31,6 +32,10 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #endif
+#endif
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+#include "yolov8_decoder.hpp"
 #endif
 
 /**
@@ -81,7 +86,20 @@ public:
      * @param num_points Number of points
      */
     void updatePoints(const Vec3* points, const uint8_t* colors, int num_points);
-    
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    /** Optional YOLOv8 overlay: set before updateImage so boxes are drawn on the frame */
+    void setYOLOv8Boxes(const std::vector<std::vector<v8xyxy>>* boxes);
+    /** YOLOv8 model input size for box scaling (default 512x288). Call when using ONNX with different input size. */
+    void setYOLOv8ModelSize(int model_w, int model_h);
+#endif
+
+    /**
+     * @brief 3D detections (e.g. from YOLOv8 + ground-plane back-projection) to draw in 3D view.
+     * Each object is drawn as a simple shape: person = tall box, vehicle = flat box, else = small cube.
+     */
+    void setDetections3D(const std::vector<Detection3D>& detections);
+
     /**
      * @brief Enable saving rendered frames to image files
      * @param output_dir Directory to save frames (will be created if needed)
@@ -94,6 +112,11 @@ public:
      */
     void enableFrameSaving(const std::string& output_dir);
     
+    /**
+     * @brief Draw 3D detections (pedestrians, vehicles) as simple wireframe shapes. Called internally.
+     */
+    void drawDetections3D();
+
     /**
      * @brief Close viewer and stop thread
      */
@@ -146,6 +169,15 @@ private:
     std::vector<Vec3> m_points;
     std::vector<uint8_t> m_colors;
     
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    const std::vector<std::vector<v8xyxy>>* m_yolov8Boxes{nullptr};
+    int m_yolov8ModelW = 512;
+    int m_yolov8ModelH = 288;
+#endif
+
+    // 3D detections (YOLOv8 back-projected to ground plane)
+    std::vector<Detection3D> m_detections3D;
+
     // Frame saving
     bool m_frameSavingEnabled{false};
     std::string m_frameSavePath;

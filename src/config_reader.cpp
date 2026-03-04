@@ -70,6 +70,8 @@ void AppConfigReader::read(std::string configPath)
         string fnetModelPath    = "";  // DPVO FNet model path
         string inetModelPath    = "";  // DPVO INet model path
         string updateModelPath  = "";  // DPVO Update model path
+        string yolov8ModelPath  = "";  // YOLOv8 model path (optional)
+        bool   enableYOLOv8     = true;  // Enable YOLOv8 inference when Yolov8ModelPath is set (1 = on, 0 = off)
         int    modelWidth           = 320;
         int    modelHeight          = 320;
 
@@ -162,7 +164,15 @@ void AppConfigReader::read(std::string configPath)
         configReader->getValue("FnetModelPath", fnetModelPath);
         configReader->getValue("InetModelPath", inetModelPath);
         configReader->getValue("UpdateModelPath", updateModelPath);
-        
+        configReader->getValue("Yolov8ModelPath", yolov8ModelPath);
+        string enableYOLOv8Str = "";
+        configReader->getValue("EnableYOLOv8", enableYOLOv8Str);
+        if (!enableYOLOv8Str.empty() && (enableYOLOv8Str == "false" || enableYOLOv8Str == "0" || enableYOLOv8Str == "False")) {
+            enableYOLOv8 = false;
+        } else if (!enableYOLOv8Str.empty() && (enableYOLOv8Str == "true" || enableYOLOv8Str == "1" || enableYOLOv8Str == "True")) {
+            enableYOLOv8 = true;
+        }
+
         // Auto-detect ONNX Runtime mode if model paths end with .onnx
         bool useOnnxRuntime = false;
         string useOnnxRuntimeStr = "";
@@ -192,6 +202,16 @@ void AppConfigReader::read(std::string configPath)
         configReader->getValue("SaveViewerFrames", saveViewerFramesStr);
         if (!saveViewerFramesStr.empty() && (saveViewerFramesStr == "true" || saveViewerFramesStr == "1" || saveViewerFramesStr == "True")) {
             saveViewerFrames = true;
+        }
+
+        // 3D Viewer: show 3D object detection (pedestrians, vehicles). 0 = off, 1 = on
+        bool enableShow3DDetection = true;
+        string enableShow3DDetectionStr = "";
+        configReader->getValue("EnableShow3DDetection", enableShow3DDetectionStr);
+        if (!enableShow3DDetectionStr.empty() && (enableShow3DDetectionStr == "false" || enableShow3DDetectionStr == "0" || enableShow3DDetectionStr == "False")) {
+            enableShow3DDetection = false;
+        } else if (!enableShow3DDetectionStr.empty() && (enableShow3DDetectionStr == "true" || enableShow3DDetectionStr == "1" || enableShow3DDetectionStr == "True")) {
+            enableShow3DDetection = true;
         }
 
         // Hidden State Reset Interval
@@ -287,10 +307,13 @@ void AppConfigReader::read(std::string configPath)
             logger->info("FnetModelPath \t\t= {}",  fnetModelPath);
             logger->info("InetModelPath \t\t= {}",  inetModelPath);
             logger->info("UpdateModelPath \t= {}",  updateModelPath);
+            logger->info("Yolov8ModelPath \t= {}",  yolov8ModelPath.empty() ? "(empty, YOLOv8 disabled)" : yolov8ModelPath);
+            logger->info("EnableYOLOv8 \t\t= {} (YOLOv8 inference {}", enableYOLOv8, enableYOLOv8 ? "on)" : "off)");
             logger->info("UseOnnxRuntime \t\t= {} (auto-detected: {})", useOnnxRuntime, 
                         (useOnnxRuntimeStr.empty() ? "yes" : "no"));
             logger->info("EnableInferenceCache \t= {}", enableInferenceCache);
             logger->info("SaveViewerFrames \t= {}", saveViewerFrames);
+            logger->info("EnableShow3DDetection \t= {} (3D viewer object detection {})", enableShow3DDetection, enableShow3DDetection ? "on" : "off");
             logger->info("NetResetInterval \t= {} {}", netResetInterval,
                         (netResetInterval > 0 ? "(reset m_net every N frames)" : "(disabled)"));
             logger->info("MaxEdges \t\t= {} (update model input edge dimension)", maxEdges);
@@ -397,9 +420,12 @@ void AppConfigReader::read(std::string configPath)
         m_config->fnetModelPath   = fnetModelPath;
         m_config->inetModelPath  = inetModelPath;
         m_config->updateModelPath = updateModelPath;
+        m_config->yolov8ModelPath = yolov8ModelPath;
+        m_config->enableYOLOv8   = enableYOLOv8;
         m_config->useOnnxRuntime = useOnnxRuntime;
         m_config->enableInferenceCache = enableInferenceCache;
         m_config->saveViewerFrames = saveViewerFrames;
+        m_config->enableShow3DDetection = enableShow3DDetection;
         m_config->netResetInterval = netResetInterval;
         m_config->maxEdges       = maxEdges;
         m_config->modelWidth     = modelWidth;

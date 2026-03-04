@@ -16,5 +16,5 @@
 
 // Note: 'extern' is required here to give the constant external linkage
 // Without it, 'const' variables at namespace scope have internal linkage by default
-extern const int TARGET_FRAME = 15;  // Change this to save a different frame
+extern const int TARGET_FRAME = -1;  // Change this to save a different frame
 

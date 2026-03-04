@@ -153,6 +153,30 @@ src/ba.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/ba.cpp.s
 .PHONY : src/ba.cpp.s
 
+src/bounding_box.o: src/bounding_box.cpp.o
+.PHONY : src/bounding_box.o
+
+# target to build an object file
+src/bounding_box.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/bounding_box.cpp.o
+.PHONY : src/bounding_box.cpp.o
+
+src/bounding_box.i: src/bounding_box.cpp.i
+.PHONY : src/bounding_box.i
+
+# target to preprocess a source file
+src/bounding_box.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/bounding_box.cpp.i
+.PHONY : src/bounding_box.cpp.i
+
+src/bounding_box.s: src/bounding_box.cpp.s
+.PHONY : src/bounding_box.s
+
+# target to generate assembly for a file
+src/bounding_box.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/bounding_box.cpp.s
+.PHONY : src/bounding_box.cpp.s
+
 src/config_reader.o: src/config_reader.cpp.o
 .PHONY : src/config_reader.o
 
@@ -513,6 +537,30 @@ src/patchify.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/patchify.cpp.s
 .PHONY : src/patchify.cpp.s
 
+src/point.o: src/point.cpp.o
+.PHONY : src/point.o
+
+# target to build an object file
+src/point.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/point.cpp.o
+.PHONY : src/point.cpp.o
+
+src/point.i: src/point.cpp.i
+.PHONY : src/point.i
+
+# target to preprocess a source file
+src/point.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/point.cpp.i
+.PHONY : src/point.cpp.i
+
+src/point.s: src/point.cpp.s
+.PHONY : src/point.s
+
+# target to generate assembly for a file
+src/point.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/point.cpp.s
+.PHONY : src/point.cpp.s
+
 src/projective_ops.o: src/projective_ops.cpp.o
 .PHONY : src/projective_ops.o
 
@@ -681,6 +729,78 @@ src/utils.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/utils.cpp.s
 .PHONY : src/utils.cpp.s
 
+src/yolov8.o: src/yolov8.cpp.o
+.PHONY : src/yolov8.o
+
+# target to build an object file
+src/yolov8.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8.cpp.o
+.PHONY : src/yolov8.cpp.o
+
+src/yolov8.i: src/yolov8.cpp.i
+.PHONY : src/yolov8.i
+
+# target to preprocess a source file
+src/yolov8.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8.cpp.i
+.PHONY : src/yolov8.cpp.i
+
+src/yolov8.s: src/yolov8.cpp.s
+.PHONY : src/yolov8.s
+
+# target to generate assembly for a file
+src/yolov8.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8.cpp.s
+.PHONY : src/yolov8.cpp.s
+
+src/yolov8_decoder.o: src/yolov8_decoder.cpp.o
+.PHONY : src/yolov8_decoder.o
+
+# target to build an object file
+src/yolov8_decoder.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8_decoder.cpp.o
+.PHONY : src/yolov8_decoder.cpp.o
+
+src/yolov8_decoder.i: src/yolov8_decoder.cpp.i
+.PHONY : src/yolov8_decoder.i
+
+# target to preprocess a source file
+src/yolov8_decoder.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8_decoder.cpp.i
+.PHONY : src/yolov8_decoder.cpp.i
+
+src/yolov8_decoder.s: src/yolov8_decoder.cpp.s
+.PHONY : src/yolov8_decoder.s
+
+# target to generate assembly for a file
+src/yolov8_decoder.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8_decoder.cpp.s
+.PHONY : src/yolov8_decoder.cpp.s
+
+src/yolov8_onnx.o: src/yolov8_onnx.cpp.o
+.PHONY : src/yolov8_onnx.o
+
+# target to build an object file
+src/yolov8_onnx.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8_onnx.cpp.o
+.PHONY : src/yolov8_onnx.cpp.o
+
+src/yolov8_onnx.i: src/yolov8_onnx.cpp.i
+.PHONY : src/yolov8_onnx.i
+
+# target to preprocess a source file
+src/yolov8_onnx.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8_onnx.cpp.i
+.PHONY : src/yolov8_onnx.cpp.i
+
+src/yolov8_onnx.s: src/yolov8_onnx.cpp.s
+.PHONY : src/yolov8_onnx.s
+
+# target to generate assembly for a file
+src/yolov8_onnx.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/wnc-app.dir/build.make CMakeFiles/wnc-app.dir/src/yolov8_onnx.cpp.s
+.PHONY : src/yolov8_onnx.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -693,6 +813,9 @@ help:
 	@echo "... src/ba.o"
 	@echo "... src/ba.i"
 	@echo "... src/ba.s"
+	@echo "... src/bounding_box.o"
+	@echo "... src/bounding_box.i"
+	@echo "... src/bounding_box.s"
 	@echo "... src/config_reader.o"
 	@echo "... src/config_reader.i"
 	@echo "... src/config_reader.s"
@@ -738,6 +861,9 @@ help:
 	@echo "... src/patchify.o"
 	@echo "... src/patchify.i"
 	@echo "... src/patchify.s"
+	@echo "... src/point.o"
+	@echo "... src/point.i"
+	@echo "... src/point.s"
 	@echo "... src/projective_ops.o"
 	@echo "... src/projective_ops.i"
 	@echo "... src/projective_ops.s"
@@ -759,6 +885,15 @@ help:
 	@echo "... src/utils.o"
 	@echo "... src/utils.i"
 	@echo "... src/utils.s"
+	@echo "... src/yolov8.o"
+	@echo "... src/yolov8.i"
+	@echo "... src/yolov8.s"
+	@echo "... src/yolov8_decoder.o"
+	@echo "... src/yolov8_decoder.i"
+	@echo "... src/yolov8_decoder.s"
+	@echo "... src/yolov8_onnx.o"
+	@echo "... src/yolov8_onnx.i"
+	@echo "... src/yolov8_onnx.s"
 .PHONY : help
 
 

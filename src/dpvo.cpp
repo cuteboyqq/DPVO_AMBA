@@ -28,6 +28,54 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+#if defined(CV28) || defined(CV28_SIMULATOR)
+// Unproject 2D image point (u,v) to 3D world point. Same convention as BA/projective_ops:
+// ray in camera frame = (X0, Y0, Z0=1) with X0=(u-cx)/fx, Y0=(v-cy)/fy (forward = +Z).
+// T_wc = world to camera. Intrinsics fx,fy,cx,cy for the same resolution as (u,v).
+// Tries ground plane y=0, then z=0, then fixed depth. Returns true and writes *out.
+static bool unprojectToGroundPlane(float fx, float fy, float cx, float cy,
+    const SE3& T_wc, float u, float v, Vec3* out)
+{
+    if (out == nullptr) return false;
+    // Match projective_ops: normalized ray (X0, Y0, 1) so reprojection is consistent with patches
+    Eigen::Vector3f d_c(static_cast<float>((u - cx) / fx), static_cast<float>((v - cy) / fy), 1.0f);
+    float n = d_c.norm();
+    if (n < 1e-6f) return false;
+    d_c /= n;
+    SE3 T_cw = T_wc.inverse();
+    Eigen::Vector3f origin_w = T_cw.t;
+    Eigen::Matrix3f R_cw = T_cw.R();
+    Eigen::Vector3f d_w = R_cw * d_c;
+    const float eps = 1e-5f;
+    const float max_ground_dist = 50.0f;  // Cap distance to avoid far outliers in 3D viewer
+    float t = -1.0f;
+    // Try ground plane y = 0 (Y-up convention)
+    if (std::abs(d_w.y()) > eps) {
+        t = (0.0f - origin_w.y()) / d_w.y();
+        if (t > 0.0f && t <= max_ground_dist) {
+            Eigen::Vector3f P_w = origin_w + t * d_w;
+            out->x = P_w.x(); out->y = P_w.y(); out->z = P_w.z();
+            return true;
+        }
+    }
+    // Try ground plane z = 0 (Z-up convention, common in robotics / viewer)
+    if (std::abs(d_w.z()) > eps) {
+        t = (0.0f - origin_w.z()) / d_w.z();
+        if (t > 0.0f && t <= max_ground_dist) {
+            Eigen::Vector3f P_w = origin_w + t * d_w;
+            out->x = P_w.x(); out->y = P_w.y(); out->z = P_w.z();
+            return true;
+        }
+    }
+    // Fallback: fixed depth (e.g. 5m) so detections still appear in 3D for debugging
+    const float fixed_depth = 5.0f;
+    Eigen::Vector3f P_c = d_c * fixed_depth;
+    Eigen::Vector3f P_w = origin_w + R_cw * P_c;
+    out->x = P_w.x(); out->y = P_w.y(); out->z = P_w.z();
+    return true;
+}
+#endif
+
 // Helper function to get bin_file directory path and ensure it exists
 static std::string get_bin_file_path(const std::string& filename) {
     const std::string bin_dir = "bin_file";
@@ -135,6 +183,7 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
 
     // Initialize intrinsics from config or use defaults
     if (config != nullptr) {
+        m_enableShow3DDetection = config->enableShow3DDetection;
         setIntrinsicsFromConfig(config);
 #ifdef USE_ONNX_RUNTIME
         if (config->useOnnxRuntime) {
@@ -196,6 +245,23 @@ DPVO::DPVO(const DPVOConfig& cfg, int ht, int wd, Config_S* config)
     m_reshape_ii_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
     m_reshape_jj_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
     m_reshape_kk_input.resize(1 * 1 * m_maxEdge * 1, 0.0f);
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    if (config != nullptr && config->enableYOLOv8 && !config->yolov8ModelPath.empty()) {
+#ifdef USE_ONNX_RUNTIME
+        if (config->useOnnxRuntime) {
+            m_yolov8_onnx = std::make_unique<YOLOv8ONNX>(config);
+            if (m_yolov8_onnx->isReady())
+                m_yolov8Decoder = std::make_unique<YOLOv8_Decoder>(
+                    m_yolov8_onnx->getInputHeight(), m_yolov8_onnx->getInputWidth(), "dpvo");
+        } else
+#endif
+        {
+            m_yolov8 = std::make_unique<YOLOv8>(config, nullptr);
+            m_yolov8Decoder = std::make_unique<YOLOv8_Decoder>(YOLOV8_MODEL_HEIGHT, YOLOV8_MODEL_WIDTH, "dpvo");
+        }
+    }
+#endif
 }
 
 void DPVO::_startThreads()
@@ -440,8 +506,13 @@ void DPVO::runAfterPatchify(int64_t timestamp, const float* intrinsics_in, int H
     //   - Scale intrinsics: (model_W / W) / RES for x, (model_H / H) / RES for y
     //   - This matches Python if images are already resized to match model input size
     const float RES = 4.0f;
-    float scale_x = 0.26666f; // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
-    float scale_y = 0.26666f; // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
+    //-----------------------------------------------------------------------------------------------------
+    // Notes:
+    // Disable using scale_x and scale_y, user need to calculate correct intrinsic by intrinsic * scale
+    // And write intrinsic * scale in app_config.txt
+    //---------------------------------------------------------------------------------------------------------
+    float scale_x = 0.26666f; //0.8fl tartan // 0.26666f; iphone // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_W) / static_cast<float>(W);  // Model input / Input image width
+    float scale_y = 0.26666f; // 0.6f; tartan// 0.26666f; iphone // 0.3333f; (352x640) //0.5f; // static_cast<float>(model_H) / static_cast<float>(H);  // Model input / Input image height
     
     float scaled_intrinsics[4];
     scaled_intrinsics[0] = intrinsics_to_use[0] * scale_x / RES;  // fx: scale to model input, then to feature map
@@ -973,11 +1044,115 @@ void DPVO::run(int64_t timestamp, ea_tensor_t* imgTensor, const float* intrinsic
             image_for_viewer = image_data.data();
         }
     }
-    
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+#ifdef USE_ONNX_RUNTIME
+    if (m_yolov8_onnx != nullptr && m_yolov8_onnx->isReady()) {
+        auto t_yolo_start = std::chrono::steady_clock::now();
+        YOLOv8_Prediction ypred;
+        if (m_yolov8_onnx->runSync(imgTensor, static_cast<int>(m_counter), ypred)) {
+            double yolov8_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_yolo_start).count();
+            m_lastYOLOv8InferenceTimeMs = yolov8_ms;
+            if (logger) logger->info("\033[33m[TIMING] Frame {} | YOLOv8 (ONNX): {:.1f} ms\033[0m", m_counter, yolov8_ms);
+            if (m_yolov8Decoder != nullptr && ypred.objBoxBuff != nullptr) {
+                std::vector<std::vector<v8xyxy>> boxes;
+                m_yolov8Decoder->decodeBox(ypred.objBoxBuff, ypred.objConfBuff, ypred.objClsBuff,
+                    m_yolov8_onnx->getNumAnchorBox(), 0.25f, 0.5f, 1, boxes);
+                {
+                    std::lock_guard<std::mutex> lock(m_yolov8BoxesMutex);
+                    m_lastYOLOv8Boxes = std::move(boxes);
+                }
+                m_yolov8InputW = m_yolov8_onnx->getInputWidth();
+                m_yolov8InputH = m_yolov8_onnx->getInputHeight();
+                if (m_viewer != nullptr) {
+                    m_viewer->setYOLOv8ModelSize(m_yolov8InputW, m_yolov8InputH);
+                    m_viewer->setYOLOv8Boxes(&m_lastYOLOv8Boxes);
+                }
+                // 3D back-projection is done after runAfterPatchify() so we use the current frame's pose
+            }
+        }
+    } else
+#endif
+    if (m_yolov8 != nullptr) {
+        auto t_yolo_start = std::chrono::steady_clock::now();
+        YOLOv8_Prediction ypred;
+        if (m_yolov8->runSync(imgTensor, static_cast<int>(m_counter), ypred)) {
+            double yolov8_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_yolo_start).count();
+            m_lastYOLOv8InferenceTimeMs = yolov8_ms;
+            if (logger) logger->info("\033[33m[TIMING] Frame {} | YOLOv8: {:.1f} ms\033[0m", m_counter, yolov8_ms);
+            if (m_yolov8Decoder != nullptr && ypred.objBoxBuff != nullptr) {
+                std::vector<std::vector<v8xyxy>> boxes;
+                m_yolov8Decoder->decodeBox(ypred.objBoxBuff, ypred.objConfBuff, ypred.objClsBuff,
+                    m_yolov8->getNumAnchorBox(), 0.25f, 0.5f, 1, boxes);
+                {
+                    std::lock_guard<std::mutex> lock(m_yolov8BoxesMutex);
+                    m_lastYOLOv8Boxes = std::move(boxes);
+                }
+                m_yolov8InputW = m_yolov8->getInputWidth();
+                m_yolov8InputH = m_yolov8->getInputHeight();
+                if (m_viewer != nullptr) {
+                    m_viewer->setYOLOv8ModelSize(m_yolov8InputW, m_yolov8InputH);
+                    m_viewer->setYOLOv8Boxes(&m_lastYOLOv8Boxes);
+                }
+                // 3D back-projection is done after runAfterPatchify() so we use the current frame's pose
+            }
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(m_detections3DMutex);
+        m_lastDetections3D.clear();
+    }
+#endif
+
     // Call helper function to continue with rest of logic after patchifier.forward()
     // This avoids calling patchifier.forward() again
     runAfterPatchify(timestamp, intrinsics, H, W, n, n_use, pm, mm, M, P, patch_D, patches, clr, image_for_viewer);
-    
+
+    // Back-project 2D YOLOv8 boxes to 3D when EnableShow3DDetection = 1 (skip when disabled to save work)
+    if (m_enableShow3DDetection) {
+    std::vector<std::vector<v8xyxy>> boxes_copy;
+    {
+        std::lock_guard<std::mutex> lock(m_yolov8BoxesMutex);
+        boxes_copy = m_lastYOLOv8Boxes;
+    }
+    if (!boxes_copy.empty()) {
+            std::vector<Detection3D> det3d;
+            const SE3& T_wc = m_pg.m_poses[n_use];
+            // Use this frame's intrinsics (same as BA) so bbox-center reprojection matches patch pipeline.
+            // m_pg.m_intrinsics[n_use] are at 1/4 res; *4 gives intrinsics at (m_wd,m_ht); then scale to YOLOv8.
+            const float* intr = m_pg.m_intrinsics[n_use];
+            const float RES = 4.0f;
+            int yw = (m_yolov8InputW > 0) ? m_yolov8InputW : m_wd;
+            int yh = (m_yolov8InputH > 0) ? m_yolov8InputH : m_ht;
+            float scale_x = (m_wd > 0) ? (static_cast<float>(yw) / static_cast<float>(m_wd)) : 1.0f;
+            float scale_y = (m_ht > 0) ? (static_cast<float>(yh) / static_cast<float>(m_ht)) : 1.0f;
+            float fx = intr[0] * RES * scale_x, fy = intr[1] * RES * scale_y;
+            float cx = intr[2] * RES * scale_x, cy = intr[3] * RES * scale_y;
+            for (const auto& class_boxes : boxes_copy) {
+                for (const auto& b : class_boxes) {
+                    // Bbox center in pixel coords (horizontal and vertical) so each detection gets a distinct ray
+                    float u = (static_cast<float>(b.x1) + static_cast<float>(b.x2)) * 0.5f;
+                    float v = (static_cast<float>(b.y1) + static_cast<float>(b.y2)) * 0.5f;
+                    Vec3 pos;
+                    if (unprojectToGroundPlane(fx, fy, cx, cy, T_wc, u, v, &pos)) {
+                        det3d.push_back({pos, b.c, b.c_prob});
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> lock(m_detections3DMutex);
+            m_lastDetections3D = std::move(det3d);
+            if (logger && !m_lastDetections3D.empty()) {
+                static bool logged_once = false;
+                if (!logged_once) {
+                    logged_once = true;
+                    logger->info("\033[33m[3D] Passing {} detection(s) to viewer (pedestrians/vehicles)\033[0m",
+                        static_cast<int>(m_lastDetections3D.size()));
+                }
+            }
+        }
+    } else {
+        std::lock_guard<std::mutex> lock(m_detections3DMutex);
+        m_lastDetections3D.clear();
+    }
 }
 #endif
 
@@ -3780,6 +3955,15 @@ void DPVO::updateViewer()
             // The sync mechanism ensures frames in the sliding window have the latest optimized poses
             // Frames removed from the sliding window retain their last optimized pose (synced before removal)
             m_viewer->updatePoses(m_allPoses.data(), num_historical_frames);
+#if defined(CV28) || defined(CV28_SIMULATOR)
+            // Only pass 3D detections to viewer when EnableShow3DDetection = 1 in app_config.txt
+            if (m_enableShow3DDetection) {
+                std::lock_guard<std::mutex> lock(m_detections3DMutex);
+                m_viewer->setDetections3D(m_lastDetections3D);
+            } else {
+                m_viewer->setDetections3D(std::vector<Detection3D>{});
+            }
+#endif
             if (logger && m_pg.m_n > 0) {
                 // Log first and last pose to track movement
                 // Also check if poses are identity and if poses are changing

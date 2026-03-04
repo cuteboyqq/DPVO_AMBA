@@ -114,7 +114,9 @@ typedef struct
     std::string fnetModelPath;      // Path to FNet model
     std::string inetModelPath;      // Path to INet model
     std::string updateModelPath;    // Path to DPVO Update model
-    
+    std::string yolov8ModelPath;   // Path to YOLOv8 model (optional; empty = disable)
+    bool enableYOLOv8 = true;      // If true, run YOLOv8 inference when yolov8ModelPath is set (app_config: EnableYOLOv8 = 1)
+
     // DPVO Inference Backend
     bool useOnnxRuntime;            // If true, use ONNX Runtime instead of AMBA EazyAI
                                     // Set to true if model paths end with .onnx
@@ -126,6 +128,9 @@ typedef struct
     // Viewer Frame Saving
     bool saveViewerFrames;          // If true, save each viewer frame as PNG to viewer_frames/<video_name>/
                                     // Useful for creating videos without screen recording
+
+    // 3D Viewer: show 3D object detection (pedestrians, vehicles) in the 3D view. 0 = off, 1 = on (app_config: EnableShow3DDetection)
+    bool enableShow3DDetection = true;
 
     // Hidden State Reset
     int netResetInterval;           // Reset m_net hidden state every N frames (0 = disabled)

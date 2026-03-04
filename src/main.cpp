@@ -1549,29 +1549,27 @@ void processDPVOInput(
 			std::chrono::duration_cast<std::chrono::duration<double>>(frame_end - frame_start).count();
 		const double frame_fps = frame_seconds > 0.0 ? 1.0 / frame_seconds : 0.0;
 
-		// DPVO-thread timing (from appDPVOthreadFunction)
-		double dpvo_ms = 0.0;
-		{
-			std::lock_guard<std::mutex> timing_lock(g_dpvoTimingMutex);
-			auto it = g_dpvoTimingMap.find(frame_index);
-			if (it != g_dpvoTimingMap.end()) {
-				dpvo_ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
-					it->second.dpvo_end - it->second.dpvo_start).count();
-				g_dpvoTimingMap.erase(it);
-			}
+
+		double yolo_ms = 0.0;
+#if defined(CV28) || defined(CV28_SIMULATOR)
+		yolo_ms = dpvo->getLastYOLOv8InferenceTimeMs();
+#endif
+		if (yolo_ms > 0.0) {
+			logger->info(
+				"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS) | YOLOv8: {:.1f} ms\033[0m",
+				frame_index,
+				frame_seconds,
+				frame_fps,
+				yolo_ms
+			);
+		} else {
+			logger->info(
+				"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS)[0m",
+				frame_index,
+				frame_seconds,
+				frame_fps
+			);
 		}
-
-		const double frame_ms = frame_seconds * 1000.0;
-		const double image_ms = std::max(0.0, frame_ms - dpvo_ms);
-
-		logger->info(
-			"\033[93m[DPVO] Frame {} time: {:.3f} s ({:.2f} FPS) [image thread: {:.1f} ms, DPVO thread: {:.1f} ms]\033[0m",
-			frame_index,
-			frame_seconds,
-			frame_fps,
-			image_ms,
-			dpvo_ms
-		);
 	}
 }
 

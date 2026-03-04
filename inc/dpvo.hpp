@@ -1,11 +1,20 @@
 #pragma once
 #include "patch_graph.hpp"
+#include "detection_3d.hpp"  // Detection3D (for m_lastDetections3D)
 #include "patchify.hpp"  // Patchifier
 #include "update.hpp"    // DPVOUpdate
 #ifdef USE_ONNX_RUNTIME
 #include "update_onnx.hpp"  // DPVOUpdateONNX
 #endif
 #include "dla_config.hpp"
+#if defined(CV28) || defined(CV28_SIMULATOR)
+#include "yolov8.hpp"
+#include "yolov8_decoder.hpp"
+#include "dataStructures.h"
+#ifdef USE_ONNX_RUNTIME
+#include "yolov8_onnx.hpp"
+#endif
+#endif
 #if defined(CV28) || defined(CV28_SIMULATOR)
 #include <eazyai.h>
 #endif
@@ -112,6 +121,11 @@ public:
     void enableVisualization(bool enable = true);
     void enableFrameSaving(const std::string& output_dir);  // Save viewer frames to disk
     void updateViewer();  // Update viewer with current state
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    /** Last YOLOv8 inference time in ms (0 if not run or disabled). Used for per-frame log in main. */
+    double getLastYOLOv8InferenceTimeMs() const { return m_lastYOLOv8InferenceTimeMs; }
+#endif
 
 private:
     // Forward declaration for InputFrame (defined later in private section)
@@ -280,6 +294,25 @@ private:
     // Visualization (optional)
     std::unique_ptr<DPVOViewer> m_viewer;
     bool m_visualizationEnabled{false};
+    bool m_enableShow3DDetection{true};  // From app_config EnableShow3DDetection (0/1): show 3D object detection in viewer
+
+#if defined(CV28) || defined(CV28_SIMULATOR)
+    // YOLOv8 (optional; when yolov8ModelPath is set). Use ONNX if UseOnnxRuntime=1, else AMBA.
+    std::unique_ptr<YOLOv8> m_yolov8;
+#ifdef USE_ONNX_RUNTIME
+    std::unique_ptr<YOLOv8ONNX> m_yolov8_onnx;
+#endif
+    std::unique_ptr<YOLOv8_Decoder> m_yolov8Decoder;
+    std::vector<std::vector<v8xyxy>> m_lastYOLOv8Boxes;
+    std::mutex m_yolov8BoxesMutex;
+    double m_lastYOLOv8InferenceTimeMs = 0.0;
+    // YOLOv8 model input size (set when YOLOv8 runs); used for 3D unproject intrinsics scaling
+    int m_yolov8InputW = 0;
+    int m_yolov8InputH = 0;
+    // 3D detections (from YOLOv8 bbox center + ground-plane unproject) for viewer
+    std::vector<Detection3D> m_lastDetections3D;
+    std::mutex m_detections3DMutex;
+#endif
     
     // Store all historical poses for visualization (not just sliding window)
     // This allows the viewer to show the full trajectory, not just the current optimization window
